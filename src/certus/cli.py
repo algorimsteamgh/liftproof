@@ -17,6 +17,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from certus import __version__, aws, logs
 from certus.adapters.postgres import PostgresAdapter
 from certus.canonical import CANONICAL_VERSION, HASH_ALGORITHM
@@ -89,9 +91,27 @@ def connect(conn: Connection) -> PostgresAdapter:
     )
 
 
+INSTANCE_CONFIG = Path(os.environ.get("CERTUS_INSTANCE_CONFIG", "/etc/mvt/config.yaml"))
+
+
+def _instance_config() -> dict[str, Any]:
+    """Instance level settings written at launch by the deployment template."""
+    try:
+        return yaml.safe_load(INSTANCE_CONFIG.read_text(encoding="utf-8")) or {}
+    except (FileNotFoundError, PermissionError):
+        return {}
+
+
 def _store(project: Project, workdir: Path) -> Store:
-    if project.store.s3_bucket:
-        return S3Store(project.store.s3_bucket, project.store.s3_prefix, project.store.kms_key_id)
+    inst = _instance_config()
+    bucket = project.store.s3_bucket or inst.get("bucket")
+    if bucket:
+        return S3Store(
+            bucket,
+            project.store.s3_prefix,
+            project.store.kms_key_id or inst.get("kms_key"),
+            report_lock_days=int(inst.get("report_lock_days", 0)),
+        )
     return LocalStore(workdir / project.name)
 
 

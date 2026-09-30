@@ -17,9 +17,11 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 10 | AWS keys in the environment | warn, do not refuse | They are part of the default provider chain (AWSAPI-005); database passwords in the environment are refused | Yes |
 | 11 | Credentials when no `secret_arn` is set | connect without a password (for local development and IAM auth later) | Never from a file or environment variable | Yes |
 
+| 12 | Infrastructure | Terraform modules for the customer deployment and the Algorims build account; Packer AMI on Amazon Linux 2023 | The spec names CloudFormation and Terraform; Terraform first, CloudFormation for the Marketplace listing next | Yes |
+
 ## Not built yet
 
-Recorder, replay, UI/API/file comparators, scheduler, web UI, SSM document, AMI build,
-CloudFormation/Terraform module, replication position assertion on the target,
+Recorder, replay, UI/API/file comparators, scheduler, web UI,
+CloudFormation version of the deployment module, replication position assertion on the target,
 row predicate ignore rules, sampled mode, multi worker snapshots
 (`pg_export_snapshot` is captured but workers are not used yet).

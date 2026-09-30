@@ -1,0 +1,12 @@
+[Unit]
+Description=Configure the CloudWatch agent to ship Certus logs
+After=cloud-final.service
+ConditionPathExists=/etc/mvt/config.yaml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mvt-cwagent-config
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,50 @@
+name: infra
+
+on:
+  pull_request:
+    paths: ["infra/**", ".github/workflows/infra.yml"]
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        root: [infra/envs/customer-example, infra/envs/algorims-build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+      - run: terraform fmt -check -recursive infra
+      - run: terraform init -backend=false -input=false
+        working-directory: ${{ matrix.root }}
+      - run: terraform validate
+        working-directory: ${{ matrix.root }}
+
+  checkov:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install checkov
+      - name: Infrastructure security scan (fails on any unjustified finding)
+        run: checkov -d infra/modules --framework terraform --compact --quiet
+
+  packer:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-packer@main
+        with:
+          version: "1.16.1"
+      - run: packer fmt -check infra/packer
+      - run: packer init infra/packer
+      - run: packer validate -syntax-only infra/packer

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Point the CloudWatch agent at the log group named in /etc/mvt/config.yaml.
+set -euo pipefail
+group=$(awk -F': *' '$1=="log_group"{print $2}' /etc/mvt/config.yaml)
+[ -n "$group" ] || exit 0
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<JSON
+{
+  "agent": {"run_as_user": "cwagent"},
+  "logs": {"logs_collected": {"files": {"collect_list": [
+    {"file_path": "/var/log/mvt/*.log", "log_group_name": "$group",
+     "log_stream_name": "{instance_id}/certus", "retention_in_days": -1}
+  ]}}}
+}
+JSON
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json

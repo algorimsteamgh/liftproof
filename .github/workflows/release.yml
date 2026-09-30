@@ -1,0 +1,58 @@
+name: release
+
+# Builds the AMI for a version tag. AWS access is through GitHub OIDC into the
+# certus-github-release role: there is no stored access key anywhere (IAM-002).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  ami:
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build pip-audit
+      - name: Dependency gate (ATS-009)
+        run: pip-audit --strict . | tee pip-audit.log
+      - run: python -m build --wheel
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.CERTUS_RELEASE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-packer@main
+        with:
+          version: "1.16.1"
+      - run: packer init infra/packer
+      - name: Build AMI
+        run: |
+          packer build \
+            -var "version=${GITHUB_REF_NAME#v}" \
+            -var "wheel=$(ls dist/certus-*.whl)" \
+            -var "region=${AWS_REGION}" \
+            -var "subnet_id=${{ vars.CERTUS_BUILD_SUBNET }}" \
+            -var "security_group_id=${{ vars.CERTUS_BUILD_SG }}" \
+            -var "instance_profile=certus-ami-builder" \
+            infra/packer
+          jq -r '.builds[-1].artifact_id' packer-manifest.json | cut -d: -f2 > ami-id.txt
+      - name: OS layer vulnerability gate (Amazon Inspector)
+        run: |
+          infra/scripts/scan-ami.sh "$(cat ami-id.txt)" "${{ vars.CERTUS_BUILD_SUBNET }}" \
+            "${{ vars.CERTUS_BUILD_SG }}" certus-ami-builder
+      - name: Keep evidence
+        if: always()
+        run: |
+          prefix="s3://${{ vars.CERTUS_EVIDENCE_BUCKET }}/releases/${GITHUB_REF_NAME}/${GITHUB_RUN_ID}"
+          for f in pip-audit.log packer-manifest.json scan-findings.json ami-id.txt; do
+            [ -f "$f" ] && aws s3 cp "$f" "$prefix/$f"
+          done

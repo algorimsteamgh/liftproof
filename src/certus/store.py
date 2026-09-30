@@ -7,6 +7,7 @@ pointed at the same bucket carries on. LocalStore serves development and tests.
 
 from __future__ import annotations
 
+import datetime as dt
 import shutil
 from pathlib import Path
 
@@ -50,27 +51,45 @@ class LocalStore(Store):
 
 class S3Store(Store):
     def __init__(
-        self, bucket: str, prefix: str = "", kms_key_id: str | None = None, client=None
+        self,
+        bucket: str,
+        prefix: str = "",
+        kms_key_id: str | None = None,
+        client=None,
+        report_lock_days: int = 0,
     ) -> None:
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self.kms_key_id = kms_key_id
+        self.report_lock_days = report_lock_days
         self.s3 = client or aws.client("s3")
 
     def _key(self, key: str) -> str:
         return f"{self.prefix}/{key}" if self.prefix else key
 
-    def _encryption(self) -> dict[str, str]:
-        args = {"ServerSideEncryption": "aws:kms"}
+    def _object_args(self, key: str) -> dict:
+        """Encryption, plus retention and classification by what the object is.
+
+        Reports under runs/ are go live sign off records: governance mode Object Lock.
+        Recorded bodies and snapshots are tagged so the bucket lifecycle expires them.
+        """
+        args: dict = {"ServerSideEncryption": "aws:kms"}
         if self.kms_key_id:
             args["SSEKMSKeyId"] = self.kms_key_id
+        if key.startswith("runs/") and self.report_lock_days > 0:
+            args["ObjectLockMode"] = "GOVERNANCE"
+            args["ObjectLockRetainUntilDate"] = dt.datetime.now(dt.UTC) + dt.timedelta(
+                days=self.report_lock_days
+            )
+        if "/assets/" in key:
+            args["Tagging"] = "certus:class=asset"
         return args
 
     def put_file(self, key: str, path: Path) -> None:
         try:
             with path.open("rb") as fh:
                 self.s3.put_object(
-                    Bucket=self.bucket, Key=self._key(key), Body=fh, **self._encryption()
+                    Bucket=self.bucket, Key=self._key(key), Body=fh, **self._object_args(key)
                 )
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "error")
