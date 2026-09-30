@@ -547,7 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    logs.setup(args.log_level)
+    log_dir = Path(os.environ.get("CERTUS_LOG_DIR", "/var/log/mvt"))
+    logs.setup(args.log_level, str(log_dir / "certus.log") if os.access(log_dir, os.W_OK) else None)
     try:
         _refuse_env_credentials()
         return args.fn(args)
