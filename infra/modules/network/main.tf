@@ -66,7 +66,7 @@ data "aws_availability_zones" "available" {
 
 locals {
   azs  = slice(data.aws_availability_zones.available.names, 0, var.az_count)
-  tags = merge(var.tags, { "certus:managed-by" = "terraform" })
+  tags = merge(var.tags, { "liftproof:managed-by" = "terraform" })
 }
 
 resource "aws_vpc" "this" {

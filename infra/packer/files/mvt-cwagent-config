@@ -8,7 +8,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<JSON
   "agent": {"run_as_user": "cwagent"},
   "logs": {"logs_collected": {"files": {"collect_list": [
     {"file_path": "/var/log/mvt/*.log", "log_group_name": "$group",
-     "log_stream_name": "{instance_id}/certus", "retention_in_days": -1}
+     "log_stream_name": "{instance_id}/liftproof", "retention_in_days": -1}
   ]}}}
 }
 JSON

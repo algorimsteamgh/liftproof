@@ -20,10 +20,10 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     env:
-      CERTUS_TEST_PG_HOST: localhost
-      CERTUS_TEST_PG_PORT: "5432"
-      CERTUS_TEST_PG_USER: postgres
-      CERTUS_TEST_PG_PASSWORD: ci-only-local-service
+      LIFTPROOF_TEST_PG_HOST: localhost
+      LIFTPROOF_TEST_PG_PORT: "5432"
+      LIFTPROOF_TEST_PG_USER: postgres
+      LIFTPROOF_TEST_PG_PASSWORD: ci-only-local-service
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,7 +35,7 @@ jobs:
       - name: Functional tests (OPE-004). A red suite blocks merge and release.
         run: pytest -q
       - name: Record SDK versions in the build output (AWSAPI-004)
-        run: certus version --format json | tee build-versions.json
+        run: liftproof version --format json | tee build-versions.json
       - uses: actions/upload-artifact@v4
         with:
           name: build-versions

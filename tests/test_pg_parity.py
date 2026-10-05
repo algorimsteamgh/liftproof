@@ -6,9 +6,9 @@ pushdown, for every type rule.
 
 import pytest
 
-from certus.adapters.base import HashPlan, TableRef
-from certus.adapters.postgres import PostgresAdapter
-from certus.canonical import CanonicalType as T
+from liftproof.adapters.base import HashPlan, TableRef
+from liftproof.adapters.postgres import PostgresAdapter
+from liftproof.canonical import CanonicalType as T
 
 pytestmark = pytest.mark.postgres
 

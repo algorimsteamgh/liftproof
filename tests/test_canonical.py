@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from certus.canonical import (
+from liftproof.canonical import (
     GROUP_SIZE,
     MOD64,
     aggregate,
@@ -23,10 +23,10 @@ from certus.canonical import (
     row_hash,
     value64,
 )
-from certus.canonical import (
+from liftproof.canonical import (
     CanonicalType as T,
 )
-from certus.canonical.render import RenderError
+from liftproof.canonical.render import RenderError
 
 
 # -- rendering (9.4) ---------------------------------------------------------------

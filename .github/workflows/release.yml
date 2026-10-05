@@ -1,7 +1,7 @@
 name: release
 
 # Builds the AMI for a version tag. AWS access is through GitHub OIDC into the
-# certus-github-release role: there is no stored access key anywhere (IAM-002).
+# liftproof-github-release role: there is no stored access key anywhere (IAM-002).
 on:
   push:
     tags: ["v*"]
@@ -28,7 +28,7 @@ jobs:
       - run: python -m build --wheel
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.CERTUS_RELEASE_ROLE_ARN }}
+          role-to-assume: ${{ vars.LIFTPROOF_RELEASE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - uses: hashicorp/setup-packer@main
         with:
@@ -38,21 +38,21 @@ jobs:
         run: |
           packer build \
             -var "version=${GITHUB_REF_NAME#v}" \
-            -var "wheel=$(ls dist/certus-*.whl)" \
+            -var "wheel=$(ls dist/liftproof-*.whl)" \
             -var "region=${AWS_REGION}" \
-            -var "subnet_id=${{ vars.CERTUS_BUILD_SUBNET }}" \
-            -var "security_group_id=${{ vars.CERTUS_BUILD_SG }}" \
-            -var "instance_profile=certus-ami-builder" \
+            -var "subnet_id=${{ vars.LIFTPROOF_BUILD_SUBNET }}" \
+            -var "security_group_id=${{ vars.LIFTPROOF_BUILD_SG }}" \
+            -var "instance_profile=liftproof-ami-builder" \
             infra/packer
           jq -r '.builds[-1].artifact_id' packer-manifest.json | cut -d: -f2 > ami-id.txt
       - name: OS layer vulnerability gate (Amazon Inspector)
         run: |
-          infra/scripts/scan-ami.sh "$(cat ami-id.txt)" "${{ vars.CERTUS_BUILD_SUBNET }}" \
-            "${{ vars.CERTUS_BUILD_SG }}" certus-ami-builder
+          infra/scripts/scan-ami.sh "$(cat ami-id.txt)" "${{ vars.LIFTPROOF_BUILD_SUBNET }}" \
+            "${{ vars.LIFTPROOF_BUILD_SG }}" liftproof-ami-builder
       - name: Keep evidence
         if: always()
         run: |
-          prefix="s3://${{ vars.CERTUS_EVIDENCE_BUCKET }}/releases/${GITHUB_REF_NAME}/${GITHUB_RUN_ID}"
+          prefix="s3://${{ vars.LIFTPROOF_EVIDENCE_BUCKET }}/releases/${GITHUB_REF_NAME}/${GITHUB_RUN_ID}"
           for f in pip-audit.log packer-manifest.json scan-findings.json ami-id.txt; do
             [ -f "$f" ] && aws s3 cp "$f" "$prefix/$f"
           done

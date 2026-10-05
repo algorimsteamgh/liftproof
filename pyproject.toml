@@ -3,9 +3,9 @@ requires = ["hatchling>=1.24"]
 build-backend = "hatchling.build"
 
 [project]
-name = "certus"
+name = "liftproof"
 dynamic = ["version"]
-description = "Certus: migration validation for workloads moving to AWS"
+description = "Liftproof: migration validation for workloads moving to AWS"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
 authors = [{ name = "Algorims" }]
@@ -20,19 +20,19 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.6", "pip-audit>=2.7"]
 
 [project.scripts]
-certus = "certus.cli:main"
-mvt = "certus.cli:main"
+liftproof = "liftproof.cli:main"
+mvt = "liftproof.cli:main"
 
 [tool.hatch.version]
-path = "src/certus/__init__.py"
+path = "src/liftproof/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/certus"]
+packages = ["src/liftproof"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-markers = ["postgres: needs a PostgreSQL server (CERTUS_TEST_PG_DSN or local initdb)"]
+markers = ["postgres: needs a PostgreSQL server (LIFTPROOF_TEST_PG_DSN or local initdb)"]
 
 [tool.ruff]
 line-length = 100

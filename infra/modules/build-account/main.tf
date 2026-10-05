@@ -14,7 +14,7 @@ terraform {
 }
 
 variable "github_repository" {
-  description = "owner/repo, for example algorimsteamgh/certus"
+  description = "owner/repo, for example algorimsteamgh/liftproof"
   type        = string
 }
 
@@ -63,7 +63,7 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
   region     = data.aws_region.current.region
-  tags       = merge(var.tags, { "certus:managed-by" = "terraform", "certus:scope" = "build" })
+  tags       = merge(var.tags, { "liftproof:managed-by" = "terraform", "liftproof:scope" = "build" })
   oidc_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : (
     "arn:${local.partition}:iam::${local.account_id}:oidc-provider/token.actions.githubusercontent.com"
   )
@@ -99,8 +99,8 @@ data "aws_iam_policy_document" "release_trust" {
 }
 
 resource "aws_iam_role" "release" {
-  name                 = "certus-github-release"
-  description          = "GitHub Actions: build, scan and publish the Certus AMI"
+  name                 = "liftproof-github-release"
+  description          = "GitHub Actions: build, scan and publish the Liftproof AMI"
   assume_role_policy   = data.aws_iam_policy_document.release_trust.json
   max_session_duration = 7200
   tags                 = local.tags
@@ -124,7 +124,7 @@ data "aws_iam_policy_document" "build_key" {
 }
 
 resource "aws_kms_key" "build" {
-  description             = "Certus build account: evidence and AMI snapshots"
+  description             = "Liftproof build account: evidence and AMI snapshots"
   enable_key_rotation     = true
   deletion_window_in_days = 30
   policy                  = data.aws_iam_policy_document.build_key.json
@@ -132,14 +132,14 @@ resource "aws_kms_key" "build" {
 }
 
 resource "aws_kms_alias" "build" {
-  name          = "alias/certus-build"
+  name          = "alias/liftproof-build"
   target_key_id = aws_kms_key.build.key_id
 }
 
 resource "aws_s3_bucket" "evidence" {
   #checkov:skip=CKV_AWS_144:Evidence is held under Object Lock compliance mode; replication is not required
   #checkov:skip=CKV2_AWS_62:No consumer for event notifications
-  bucket              = "certus-build-evidence-${local.account_id}-${local.region}"
+  bucket              = "liftproof-build-evidence-${local.account_id}-${local.region}"
   object_lock_enabled = true
   tags                = local.tags
 }
@@ -157,7 +157,7 @@ resource "aws_s3_bucket_object_lock_configuration" "evidence" {
 resource "aws_s3_bucket_logging" "evidence" {
   bucket        = aws_s3_bucket.evidence.id
   target_bucket = var.access_log_bucket
-  target_prefix = "s3/certus-build-evidence/"
+  target_prefix = "s3/liftproof-build-evidence/"
 }
 
 resource "aws_s3_bucket_versioning" "evidence" {
@@ -247,7 +247,7 @@ data "aws_iam_policy_document" "assume_ec2" {
 }
 
 resource "aws_iam_role" "builder" {
-  name               = "certus-ami-builder"
+  name               = "liftproof-ami-builder"
   description        = "Temporary Packer build instances (Session Manager only)"
   assume_role_policy = data.aws_iam_policy_document.assume_ec2.json
   tags               = local.tags
@@ -259,14 +259,14 @@ resource "aws_iam_role_policy_attachment" "builder_ssm" {
 }
 
 resource "aws_iam_instance_profile" "builder" {
-  name = "certus-ami-builder"
+  name = "liftproof-ami-builder"
   role = aws_iam_role.builder.name
   tags = local.tags
 }
 
 resource "aws_security_group" "builder" {
   #checkov:skip=CKV2_AWS_5:Attached by Packer to temporary build instances
-  name        = "certus-ami-builder"
+  name        = "liftproof-ami-builder"
   description = "Packer build instances: no inbound; HTTPS out for packages and SSM"
   vpc_id      = var.build_vpc_id
   tags        = local.tags
@@ -285,7 +285,7 @@ resource "aws_vpc_security_group_egress_rule" "builder_https" {
 
 data "aws_iam_policy_document" "release" {
   #checkov:skip=CKV_AWS_356:Describe and list actions have no resource level permissions; launches are tag conditioned
-  #checkov:skip=CKV_AWS_111:Write actions are constrained by the certus:build tag and the build subnet
+  #checkov:skip=CKV_AWS_111:Write actions are constrained by the liftproof:build tag and the build subnet
   #checkov:skip=CKV_AWS_108:Evidence reads are limited to the evidence bucket
   statement {
     sid = "PackerDescribe"
@@ -305,7 +305,7 @@ data "aws_iam_policy_document" "release" {
     resources = ["*"]
     condition {
       test     = "StringEquals"
-      variable = "aws:RequestTag/certus:build"
+      variable = "aws:RequestTag/liftproof:build"
       values   = ["true"]
     }
   }
@@ -330,7 +330,7 @@ data "aws_iam_policy_document" "release" {
     resources = ["*"]
     condition {
       test     = "StringEquals"
-      variable = "aws:ResourceTag/certus:build"
+      variable = "aws:ResourceTag/liftproof:build"
       values   = ["true"]
     }
   }
@@ -377,7 +377,7 @@ data "aws_iam_policy_document" "release" {
 }
 
 resource "aws_iam_role_policy" "release" {
-  name   = "certus-release"
+  name   = "liftproof-release"
   role   = aws_iam_role.release.id
   policy = data.aws_iam_policy_document.release.json
 }
@@ -395,8 +395,8 @@ data "aws_iam_policy_document" "marketplace_trust" {
 }
 
 resource "aws_iam_role" "marketplace_ingestion" {
-  name               = "certus-marketplace-ami-ingestion"
-  description        = "Lets AWS Marketplace scan and copy Certus AMIs for listing versions"
+  name               = "liftproof-marketplace-ami-ingestion"
+  description        = "Lets AWS Marketplace scan and copy Liftproof AMIs for listing versions"
   assume_role_policy = data.aws_iam_policy_document.marketplace_trust.json
   tags               = local.tags
 }

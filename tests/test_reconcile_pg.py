@@ -6,10 +6,10 @@ reported with the table named, the count difference shown and the differing rows
 
 import pytest
 
-from certus.findings import FindingWriter, Kind, read_findings
-from certus.reconcile.baseline import Baseline, take_baseline
-from certus.reconcile.engine import ReconcileOptions, Reconciler
-from certus.reconcile.plan import IgnoreRule
+from liftproof.findings import FindingWriter, Kind, read_findings
+from liftproof.reconcile.baseline import Baseline, take_baseline
+from liftproof.reconcile.engine import ReconcileOptions, Reconciler
+from liftproof.reconcile.plan import IgnoreRule
 
 pytestmark = pytest.mark.postgres
 

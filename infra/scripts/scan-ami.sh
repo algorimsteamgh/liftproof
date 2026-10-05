@@ -12,8 +12,8 @@ iid=$(aws ec2 run-instances --image-id "$ami" --instance-type m7i.large \
   --subnet-id "$subnet" --security-group-ids "$sg" \
   --iam-instance-profile Name="$profile" \
   --metadata-options HttpTokens=required,HttpEndpoint=enabled \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=certus:build,Value=true},{Key=Name,Value=certus-ami-scan}]" \
-    "ResourceType=volume,Tags=[{Key=certus:build,Value=true}]" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=liftproof:build,Value=true},{Key=Name,Value=liftproof-ami-scan}]" \
+    "ResourceType=volume,Tags=[{Key=liftproof:build,Value=true}]" \
   --query 'Instances[0].InstanceId' --output text)
 trap 'aws ec2 terminate-instances --instance-ids "$iid" >/dev/null' EXIT
 echo "scanning $ami on $iid"

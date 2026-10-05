@@ -1,5 +1,5 @@
 [Unit]
-Description=Configure the CloudWatch agent to ship Certus logs
+Description=Configure the CloudWatch agent to ship Liftproof logs
 After=cloud-final.service
 ConditionPathExists=/etc/mvt/config.yaml
 

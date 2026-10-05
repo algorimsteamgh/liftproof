@@ -2,8 +2,8 @@
 
 from botocore.stub import ANY, Stubber
 
-from certus import aws
-from certus.store import S3Store
+from liftproof import aws
+from liftproof.store import S3Store
 
 
 def _store(**kw):
@@ -35,7 +35,7 @@ def test_assets_are_tagged_for_expiry(tmp_path):
             "Bucket": "bucket", "Key": "acme/journeys/j1/assets/abc", "Body": ANY,
             "ServerSideEncryption": "aws:kms",
             "SSEKMSKeyId": "arn:aws:kms:ap-south-1:111122223333:key/k",
-            "Tagging": "certus:class=asset",
+            "Tagging": "liftproof:class=asset",
         })
         store.put_file("journeys/j1/assets/abc", f)
         stub.assert_no_pending_responses()

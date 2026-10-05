@@ -1,4 +1,4 @@
-# Security baseline for each Algorims AWS account that builds or distributes Certus.
+# Security baseline for each Algorims AWS account that builds or distributes Liftproof.
 # These are account level settings, applied once per account and region.
 
 terraform {
@@ -45,7 +45,7 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
   region     = data.aws_region.current.region
-  tags       = merge(var.tags, { "certus:managed-by" = "terraform" })
+  tags       = merge(var.tags, { "liftproof:managed-by" = "terraform" })
 }
 
 # Account wide guard rails

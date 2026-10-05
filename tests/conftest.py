@@ -1,6 +1,6 @@
 """Shared fixtures.
 
-PostgreSQL tests need a server. Set CERTUS_TEST_PG_HOST / _PORT / _USER (CI uses a
+PostgreSQL tests need a server. Set LIFTPROOF_TEST_PG_HOST / _PORT / _USER (CI uses a
 service container); tests marked postgres are skipped when none is reachable.
 """
 
@@ -12,13 +12,13 @@ import uuid
 import psycopg
 import pytest
 
-from certus.adapters.postgres import PostgresAdapter
+from liftproof.adapters.postgres import PostgresAdapter
 
 PG = {
-    "host": os.environ.get("CERTUS_TEST_PG_HOST", "/tmp"),
-    "port": int(os.environ.get("CERTUS_TEST_PG_PORT", "55432")),
-    "user": os.environ.get("CERTUS_TEST_PG_USER", "postgres"),
-    "password": os.environ.get("CERTUS_TEST_PG_PASSWORD") or None,
+    "host": os.environ.get("LIFTPROOF_TEST_PG_HOST", "/tmp"),
+    "port": int(os.environ.get("LIFTPROOF_TEST_PG_PORT", "55432")),
+    "user": os.environ.get("LIFTPROOF_TEST_PG_USER", "postgres"),
+    "password": os.environ.get("LIFTPROOF_TEST_PG_PASSWORD") or None,
 }
 
 
@@ -44,7 +44,7 @@ def make_db(pg_available):
     conns: list[psycopg.Connection] = []
 
     def factory(prefix: str = "t"):
-        name = f"certus_{prefix}_{uuid.uuid4().hex[:8]}"
+        name = f"liftproof_{prefix}_{uuid.uuid4().hex[:8]}"
         with _admin() as c:
             c.execute(f'CREATE DATABASE "{name}" ENCODING UTF8 TEMPLATE template0')
         created.append(name)

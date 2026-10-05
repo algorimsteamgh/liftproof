@@ -11,7 +11,7 @@ terraform {
   }
   # backend "s3" {
   #   bucket       = "REPLACE-algorims-terraform-state"
-  #   key          = "certus/build-account.tfstate"
+  #   key          = "liftproof/build-account.tfstate"
   #   region       = "ap-south-1"
   #   encrypt      = true
   #   use_lockfile = true
@@ -21,7 +21,7 @@ terraform {
 provider "aws" {
   region = var.region
   default_tags {
-    tags = { Product = "Certus", Environment = "build", Owner = "algorims" }
+    tags = { Product = "Liftproof", Environment = "build", Owner = "algorims" }
   }
 }
 
@@ -32,7 +32,7 @@ variable "region" {
 
 variable "github_repository" {
   type    = string
-  default = "algorimsteamgh/certus"
+  default = "algorimsteamgh/liftproof"
 }
 
 variable "budget_emails" {
@@ -41,13 +41,13 @@ variable "budget_emails" {
 
 module "baseline" {
   source        = "../../modules/account-baseline"
-  name          = "algorims-certus-build"
+  name          = "algorims-liftproof-build"
   budget_emails = var.budget_emails
 }
 
 module "network" {
   source     = "../../modules/network"
-  name       = "certus-build"
+  name       = "liftproof-build"
   enable_nat = true # build instances fetch OS packages and Python wheels
   az_count   = 2
 }

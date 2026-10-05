@@ -5,8 +5,8 @@ import json
 import pytest
 import yaml
 
-from certus import cli
-from certus.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_OK, EXIT_RUN_FAILED
+from liftproof import cli
+from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_OK, EXIT_RUN_FAILED
 from tests.conftest import PG
 
 SCHEMA = """

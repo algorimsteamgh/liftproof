@@ -1,4 +1,4 @@
-# Certus infrastructure
+# Liftproof infrastructure
 
 Everything here is Terraform (plus a Packer template for the AMI). It passes
 `terraform validate` and a Checkov scan with no open findings; every Checkov skip is
@@ -6,11 +6,11 @@ written next to the resource with its reason. Nothing has been applied to any ac
 
 ```
 infra/
-  modules/certus            what a customer deploys: the product and everything around it
+  modules/liftproof            what a customer deploys: the product and everything around it
   modules/network           reference private VPC (for customers without one, and for tests)
   modules/account-baseline  security baseline for Algorims' own AWS accounts
   modules/build-account     GitHub OIDC release role, AMI builder, evidence store, Marketplace ingestion
-  envs/customer-example     example customer root: network + certus
+  envs/customer-example     example customer root: network + liftproof
   envs/algorims-build       Algorims build account root: baseline + network + build
   packer/                   the product AMI (Amazon Linux 2023, IMDSv2, no SSH, hardened)
   scripts/scan-ami.sh       Amazon Inspector release gate for the AMI's OS layer
@@ -22,7 +22,7 @@ infra/
 flowchart LR
   subgraph Customer AWS account
     subgraph VPC["VPC (private subnets, 2 AZs, no internet gateway)"]
-      EC2["Certus EC2 instance<br/>IMDSv2 only, no inbound rule<br/>encrypted gp3 (customer KMS key)"]
+      EC2["Liftproof EC2 instance<br/>IMDSv2 only, no inbound rule<br/>encrypted gp3 (customer KMS key)"]
       EP["Interface endpoints<br/>ssm, ssmmessages, ec2messages,<br/>secretsmanager, kms, logs, monitoring"]
       S3GW["S3 gateway endpoint"]
       VGW["Virtual private gateway"]
@@ -68,9 +68,9 @@ terraform apply -var ami_id=ami-... -var source_database_cidr=10.1.2.0/24 \
   -var target_database_cidr=10.42.0.0/20 -var 'application_cidrs=["10.1.3.0/24"]'
 ```
 
-Then store the database logins in Secrets Manager under `certus/acme-prod/`
+Then store the database logins in Secrets Manager under `liftproof/acme-prod/`
 (`{"username": ..., "password": ...}`), open the UI with the `connect_ui` output, and
-run `certus doctor`.
+run `liftproof doctor`.
 
 ## Algorims build account
 
@@ -79,7 +79,7 @@ run `certus doctor`.
   Security Best Practices, IAM Access Analyzer, account-wide S3 Block Public Access,
   EBS encryption by default, IMDSv2 by default, a strict password policy, S3 access
   logging and a monthly budget alert.
-- **Release path:** GitHub Actions assumes `certus-github-release` through OIDC, only
+- **Release path:** GitHub Actions assumes `liftproof-github-release` through OIDC, only
   from `main` and `v*` tags. No stored keys (the second half of IAM-002).
 - **AMI:** Packer builds over Session Manager in a private subnet. Amazon Inspector then
   scans an instance of the new AMI, and any HIGH or CRITICAL finding fails the release
@@ -108,7 +108,7 @@ endpoints can be shared with other workloads in the same VPC by setting
 
 ## What is still to do
 
-- A CloudFormation version of `modules/certus` for the Marketplace listing's
+- A CloudFormation version of `modules/liftproof` for the Marketplace listing's
   "launch with CloudFormation" option (spec 3 promises both).
 - Chromium and its libraries in the AMI once the recorder lands (the base image
   decision, Amazon Linux 2023 or Ubuntu, is still open).

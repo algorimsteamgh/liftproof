@@ -12,7 +12,7 @@ cat > /etc/systemd/coredump.conf.d/disable.conf <<'CONF'
 Storage=none
 ProcessSizeMax=0
 CONF
-cat > /etc/sysctl.d/90-certus.conf <<'CONF'
+cat > /etc/sysctl.d/90-liftproof.conf <<'CONF'
 fs.suid_dumpable = 0
 kernel.dmesg_restrict = 1
 kernel.kptr_restrict = 2
@@ -26,6 +26,6 @@ CONF
 systemctl disable sshd || true
 
 # Session Manager sessions time out; long runs go under systemd, never in a shell.
-cat > /etc/profile.d/certus.sh <<'CONF'
-echo "Certus $(cat /etc/mvt/version). Run long commands with: sudo systemd-run --unit=certus-job --collect -p User=mvt certus ..."
+cat > /etc/profile.d/liftproof.sh <<'CONF'
+echo "Liftproof $(cat /etc/mvt/version). Run long commands with: sudo systemd-run --unit=liftproof-job --collect -p User=mvt liftproof ..."
 CONF

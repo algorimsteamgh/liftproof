@@ -2,9 +2,9 @@
 
 This is the wire format that lets two database engines produce byte identical hashes
 for the same data (Technical Spec section 9). It is normative. The Python reference
-implementation is `src/certus/canonical/`; every engine pushdown must match it byte for
+implementation is `src/liftproof/canonical/`; every engine pushdown must match it byte for
 byte, and `tests/test_pg_parity.py` proves that for PostgreSQL. Every baseline records
-`canonical_version` and `hash_algorithm`, and Certus refuses to compare baselines taken
+`canonical_version` and `hash_algorithm`, and Liftproof refuses to compare baselines taken
 under a different version.
 
 Changing anything below changes the golden vectors in `tests/test_canonical.py` and

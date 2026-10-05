@@ -7,7 +7,7 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 |---|---|---|---|---|
 | 1 | Language | Python 3.12 | The database reconciliation is where the product lives or dies; spec section 2 | Costly |
 | 2 | First database engine | PostgreSQL (source and target) | Most common target, and a full test server is easy in CI. MySQL, SQL Server and Oracle follow as adapters | Yes |
-| 3 | Package and CLI name | package `certus`, commands `certus` and `mvt` | Project is called Certus; spec uses `mvt`. Both entry points work | Yes |
+| 3 | Package and CLI name | package `liftproof`, commands `liftproof` and `mvt` | Project is called Liftproof; spec uses `mvt`. Both entry points work | Yes |
 | 4 | Row hash grouping | per column digest, groups of 32 columns | Resolves the ambiguous 1000 byte rule; see canonical-v1.md | Canonical version bump |
 | 5 | NULL encoding | own frame `-1 0x1F` | The draft `\N` collides with the string `\N` | Canonical version bump |
 | 6 | Baseline contents | per bucket aggregates only | Keeps baselines small; row level drill-down needs the source readable at validate time, and the report says so when it is not | Yes |

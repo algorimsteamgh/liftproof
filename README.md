@@ -1,6 +1,6 @@
-# Certus
+# Liftproof
 
-Migration validation for workloads moving to AWS. Certus records how an application and
+Migration validation for workloads moving to AWS. Liftproof records how an application and
 its database behave before a migration, checks the same behaviour afterwards, and
 produces the report a release manager signs at go live.
 
@@ -13,10 +13,10 @@ F6 (reconcile), F8/F9 (reports), F11 (CLI and exit codes), F14 (credentials) and
 
 ```bash
 uv venv -p 3.12 && uv pip install -e ".[dev]"
-certus init acme                   # writes acme.yaml; no credentials go in it
-certus doctor --project acme.yaml  # connections, read only source, TLS, S3 and KMS
-certus baseline --project acme.yaml
-certus reconcile --project acme.yaml --baseline latest
+liftproof init acme                   # writes acme.yaml; no credentials go in it
+liftproof doctor --project acme.yaml  # connections, read only source, TLS, S3 and KMS
+liftproof baseline --project acme.yaml
+liftproof reconcile --project acme.yaml --baseline latest
 ```
 
 ## Exit codes
@@ -33,8 +33,8 @@ certus reconcile --project acme.yaml --baseline latest
 
 ## Tests
 
-`pytest` runs everything. Database tests need PostgreSQL: set `CERTUS_TEST_PG_HOST`,
-`CERTUS_TEST_PG_PORT` and `CERTUS_TEST_PG_USER` (CI uses a service container); they are
+`pytest` runs everything. Database tests need PostgreSQL: set `LIFTPROOF_TEST_PG_HOST`,
+`LIFTPROOF_TEST_PG_PORT` and `LIFTPROOF_TEST_PG_USER` (CI uses a service container); they are
 skipped when no server is reachable. The suite includes the golden vectors that pin the
 canonical wire format, pushdown against fallback parity for every type rule, and the
 PRD F6 acceptance test (a ten row injected difference, reported exactly).
@@ -42,10 +42,10 @@ PRD F6 acceptance test (a ten row injected difference, reported exactly).
 ## Layout
 
 ```
-src/certus/canonical   canonical v1.0 encoding and hashing (docs/canonical-v1.md)
-src/certus/adapters    one adapter per database engine
-src/certus/reconcile   planning, baselines, reconciliation
-src/certus/report      JSON and self contained HTML reports
-src/certus/cli.py      the product's complete interface
+src/liftproof/canonical   canonical v1.0 encoding and hashing (docs/canonical-v1.md)
+src/liftproof/adapters    one adapter per database engine
+src/liftproof/reconcile   planning, baselines, reconciliation
+src/liftproof/report      JSON and self contained HTML reports
+src/liftproof/cli.py      the product's complete interface
 docs/decisions.md      defaults chosen where the spec leaves a choice open
 ```
