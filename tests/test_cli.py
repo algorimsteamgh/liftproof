@@ -145,3 +145,19 @@ def test_version_reports_sdk(capsys):
 def test_init_writes_template(tmp_path):
     assert cli.main(["init", "demo", "--dir", str(tmp_path)]) == EXIT_OK
     assert "secret_arn" in (tmp_path / "demo.yaml").read_text()
+
+
+def test_mysql_to_postgresql_project_defaults(tmp_path):
+    from liftproof.config import load_project
+
+    doc = {
+        "project": "shop",
+        "source": {"engine": "mysql", "host": "old.example", "database": "shop"},
+        "target": {"engine": "postgresql", "host": "new.example", "database": "shop"},
+    }
+    path = tmp_path / "shop.yaml"
+    path.write_text(yaml.safe_dump(doc))
+    p = load_project(path)
+    assert (p.source.port, p.target.port) == (3306, 5432)
+    assert p.database.schemas == ["shop"]
+    assert p.database.schema_map == {"shop": "public"}
