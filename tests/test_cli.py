@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from liftproof import cli
+from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_OK, EXIT_RUN_FAILED
 from tests.conftest import PG
 
@@ -17,9 +18,23 @@ INSERT INTO notes SELECT 'n' || g FROM generate_series(1, 10) g;
 """
 
 
+TEST_SECRET_ARN = "arn:aws:secretsmanager:ap-south-1:000000000000:secret:liftproof/test"
+
+
+@pytest.fixture(autouse=True)
+def test_secret(monkeypatch):
+    """Serve the test server's login through the Secrets Manager path the CLI really uses."""
+
+    def fake(arn):
+        assert arn == TEST_SECRET_ARN
+        return DbCredentials(PG["user"], PG["password"])
+
+    monkeypatch.setattr(cli, "from_secrets_manager", fake)
+
+
 def _project(tmp_path, src, tgt, **database):
     conn = {"engine": "postgresql", "host": PG["host"], "port": PG["port"], "user": PG["user"],
-            "sslmode": "disable"}
+            "sslmode": "disable", "secret_arn": TEST_SECRET_ARN}
     doc = {"project": "acme", "source": dict(conn, database=src),
            "target": dict(conn, database=tgt), "database": {"rows_per_bucket": 500, **database}}
     path = tmp_path / "acme.yaml"

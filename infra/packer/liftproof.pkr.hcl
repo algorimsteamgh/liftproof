@@ -97,15 +97,15 @@ source "amazon-ebs" "liftproof" {
 
   run_tags = {
     "liftproof:build" = "true"
-    Name           = "liftproof-ami-build"
+    Name              = "liftproof-ami-build"
   }
   run_volume_tags = {
     "liftproof:build" = "true"
   }
   tags = {
     "liftproof:version" = var.version
-    Product          = "Liftproof"
-    BaseImage        = "{{ .SourceAMIName }}"
+    Product             = "Liftproof"
+    BaseImage           = "{{ .SourceAMIName }}"
   }
 }
 
