@@ -108,6 +108,37 @@ are plain ASCII of at most 3990 characters, its RAW values are at most 1995 byte
 decimals print without an exponent. Every other row is hashed application side; the two
 are summed.
 
+### SQL Server type mapping and engine specific rules
+
+SQL Server sessions pin `LANGUAGE us_english`, `DATEFORMAT ymd` and the ANSI settings;
+every rendering uses an explicit `CONVERT` style, so no other setting matters.
+
+| SQL Server | Canonical | Note |
+|---|---|---|
+| tinyint, smallint, int, bigint | integer | |
+| decimal, numeric, money, smallmoney | decimal | |
+| real, float | float | statistical comparison only; SQL Server stores no NaN or infinity |
+| bit | boolean | |
+| varchar, nvarchar, text, ntext | text | |
+| char, nchar | char | |
+| date | date | |
+| time(n) | time | 100 ns digits are truncated to the precision |
+| datetime | timestamp (naive) | hashed as shown, rounded to the millisecond (.003, .007), not as the 1/300 second tick it stores |
+| datetime2(n), smalldatetime | timestamp (naive) | |
+| datetimeoffset(n) | timestamptz | converted to UTC |
+| binary, varbinary, image, rowversion | binary | rowversion values are never preserved by a migration; ignore the column |
+| uniqueidentifier | uuid | |
+| json (SQL Server 2025, Azure SQL) | json | always hashed application side |
+| xml, sql_variant, geography, geometry, hierarchyid | unsupported | reported as not checked |
+
+SQL Server has no NFC function and hashes `nvarchar` as UTF-16, so a row is hashed in the
+database only when its text values are all characters U+0001 to U+007F (tested with a
+binary collation). There is no length limit: `HASHBYTES` takes `varchar(max)`. Every other
+row is hashed application side; the two are summed.
+
+The default schema is `dbo`; a SQL Server `dbo` maps onto PostgreSQL `public` (or the MySQL
+database) unless `database.schema_map` says otherwise.
+
 ## 3. Framing and hashing
 
 ```

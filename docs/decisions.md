@@ -24,6 +24,9 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 23 | Third database engine | Oracle 19c and later (RDS for Oracle), via python-oracledb in thin mode | The largest legacy source estate; thin mode needs no Oracle client on the image. SQL Server follows | Yes |
 | 24 | Oracle snapshot and position | One `SET TRANSACTION READ ONLY` transaction; the SCN read right after it begins, recorded with `exact: false`, or unknown without `SELECT` on `V$DATABASE` | Oracle answers every query in a read only transaction as of its start; `AS OF SCN` flashback queries need undo retention the source may not have | Yes |
 | 25 | Integer against decimal columns | Planned together as decimal instead of a type change | Oracle `NUMBER` keys move to `bigint`; the renderings agree for whole numbers, so excluding the column would hide real differences | Yes |
+| 34 | Fourth database engine | SQL Server 2016 and later (RDS for SQL Server, Azure SQL), via python-tds, a pure Python driver, with pyOpenSSL for TLS | No ODBC driver or Microsoft package repository on the image, as with Oracle thin mode. HASHBYTES has no input limit from 2016 | Yes |
+| 35 | SQL Server snapshot | A SNAPSHOT isolation transaction, position `@@DBTS` recorded as `exact: false`. Without ALLOW_SNAPSHOT_ISOLATION the source is read under READ COMMITTED, the baseline records `consistent: false`, and doctor fails the check | Turning snapshot isolation on is the DBA's decision (it adds version store load in tempdb); a baseline must not silently claim consistency | Yes |
+| 36 | SQL Server TLS | `verify-ca` or `verify-full` with a CA bundle; `require` (encrypt without checking) is refused | The driver only encrypts with a CA bundle. A self signed server certificate can be its own bundle | Yes |
 
 ## Not built yet
 

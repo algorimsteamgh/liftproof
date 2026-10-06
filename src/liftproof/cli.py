@@ -24,6 +24,7 @@ from liftproof.adapters.base import Adapter
 from liftproof.adapters.mysql import MySQLAdapter
 from liftproof.adapters.oracle import OracleAdapter
 from liftproof.adapters.postgres import PostgresAdapter
+from liftproof.adapters.sqlserver import SQLServerAdapter
 from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
 from liftproof.config import TEMPLATE, Connection, Project, load_project
 from liftproof.credentials import from_secrets_manager
@@ -80,7 +81,9 @@ def _refuse_env_credentials() -> None:
 
 def connect(conn: Connection) -> Adapter:
     creds = from_secrets_manager(conn.secret_arn) if conn.secret_arn else None
-    cls = {"mysql": MySQLAdapter, "oracle": OracleAdapter}.get(conn.engine, PostgresAdapter)
+    cls = {"mysql": MySQLAdapter, "oracle": OracleAdapter, "sqlserver": SQLServerAdapter}.get(
+        conn.engine, PostgresAdapter
+    )
     return cls(
         host=conn.host,
         port=conn.port,
@@ -446,7 +449,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 if r == "source":
                     _assert(a.verify_read_only(), "the source user can write; it must be read only")
                 with a.conn.cursor() as cur:
-                    cur.execute("SELECT md5('liftproof')")
+                    cur.execute(a.hash_probe)
+                if r == "source" and hasattr(a, "snapshot_available"):
+                    _assert(
+                        a.snapshot_available(),
+                        "snapshot isolation is off: a baseline of a live source is not "
+                        "consistent (ALTER DATABASE ... SET ALLOW_SNAPSHOT_ISOLATION ON)",
+                    )
                 return f"connected to {c.describe()}"
 
         check(
