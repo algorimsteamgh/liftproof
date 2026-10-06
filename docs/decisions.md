@@ -33,12 +33,16 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 31 | A scheduled run that would overlap | skipped, and the skip is a run: a report with a high severity error finding and a `ScheduledRunSkipped` CloudWatch metric (namespace Liftproof; dimensions Deployment, which the deployment's alarm watches, and Deployment plus Project); exit code 2 | A skip seen only in a log goes unnoticed for weeks. A run started by hand is refused with exit code 2 and writes nothing | Yes |
 | 32 | Scheduler | `mvt-scheduler.service` reads `schedules:` from every project file; five field cron, wall clock in a named time zone; each run is its own process; runs missed while it was down are not caught up, the latest missed one fires once | Customers with richer needs drive runs from their own pipeline through SSM Run Command (F11). No new dependency for cron parsing | Yes |
 | 33 | SSM document modes | validate, reconcile, files, replay, smoke, baseline and doctor, with `journeys` and `sets` parameters restricted by pattern | Every pipeline stage the CLI has can be called without a shell on the instance; the patterns keep parameters out of the shell | Yes |
+| 37 | CloudFormation template for the Marketplace listing | One template, `infra/cloudformation/liftproof.yaml`, written by hand to mirror `modules/liftproof`; a test compares the inputs, Run Command document, IAM statements, endpoints and instance settings of the two | Spec 3 offers both. Generating one from the other (cdktf, former2) would add a toolchain to the release path; a parity test catches drift with none | Yes |
+| 38 | Database egress in the template | Four fixed slots (CIDR and port), an empty CIDR skips the slot; one application port for a list of CIDRs | CloudFormation has no loop over a map, and a Marketplace form cannot take a list of objects. Four covers source, target and a replica each side | Yes |
+| 39 | Lookups the template needs | A small Lambda custom resource returns the VPC CIDR (endpoint security group) and the Region's S3 prefix list ID (S3 egress rule); read only EC2 permissions, runs outside the VPC so it needs no extra endpoint, logs to its own log group | Terraform reads both with data sources; CloudFormation has no equivalent | Yes |
+| 40 | AMI in the template | `ImageId` is an SSM parameter type defaulting to the Marketplace public parameter for the product, so each stack launches the latest listed version | The ID differs per Region and per version; a mapping would have to be edited on every release | Yes |
 
 ## Not built yet
 
 Web UI, parallel journeys, the target watermark that
 excludes rows a replay created when reconciliation must follow replay (validate already
 reconciles first), extractor transform chains (base64, URL encoding) for correlations,
-CloudFormation version of the deployment module, replication position assertion on the target,
+replication position assertion on the target,
 row predicate ignore rules, sampled mode, multi worker snapshots
 (`pg_export_snapshot` is captured but workers are not used yet).

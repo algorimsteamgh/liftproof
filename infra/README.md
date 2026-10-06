@@ -1,11 +1,14 @@
 # Liftproof infrastructure
 
-Everything here is Terraform (plus a Packer template for the AMI). It passes
+Everything here is Terraform (plus a Packer template for the AMI and a CloudFormation
+template for the AWS Marketplace listing). It passes
 `terraform validate` and a Checkov scan with no open findings; every Checkov skip is
 written next to the resource with its reason. Nothing has been applied to any account.
 
 ```
 infra/
+  cloudformation/liftproof.yaml  the same customer deployment as modules/liftproof, for the
+                            Marketplace "launch with CloudFormation" option (docs/marketplace.md)
   modules/liftproof            what a customer deploys: the product and everything around it
   modules/network           reference private VPC (for customers without one, and for tests)
   modules/account-baseline  security baseline for Algorims' own AWS accounts
@@ -108,8 +111,8 @@ endpoints can be shared with other workloads in the same VPC by setting
 
 ## What is still to do
 
-- A CloudFormation version of `modules/liftproof` for the Marketplace listing's
-  "launch with CloudFormation" option (spec 3 promises both).
+- A test launch of `cloudformation/liftproof.yaml`; it has passed `cfn-lint` and Checkov
+  only. `tests/test_cloudformation.py` keeps it in step with `modules/liftproof`.
 - Chromium and its libraries in the AMI once the recorder lands (the base image
   decision, Amazon Linux 2023 or Ubuntu, is still open).
 - Remote state bucket for the Terraform roots (backend blocks are in place, commented).

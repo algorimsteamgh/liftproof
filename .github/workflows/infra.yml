@@ -38,6 +38,18 @@ jobs:
       - name: Infrastructure security scan (fails on any unjustified finding)
         run: checkov -d infra/modules --framework terraform --compact --quiet
 
+  cloudformation:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cfn-lint checkov
+      - run: cfn-lint infra/cloudformation/liftproof.yaml
+      - name: Template security scan (fails on any unjustified finding)
+        run: checkov -d infra/cloudformation --framework cloudformation --compact --quiet
+
   packer:
     runs-on: ubuntu-24.04
     steps:
