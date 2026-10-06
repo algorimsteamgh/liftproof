@@ -63,6 +63,7 @@ def build_report(
     db: ReconcileResult | None,
     started_at: str,
     web: Any = None,
+    files: Any = None,
     finished_at: str,
     metadata: dict[str, Any],
     range_block: dict[str, Any],
@@ -92,6 +93,11 @@ def build_report(
         if j.status == "not_run"
     ]
 
+    file_sets = list(files.sets) if files is not None else []
+    f_total = sum(fs.files for fs in file_sets)
+    f_matched = sum(fs.matched for fs in file_sets)
+    f_attempted = sum(fs.matched + fs.different + fs.missing for fs in file_sets)
+
     # ATS-001: each user story, the journeys that test it, and what they found
     stories: dict[str, Counter] = defaultdict(Counter)
     for j in journeys:
@@ -119,6 +125,11 @@ def build_report(
             "journeys_passed": jstatus["passed"],
             "journeys_different": jstatus["different"],
             "journeys_failed": jstatus["failed"],
+            "files": f_total,
+            "files_matched": f_matched,
+            "files_different": sum(fs.different for fs in file_sets),
+            "files_missing": sum(fs.missing for fs in file_sets),
+            "files_extra": sum(fs.extra for fs in file_sets),
             "tables": exists,
             "tables_matched": status["matched"],
             "tables_different": status["different"],
@@ -136,6 +147,8 @@ def build_report(
             # those replayed. Reported separately on purpose (spec 12).
             "journeys_coverage_pct": _pct(j_attempted, len(journeys)),
             "journeys_success_pct": _pct(jstatus["passed"], j_attempted),
+            "files_coverage_pct": _pct(f_attempted, f_total),
+            "files_success_pct": _pct(f_matched, f_attempted),
             "not_covered": not_covered,
             "partially_compared": [
                 {"object": t.table, "excluded_columns": t.excluded_columns}
@@ -160,6 +173,7 @@ def build_report(
             for s, c in sorted(stories.items())
         ],
         "journeys": [asdict(j) for j in journeys],
+        "file_sets": [asdict(fs) for fs in file_sets],
         # F16: response times on the source and on AWS, side by side; never a verdict
         "timings": {
             "journeys": [

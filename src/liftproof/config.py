@@ -16,6 +16,7 @@ from typing import Any
 import yaml
 
 from liftproof.errors import ConfigError
+from liftproof.files.compare import FileSetConfig, IgnoreFile
 from liftproof.reconcile.engine import ReconcileOptions
 from liftproof.reconcile.plan import IgnoreRule
 
@@ -79,11 +80,17 @@ class Project:
     database: ReconcileOptions = field(default_factory=ReconcileOptions)
     path: Path | None = None
     web: WebConfig | None = None
+    files: list[FileSetConfig] = field(default_factory=list)
 
     def require_database(self) -> tuple[Connection, Connection]:
         if self.source is None or self.target is None:
             raise ConfigError("this project has no source and target database configured")
         return self.source, self.target
+
+    def require_files(self) -> list[FileSetConfig]:
+        if not self.files:
+            raise ConfigError("this project has no files section (file sets to compare)")
+        return self.files
 
     def require_web(self) -> WebConfig:
         if self.web is None:
@@ -181,6 +188,73 @@ def _web(d: Any) -> WebConfig | None:
     )
 
 
+def _side(d: Any, where: str) -> tuple[str, str | None, str | None]:
+    """A file location: a string, or {location, endpoint_url, secret_arn} for an S3
+    compatible store outside AWS."""
+    if isinstance(d, str) and d:
+        return d, None, None
+    if isinstance(d, dict) and d.get("location"):
+        return str(d["location"]), d.get("endpoint_url"), d.get("secret_arn")
+    raise ConfigError(f"{where} must be a path, an s3:// location, or {{location: ...}}")
+
+
+def _files(d: Any) -> list[FileSetConfig]:
+    if not d:
+        return []
+    if not isinstance(d, list):
+        raise ConfigError("files must be a list of file sets (name, source, target)")
+    sets, names = [], set()
+    for i, f in enumerate(d):
+        where = f"files.{i}"
+        if not isinstance(f, dict) or not f.get("name"):
+            raise ConfigError(f"{where}: every file set needs a name")
+        name = str(f["name"])
+        if name in names:
+            raise ConfigError(f"{where}: file set name {name!r} is used twice")
+        names.add(name)
+        src, src_ep, src_secret = _side(f.get("source"), f"{where}.source")
+        tgt, tgt_ep, tgt_secret = _side(f.get("target"), f"{where}.target")
+        ignore = []
+        for j, r in enumerate(f.get("ignore") or []):
+            if not isinstance(r, dict) or not r.get("path") or not r.get("reason"):
+                raise ConfigError(
+                    f"{where}.ignore.{j}: every ignore rule needs a path and a reason; "
+                    "the reasons are printed in the report"
+                )
+            ignore.append(IgnoreFile(str(r["path"]), str(r["reason"])))
+        path_map = []
+        for j, pair in enumerate(f.get("path_map") or []):
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise ConfigError(f"{where}.path_map.{j}: use [source regex, target replacement]")
+            path_map.append((str(pair[0]), str(pair[1])))
+        for pattern in [p for p, _ in path_map] + list(f.get("ignore_text") or []):
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ConfigError(f"{where}: {pattern!r} is not a valid regular expression: "
+                                  f"{exc}") from None  # fmt: skip
+        sets.append(
+            FileSetConfig(
+                name=name,
+                source=src,
+                target=tgt,
+                include=[str(x) for x in f.get("include") or []],
+                ignore=ignore,
+                ignore_text=[str(x) for x in f.get("ignore_text") or []],
+                path_map=path_map,
+                case_insensitive=bool(f.get("case_insensitive", False)),
+                show_content=bool(f.get("show_content", False)),
+                max_text_mb=int(f.get("max_text_mb", 64)),
+                workers=int(f.get("workers", 8)),
+                source_endpoint_url=src_ep,
+                target_endpoint_url=tgt_ep,
+                source_secret_arn=src_secret,
+                target_secret_arn=tgt_secret,
+            )
+        )
+    return sets
+
+
 def load_project(path: Path) -> Project:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -193,14 +267,19 @@ def load_project(path: Path) -> Project:
         raise ConfigError(f"{path}: 'project' (the project name) is required")
     store = raw.get("store") or {}
     web = _web(raw.get("web"))
+    files = _files(raw.get("files"))
     has_db = raw.get("source") is not None or raw.get("target") is not None
-    if not has_db and web is None:
-        raise ConfigError(f"{path}: configure source and target databases, a web section, or both")
+    if not has_db and web is None and not files:
+        raise ConfigError(
+            f"{path}: configure source and target databases, a web section, file sets, "
+            "or any combination"
+        )
     return Project(
         name=str(raw["project"]),
         source=_connection(raw.get("source"), "source") if has_db else None,
         target=_connection(raw.get("target"), "target") if has_db else None,
         web=web,
+        files=files,
         store=StoreConfig(
             store.get("s3_bucket"), store.get("s3_prefix", raw["project"]), store.get("kms_key_id")
         ),
@@ -246,6 +325,19 @@ web:                            # record and replay; omit for database only proj
   ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag"
   ignore_text: []               # regular expressions masked in page content
   step_timeout_ms: 15000
+
+files:                          # compare files the application generates or stores
+  - name: invoices
+    source: /mnt/source-share/invoices    # a path on this instance, or s3://bucket/prefix
+    target: s3://REPLACE-target-bucket/invoices/
+    include: ["*.pdf", "*.csv"]           # default: every file; * crosses folders
+    ignore_text: []                       # regular expressions masked in extracted text
+    show_content: false                   # the report shows where text differs, not what
+    # path_map: [["^archive/", "old/"]]   # rewrite source paths: regex -> replacement
+    # case_insensitive: false             # true when a Windows share moves to S3
+    # ignore:
+    #   - path: "tmp/*"
+    #     reason: scratch files, not migrated
 
 database:
   schemas: [public]
