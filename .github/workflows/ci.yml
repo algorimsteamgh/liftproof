@@ -30,6 +30,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -e ".[dev]"
+      - name: Chromium for record and replay tests
+        run: python -m playwright install --with-deps chromium
       - run: ruff check src tests
       - run: ruff format --check src
       - name: Functional tests (OPE-004). A red suite blocks merge and release.

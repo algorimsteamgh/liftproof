@@ -62,6 +62,7 @@ def build_report(
     findings: list[Finding],
     db: ReconcileResult | None,
     started_at: str,
+    web: Any = None,
     finished_at: str,
     metadata: dict[str, Any],
     range_block: dict[str, Any],
@@ -82,10 +83,24 @@ def build_report(
     )
     kinds = Counter(f.kind for f in findings)
 
+    journeys = list(web.journeys) if web is not None else []
+    jstatus = Counter(j.status for j in journeys)
+    j_attempted = len(journeys) - jstatus["not_run"]
+    not_covered += [
+        {"object": f"journey {j.journey}", "reason": j.reason or "not replayed"}
+        for j in journeys
+        if j.status == "not_run"
+    ]
+
+    # ATS-001: each user story, the journeys that test it, and what they found
     stories: dict[str, Counter] = defaultdict(Counter)
+    for j in journeys:
+        if j.story:
+            stories[j.story]["tests"] += 1
+            stories[j.story]["passed"] += j.status == "passed"
     for f in findings:
-        if f.story:
-            stories[f.story]["differences" if f.kind == Kind.DIFFERENCE else "other"] += 1
+        if f.story and f.kind == Kind.DIFFERENCE:
+            stories[f.story]["differences"] += 1
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -100,12 +115,15 @@ def build_report(
             else "hashes and column names only; no row values"
         ),
         "counts": {
-            "journeys": 0,
+            "journeys": len(journeys),
+            "journeys_passed": jstatus["passed"],
+            "journeys_different": jstatus["different"],
+            "journeys_failed": jstatus["failed"],
             "tables": exists,
             "tables_matched": status["matched"],
             "tables_different": status["different"],
             "differences": kinds[Kind.DIFFERENCE],
-            "not_checked": kinds[Kind.NOT_CHECKED] + status["excluded"],
+            "not_checked": kinds[Kind.NOT_CHECKED] + status["excluded"] + jstatus["not_run"],
             "partial": kinds[Kind.PARTIAL],
             "flakes": kinds[Kind.FLAKE],
             "errors": kinds[Kind.ERROR],
@@ -114,8 +132,10 @@ def build_report(
         "coverage": {
             "tables_coverage_pct": _pct(attempted, exists),
             "tables_success_pct": _pct(status["matched"], attempted),
-            "journeys_coverage_pct": None,
-            "journeys_success_pct": None,
+            # ATS-004: journeys replayed of journeys recorded, and those that passed of
+            # those replayed. Reported separately on purpose (spec 12).
+            "journeys_coverage_pct": _pct(j_attempted, len(journeys)),
+            "journeys_success_pct": _pct(jstatus["passed"], j_attempted),
             "not_covered": not_covered,
             "partially_compared": [
                 {"object": t.table, "excluded_columns": t.excluded_columns}
@@ -131,10 +151,32 @@ def build_report(
         "range": range_block,
         "tables": [asdict(t) for t in tables],
         "traceability": [
-            {"story": s, "tests": sum(c.values()), "differences": c["differences"]}
+            {
+                "story": s,
+                "tests": c["tests"],
+                "passed": c["passed"],
+                "differences": c["differences"],
+            }
             for s, c in sorted(stories.items())
         ],
-        "timings": [],
+        "journeys": [asdict(j) for j in journeys],
+        # F16: response times on the source and on AWS, side by side; never a verdict
+        "timings": {
+            "journeys": [
+                {
+                    "journey": j.journey,
+                    "source_ms": j.recorded_ms,
+                    "target_ms": j.replayed_ms,
+                    "change_pct": (
+                        round(100 * (j.replayed_ms - j.recorded_ms) / j.recorded_ms, 1)
+                        if j.recorded_ms and j.replayed_ms
+                        else None
+                    ),
+                }
+                for j in journeys
+            ],
+            "endpoints": list(web.endpoints) if web is not None else [],
+        },
         "run": {
             "started_at": started_at,
             "finished_at": finished_at,

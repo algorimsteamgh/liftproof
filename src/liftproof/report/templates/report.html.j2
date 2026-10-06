@@ -54,6 +54,8 @@
     <div class="tile"><b>{{ r.counts.tables|num }}</b><span>tables in scope</span></div>
     <div class="tile"><b>{{ r.counts.tables_matched|num }}</b><span>tables matched</span></div>
     <div class="tile"><b>{{ r.counts.tables_different|num }}</b><span>tables with differences</span></div>
+    {% if r.counts.journeys %}<div class="tile"><b>{{ r.counts.journeys|num }}</b><span>journeys in scope</span></div>
+    <div class="tile"><b>{{ r.counts.journeys_passed|num }}</b><span>journeys passed</span></div>{% endif %}
     <div class="tile"><b>{{ r.counts.differences|num }}</b><span>differences</span></div>
     <div class="tile"><b>{{ r.counts.not_checked|num }}</b><span>items not checked</span></div>
   </div>
@@ -62,6 +64,8 @@
   <div class="tiles">
     <div class="tile"><b>{{ r.coverage.tables_coverage_pct|pct }}</b><span>coverage: tables compared of tables in scope</span></div>
     <div class="tile"><b>{{ r.coverage.tables_success_pct|pct }}</b><span>success rate: tables matched of tables compared</span></div>
+    {% if r.counts.journeys %}<div class="tile"><b>{{ r.coverage.journeys_coverage_pct|pct }}</b><span>coverage: journeys replayed of journeys recorded</span></div>
+    <div class="tile"><b>{{ r.coverage.journeys_success_pct|pct }}</b><span>success rate: journeys passed of journeys replayed</span></div>{% endif %}
   </div>
   {% if r.coverage.not_covered %}
   <p><strong>Not covered</strong></p>
@@ -107,6 +111,26 @@
       <td class="num">{{ t.missing_rows|num }}</td><td class="num">{{ t.extra_rows|num }}</td>
       <td class="num">{{ t.changed_rows|num }}</td><td>{{ t.key }}</td></tr>
     {% endfor %}
+  </table></div>
+  {% endif %}
+
+  {% if r.journeys %}
+  <h2>Journeys</h2>
+  <div class="scroll"><table>
+    <tr><th>Journey</th><th>Story</th><th>Status</th><th class="num">Steps run</th><th class="num">Differences</th><th class="num">Attempts</th><th class="num">Flakes</th></tr>
+    {% for j in r.journeys %}
+    <tr><td><code>{{ j.journey }}</code></td><td>{{ j.story or "" }}</td>
+      <td class="status-{{ j.status }}">{{ j.status|replace("_"," ") }}</td>
+      <td class="num">{{ j.steps_run }} of {{ j.steps }}</td><td class="num">{{ j.differences }}</td>
+      <td class="num">{{ j.attempts }}</td><td class="num">{{ j.flakes }}</td></tr>
+    {% endfor %}
+  </table></div>
+  <h2>Response times, source and AWS</h2>
+  <p class="sub">Recorded for comparison only; a slower response is never a pass or fail condition on its own.</p>
+  <div class="scroll"><table>
+    <tr><th>Journey or endpoint</th><th class="num">Source ms</th><th class="num">AWS ms</th><th class="num">Change</th></tr>
+    {% for t in r.timings.journeys %}<tr><td><code>{{ t.journey }}</code></td><td class="num">{{ t.source_ms|num }}</td><td class="num">{{ t.target_ms|num }}</td><td class="num">{{ t.change_pct|pct }}</td></tr>{% endfor %}
+    {% for t in r.timings.endpoints %}<tr><td><code>{{ t.endpoint }}</code></td><td class="num">{{ t.source_ms|num }}</td><td class="num">{{ t.target_ms|num }}</td><td class="num">{{ t.change_pct|pct }}</td></tr>{% endfor %}
   </table></div>
   {% endif %}
 

@@ -23,7 +23,7 @@ from liftproof import __version__, aws, logs
 from liftproof.adapters.postgres import PostgresAdapter
 from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
 from liftproof.config import TEMPLATE, Connection, Project, load_project
-from liftproof.credentials import from_secrets_manager
+from liftproof.credentials import from_secrets_manager, secret_value
 from liftproof.errors import (
     EXIT_CONFIG,
     EXIT_DIFFERENCES,
@@ -38,6 +38,8 @@ from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import Reconciler, ReconcileResult, TableResult
 from liftproof.report.builder import build_report, who_ran_it, write_reports
 from liftproof.store import LocalStore, S3Store, Store
+from liftproof.web.journey import Journey
+from liftproof.web.run import WebResult
 
 log = logging.getLogger("liftproof.cli")
 
@@ -161,7 +163,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     if args.resume:
         store.get_file(key, manifest)
     o = project.database
-    with connect(project.source) as source:
+    with connect(project.require_database()[0]) as source:
         b = take_baseline(
             source,
             manifest,
@@ -225,35 +227,29 @@ def _load_results(run_dir: Path) -> ReconcileResult:
     return ReconcileResult([TableResult(**t) for t in d["tables"]], d["systemic"])
 
 
-def cmd_reconcile(args: argparse.Namespace) -> int:
-    project = _project(args)
-    workdir = Path(args.workdir) / project.name
-    store = _store(project, Path(args.workdir))
-    run_id = args.run_id or _new_id("r")
-    run_dir = workdir / "runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    logs.set_context(run_id=run_id, project=project.name)
+def _reconcile_into(
+    args: argparse.Namespace, project: Project, store: Store, workdir: Path, writer: FindingWriter
+) -> tuple[ReconcileResult, Baseline | None]:
+    """The database comparison of a run. Failures propagate to _run, which records them."""
+    src_conn, tgt_conn = project.require_database()
     o = project.database
-    if args.tables:
+    if getattr(args, "tables", None):
         o.tables = _tables(args)
     if args.show_values:
         o.show_values = True
     baseline = _load_baseline(args, project, store, workdir)
-    started = _now()
-    writer = FindingWriter(run_dir, run_id)
-    result = ReconcileResult()
-    failure: str | None = None
     target = source = None
+    rec = None
     try:
-        target = connect(project.target)
+        target = connect(tgt_conn)
         if not args.no_source:
             try:
-                source = connect(project.source)
+                source = connect(src_conn)
             except ConfigError:
                 if baseline is None:
                     raise
                 log.warning("source unreachable; comparing against the baseline only")
-        for conn in (project.source, project.target):
+        for conn in (src_conn, tgt_conn):
             if not conn.tls_verified:
                 writer.write(
                     Finding(
@@ -268,10 +264,43 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         rec = Reconciler(
             target, writer, o, source=source, baseline=baseline, progress=lambda m: log.info(m)
         )
-        try:
-            result = rec.run()
-        finally:
-            result = rec.result  # keep whatever finished before a failure
+        return rec.run(), baseline
+    except Exception as exc:
+        exc.partial_result = rec.result if rec else ReconcileResult()  # type: ignore[attr-defined]
+        exc.baseline = baseline  # type: ignore[attr-defined]
+        raise
+    finally:
+        for a in (source, target):
+            if a is not None:
+                a.close()
+
+
+def _run(args: argparse.Namespace, mode: str, *, database: bool, web: bool) -> int:
+    """One run: database first, then replay (spec 6: the tool creates data and must not
+    then reconcile it), then one report over every finding."""
+    project = _project(args)
+    workdir = Path(args.workdir) / project.name
+    store = _store(project, Path(args.workdir))
+    run_id = args.run_id or _new_id("r")
+    run_dir = workdir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    logs.set_context(run_id=run_id, project=project.name)
+    started = _now()
+    writer = FindingWriter(run_dir, run_id)
+    result: ReconcileResult | None = ReconcileResult() if database else None
+    web_result = None
+    baseline = None
+    failure: str | None = None
+    try:
+        if database:
+            try:
+                result, baseline = _reconcile_into(args, project, store, workdir, writer)
+            except Exception as exc:
+                result = getattr(exc, "partial_result", result)
+                baseline = getattr(exc, "baseline", None)
+                raise
+        if web:
+            web_result = _replay_into(args, project, store, workdir, writer)
     except ConfigError:
         raise
     except LiftproofError as exc:
@@ -280,13 +309,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         failure = f"{type(exc).__name__}: {logs.scrub(str(exc))}"
         log.error("run failed", exc_info=True)
     finally:
-        for a in (source, target):
-            if a is not None:
-                a.close()
         if failure:
             writer.write(
                 Finding(
-                    Comparator.DATABASE,
+                    Comparator.DATABASE if database and web_result is None else Comparator.UI,
                     Kind.ERROR,
                     Severity.CRITICAL,
                     "run",
@@ -294,16 +320,22 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 )
             )
         writer.close()
-        _save_results(run_dir, result)
+        if result is not None:
+            _save_results(run_dir, result)
+        if web_result is not None:
+            (run_dir / "web-results.json").write_text(
+                json.dumps(web_result.to_dict(), indent=2), encoding="utf-8"
+            )
 
     report = _report(
         project,
         run_id,
-        "reconcile",
+        mode,
         run_dir,
         result,
         started,
         baseline,
+        web_result=web_result,
         failure=failure,
         template=args.template,
     )
@@ -312,33 +344,235 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return _conclude(args, report, store, run_id)
 
 
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    return _run(args, "reconcile", database=True, web=False)
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    return _run(args, args.command, database=False, web=True)
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    project = _project(args)
+    return _run(
+        args,
+        "validate",
+        database=project.source is not None,
+        web=project.web is not None,
+    )
+
+
+# ------------------------------------------------------------------- journeys
+def _journey_dir(workdir: Path) -> Path:
+    return workdir / "journeys"
+
+
+def _journey_ids(args: argparse.Namespace, project: Project, workdir: Path) -> list[str]:
+    if getattr(args, "journeys", None):
+        return [j.strip() for j in args.journeys.split(",") if j.strip()]
+    web = project.require_web()
+    if web.journeys:
+        return list(web.journeys)
+    return sorted(p.stem for p in _journey_dir(workdir).glob("*.json"))
+
+
+def _load_journey(store: Store, workdir: Path, journey_id: str) -> Journey:
+    path = _journey_dir(workdir) / f"{journey_id}.json"
+    if not path.exists() and not store.get_file(f"journeys/{journey_id}.json", path):
+        raise ConfigError(f"journey {journey_id} not found; record it with liftproof record")
+    journey = Journey.load(path)
+    assets = _journey_dir(workdir) / journey_id / "assets"
+    for step in journey.steps:
+        for ex in step.exchanges:
+            if ex.body_asset:
+                local = assets / ex.body_asset.split("/")[-1]
+                if not local.exists():
+                    store.get_file(f"journeys/{journey_id}/{ex.body_asset}", local)
+    return journey
+
+
+def _save_journey(store: Store, workdir: Path, journey: Journey, assets: dict[str, bytes]) -> Path:
+    base = _journey_dir(workdir)
+    path = journey.save(base / f"{journey.journey_id}.json")
+    store.put_file(f"journeys/{journey.journey_id}.json", path)
+    for sha, body in assets.items():
+        local = base / journey.journey_id / "assets" / sha
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(body)
+        store.put_file(f"journeys/{journey.journey_id}/assets/{sha}", local)
+    return path
+
+
+def _journey_secrets(journey: Journey) -> dict[str, str]:
+    unbound = journey.unbound_tokens()
+    if unbound:
+        fields = ", ".join(f"{t} ({journey.secrets[t].field})" for t in unbound)
+        raise ConfigError(
+            f"journey {journey.journey_id}: redaction tokens not bound to a secret: {fields}. "
+            f"Bind each with: liftproof bind --journey {journey.journey_id} --token TOKEN "
+            "--secret-arn ARN --key KEY"
+        )
+    return {t: secret_value(b.arn, b.key) for t, b in journey.secrets.items() if b.arn}
+
+
+def _replay_into(
+    args: argparse.Namespace, project: Project, store: Store, workdir: Path, writer: FindingWriter
+) -> WebResult:
+    from liftproof.web.compare import WebOptions
+    from liftproof.web.run import run_journeys
+
+    web = project.require_web()
+    if not web.target_url:
+        raise ConfigError("web.target_url is required to replay")
+    journeys = [_load_journey(store, workdir, j) for j in _journey_ids(args, project, workdir)]
+    if not journeys:
+        raise ConfigError("no journeys recorded for this project; record one with liftproof record")
+    options = WebOptions(
+        compare_headers=web.compare_headers,
+        ignore_json_paths=web.ignore_json_paths,
+        ignore_text=web.ignore_text,
+        show_values=bool(args.show_values or project.database.show_values),
+    )
+    return run_journeys(
+        journeys,
+        target_url=web.target_url,
+        options=options,
+        emit=writer.write,
+        assets_dir=lambda j: _journey_dir(workdir) / j.journey_id / "assets",
+        secret_values=_journey_secrets,
+        step_timeout_ms=web.step_timeout_ms,
+        executable_path=web.chromium_path,
+    )
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    from liftproof.web.browser import BodyPolicy
+    from liftproof.web.recorder import Recorder
+
+    project = _project(args)
+    web = project.require_web()
+    workdir = Path(args.workdir) / project.name
+    store = _store(project, Path(args.workdir))
+    recorder = Recorder(
+        web.source_url,
+        policy=BodyPolicy(web.capture_bodies),
+        headless=False,
+        executable_path=web.chromium_path,
+    )
+    print(
+        "Recording. Carry out the journey in the browser window, then close the window.",
+        file=sys.stderr,
+    )
+    journey, assets = recorder.record(args.journey, start=args.start, story=args.story)
+    if args.writes:
+        journey.writes_tables = [t.strip() for t in args.writes.split(",") if t.strip()]
+    path = _save_journey(store, workdir, journey, assets)
+    unconfirmed = [c.name for c in journey.correlations if not c.confirmed]
+    _out(
+        args,
+        {
+            "journey": journey.journey_id,
+            "file": store.location(f"journeys/{journey.journey_id}.json"),
+            "steps": len(journey.steps),
+            "correlations": [c.name for c in journey.correlations],
+            "unconfirmed_correlations": unconfirmed,
+            "unbound_tokens": journey.unbound_tokens(),
+        },
+        f"recorded {journey.journey_id}: {len(journey.steps)} steps, "
+        f"{len(journey.correlations)} correlations ({len(unconfirmed)} to confirm)\n"
+        + "".join(
+            f"bind {t} ({journey.secrets[t].field}): liftproof bind --project {args.project} "
+            f"--journey {journey.journey_id} --token {t} --secret-arn ARN --key KEY\n"
+            for t in journey.unbound_tokens()
+        )
+        + f"saved: {path}",
+    )
+    return EXIT_OK
+
+
+def cmd_bind(args: argparse.Namespace) -> int:
+    """Bind a redaction token to a secret, or confirm a correlation, in a journey file."""
+    project = _project(args)
+    workdir = Path(args.workdir) / project.name
+    store = _store(project, Path(args.workdir))
+    journey = _load_journey(store, workdir, args.journey)
+    done = []
+    if args.token:
+        if args.token not in journey.secrets:
+            raise ConfigError(f"journey {args.journey} has no token {args.token}")
+        if not args.secret_arn:
+            raise ConfigError("--secret-arn is required with --token")
+        b = journey.secrets[args.token]
+        b.arn, b.key = args.secret_arn, args.key
+        done.append(f"{args.token} bound to {args.secret_arn} key {args.key}")
+    for name in args.confirm or []:
+        match = [c for c in journey.correlations if c.name == name]
+        if not match:
+            raise ConfigError(f"journey {args.journey} has no correlation {name}")
+        match[0].confirmed = True
+        done.append(f"correlation {name} confirmed")
+    if not done:
+        raise ConfigError("nothing to do: give --token with --secret-arn, or --confirm NAME")
+    _save_journey(store, workdir, journey, {})
+    _out(args, {"journey": args.journey, "changes": done}, "\n".join(done))
+    return EXIT_OK
+
+
 def _report(
-    project, run_id, mode, run_dir, result, started, baseline, *, failure=None, template=None
+    project,
+    run_id,
+    mode,
+    run_dir,
+    result,
+    started,
+    baseline,
+    *,
+    web_result=None,
+    failure=None,
+    template=None,
 ) -> dict[str, Any]:
     findings = list(read_findings(run_dir))
     o = project.database
-    range_block = {
-        "schemas": ", ".join(o.schemas),
-        "tables": [t.table for t in result.tables],
-        "source": project.source.describe(),
-        "target": project.target.describe(),
-        "reference": f"baseline {baseline.baseline_id}" if baseline else "live source",
-        "consistency_position": baseline.position if baseline else "live read",
-        "run_window": f"{started} to {_now()}",
-    }
-    metadata = {
+    range_block: dict[str, Any] = {"run_window": f"{started} to {_now()}"}
+    metadata: dict[str, Any] = {
         "invoked_by": who_ran_it(),
         "values_shown": o.show_values,
-        "tls": {"source": project.source.sslmode, "target": project.target.sslmode},
-        "rows_per_bucket": o.rows_per_bucket,
-        "timestamp_precision": o.precision,
     }
+    if result is not None and project.source is not None:
+        range_block.update(
+            {
+                "schemas": ", ".join(o.schemas),
+                "tables": [t.table for t in result.tables],
+                "source": project.source.describe(),
+                "target": project.target.describe(),
+                "reference": f"baseline {baseline.baseline_id}" if baseline else "live source",
+                "consistency_position": baseline.position if baseline else "live read",
+            }
+        )
+        metadata.update(
+            {
+                "tls": {"source": project.source.sslmode, "target": project.target.sslmode},
+                "rows_per_bucket": o.rows_per_bucket,
+                "timestamp_precision": o.precision,
+            }
+        )
+    if web_result is not None:
+        range_block.update(
+            {
+                "journeys": [j.journey for j in web_result.journeys],
+                "web_source": project.web.source_url if project.web else None,
+                "web_target": web_result.target_url,
+                "journeys_in_parallel": web_result.parallel,
+            }
+        )
+        metadata["browser"] = web_result.browser
     report = build_report(
         run_id=run_id,
         project=project.name,
         mode=mode,
         findings=findings,
         db=result,
+        web=web_result,
         started_at=started,
         finished_at=_now(),
         metadata=metadata,
@@ -354,28 +588,38 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
     html = store.location(f"runs/{run_id}/report.html")
     c = report["counts"]
     cov = report["coverage"]
+    lines = [f"verdict: {report['verdict']}"]
+    if c["tables"]:
+        lines.append(
+            f"tables: {c['tables']} ({c['tables_matched']} matched, {c['tables_different']} "
+            "different)"
+        )
+    if c["journeys"]:
+        lines.append(
+            f"journeys: {c['journeys']} ({c['journeys_passed']} passed, "
+            f"{c['journeys_different']} different, {c['journeys_failed']} failed)"
+        )
+    lines.append(f"differences: {c['differences']}, not checked: {c['not_checked']}")
+    lines.append(f"report: {html}")
     _out(
         args,
         {
             "run_id": run_id,
             "verdict": report["verdict"],
             "counts": c,
-            "coverage": {k: cov[k] for k in ("tables_coverage_pct", "tables_success_pct")},
+            "coverage": {k: v for k, v in cov.items() if k.endswith("_pct")},
             "report_html": html,
             "report_json": store.location(f"runs/{run_id}/report.json"),
         },
-        f"verdict: {report['verdict']}\n"
-        f"tables: {c['tables']} ({c['tables_matched']} matched, {c['tables_different']} "
-        f"different), differences: {c['differences']}, not checked: {c['not_checked']}\n"
-        f"report: {html}",
+        "\n".join(lines),
     )
     if report["failure"]:
         return EXIT_RUN_FAILED
     if args.fail_on == "never":
         return EXIT_OK
     if args.fail_on == "errors":
-        return EXIT_OK
-    return EXIT_DIFFERENCES if c["differences"] else EXIT_OK
+        return EXIT_DIFFERENCES if c["errors"] else EXIT_OK
+    return EXIT_DIFFERENCES if c["differences"] or c["errors"] else EXIT_OK
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -390,14 +634,20 @@ def cmd_report(args: argparse.Namespace) -> int:
         else {}
     )
     started = prior.get("run", {}).get("started_at", _now())
+    web_file = run_dir / "web-results.json"
     report = _report(
         project,
         args.run,
         prior.get("mode", "reconcile"),
         run_dir,
-        _load_results(run_dir),
+        _load_results(run_dir) if (run_dir / "db-results.json").exists() else None,
         started,
         None,
+        web_result=(
+            WebResult.from_dict(json.loads(web_file.read_text(encoding="utf-8")))
+            if web_file.exists()
+            else None
+        ),
         failure=prior.get("failure"),
         template=args.template,
     )
@@ -421,7 +671,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 {"check": name, "result": "fail", "detail": logs.scrub(msg), "remedy": remedy}
             )
 
-    for role, conn in (("source", project.source), ("target", project.target)):
+    connections = [("source", project.source), ("target", project.target)]
+    for role, conn in [(r, c) for r, c in connections if c is not None]:
         if conn.secret_arn:
             check(
                 f"{role} secret resolves",
@@ -451,6 +702,35 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "check the route (VPN, Direct Connect, security groups) and the grants: the "
             "source user needs SELECT only",
         )
+    if project.web is not None:
+        workdir = Path(args.workdir) / project.name
+        store = _store(project, Path(args.workdir))
+        for jid in _journey_ids(args, project, workdir):
+
+            def _tokens(j=jid):
+                journey = _load_journey(store, workdir, j)
+                values = _journey_secrets(journey)
+                return f"{len(values)} secret(s) resolve" if values else "no secrets needed"
+
+            check(
+                f"journey {jid} secrets resolve",
+                _tokens,
+                "bind every redaction token with liftproof bind, and grant "
+                "secretsmanager:GetSecretValue on the secrets",
+            )
+
+        def _browser():
+            from playwright.sync_api import sync_playwright
+
+            from liftproof.web.browser import launch
+
+            with sync_playwright() as pw:
+                b = launch(pw, executable_path=project.web.chromium_path)
+                version = b.version
+                b.close()
+            return f"chromium {version}"
+
+        check("browser starts", _browser, "the AMI ships Chromium; set web.chromium_path")
     if project.store.s3_bucket:
 
         def _s3():
@@ -538,6 +818,47 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--run-id")
     s.add_argument("--template", help="directory holding a custom report.html.j2")
     s.set_defaults(fn=cmd_reconcile)
+
+    def run_flags(s, database: bool) -> None:
+        s.add_argument("--journeys", help="comma separated journey ids; default: all")
+        s.add_argument(
+            "--show-values",
+            action="store_true",
+            help="print values in the report (the report becomes an egress path)",
+        )
+        s.add_argument("--run-id")
+        s.add_argument("--template", help="directory holding a custom report.html.j2")
+        if database:
+            s.add_argument("--baseline", help="baseline id, or 'latest'")
+            s.add_argument("--no-source", action="store_true")
+            s.add_argument("--tables", help="comma separated subset")
+
+    s = with_project("record", "record a user journey on the source application")
+    s.add_argument("--journey", required=True, help="journey id, e.g. checkout-flow")
+    s.add_argument("--start", default="/", help="path to open first")
+    s.add_argument("--story", help="user story label, for traceability")
+    s.add_argument("--writes", help="comma separated tables the journey writes to")
+    s.set_defaults(fn=cmd_record)
+
+    s = with_project("bind", "bind a redaction token to a secret, or confirm a correlation")
+    s.add_argument("--journey", required=True)
+    s.add_argument("--token")
+    s.add_argument("--secret-arn")
+    s.add_argument("--key", default="password")
+    s.add_argument("--confirm", action="append", help="correlation name to confirm")
+    s.set_defaults(fn=cmd_bind)
+
+    s = with_project("replay", "replay journeys against the target and compare")
+    run_flags(s, database=False)
+    s.set_defaults(fn=cmd_replay)
+
+    s = with_project("smoke", "replay a named subset of journeys (cutover pipelines)")
+    run_flags(s, database=False)
+    s.set_defaults(fn=cmd_replay)
+
+    s = with_project("validate", "full run: reconcile, then replay, then one report")
+    run_flags(s, database=True)
+    s.set_defaults(fn=cmd_validate)
 
     s = with_project("report", "regenerate a report from a run's findings")
     s.add_argument("--run", required=True)

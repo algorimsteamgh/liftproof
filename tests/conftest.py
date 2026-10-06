@@ -78,3 +78,18 @@ def adapter_for():
     yield factory
     for a in opened:
         a.close()
+
+
+# ---------------------------------------------------------------------- browser
+@pytest.fixture(scope="session")
+def browser_available():
+    """Playwright's Chromium, or the binary named by LIFTPROOF_CHROMIUM."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        from liftproof.web.browser import launch
+
+        with sync_playwright() as p:
+            launch(p).close()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"no browser for tests: {str(exc).splitlines()[0]}")

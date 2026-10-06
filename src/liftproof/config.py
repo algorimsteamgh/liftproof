@@ -55,13 +55,40 @@ class StoreConfig:
 
 
 @dataclass
+class WebConfig:
+    """Record and replay settings (spec 5 to 8). Bodies are kept only for capture_bodies
+    URL patterns; everything else is reduced to a hash and a shape."""
+
+    source_url: str
+    target_url: str | None = None
+    journeys: list[str] | None = None  # default: every recorded journey
+    capture_bodies: list[str] = field(default_factory=list)
+    compare_headers: list[str] = field(default_factory=list)
+    ignore_json_paths: list[str] = field(default_factory=list)
+    ignore_text: list[str] = field(default_factory=list)
+    step_timeout_ms: int = 15_000
+    chromium_path: str | None = None
+
+
+@dataclass
 class Project:
     name: str
-    source: Connection
-    target: Connection
+    source: Connection | None  # None: the project validates web journeys only
+    target: Connection | None
     store: StoreConfig = field(default_factory=StoreConfig)
     database: ReconcileOptions = field(default_factory=ReconcileOptions)
     path: Path | None = None
+    web: WebConfig | None = None
+
+    def require_database(self) -> tuple[Connection, Connection]:
+        if self.source is None or self.target is None:
+            raise ConfigError("this project has no source and target database configured")
+        return self.source, self.target
+
+    def require_web(self) -> WebConfig:
+        if self.web is None:
+            raise ConfigError("this project has no web section (source_url, target_url)")
+        return self.web
 
 
 def _scan_for_credentials(node: Any, where: str = "") -> None:
@@ -129,6 +156,31 @@ def _options(d: dict[str, Any]) -> ReconcileOptions:
     return opts
 
 
+def _web(d: Any) -> WebConfig | None:
+    if not d:
+        return None
+    if not isinstance(d, dict) or not d.get("source_url"):
+        raise ConfigError("web.source_url is required when a web section is present")
+
+    def strings(key: str) -> list[str]:
+        v = d.get(key) or []
+        if not isinstance(v, list):
+            raise ConfigError(f"web.{key} must be a list")
+        return [str(x) for x in v]
+
+    return WebConfig(
+        source_url=str(d["source_url"]),
+        target_url=d.get("target_url"),
+        journeys=strings("journeys") or None,
+        capture_bodies=strings("capture_bodies"),
+        compare_headers=strings("compare_headers"),
+        ignore_json_paths=strings("ignore_json_paths"),
+        ignore_text=strings("ignore_text"),
+        step_timeout_ms=int(d.get("step_timeout_ms", 15_000)),
+        chromium_path=d.get("chromium_path"),
+    )
+
+
 def load_project(path: Path) -> Project:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -140,10 +192,15 @@ def load_project(path: Path) -> Project:
     if "project" not in raw:
         raise ConfigError(f"{path}: 'project' (the project name) is required")
     store = raw.get("store") or {}
+    web = _web(raw.get("web"))
+    has_db = raw.get("source") is not None or raw.get("target") is not None
+    if not has_db and web is None:
+        raise ConfigError(f"{path}: configure source and target databases, a web section, or both")
     return Project(
         name=str(raw["project"]),
-        source=_connection(raw.get("source"), "source"),
-        target=_connection(raw.get("target"), "target"),
+        source=_connection(raw.get("source"), "source") if has_db else None,
+        target=_connection(raw.get("target"), "target") if has_db else None,
+        web=web,
         store=StoreConfig(
             store.get("s3_bucket"), store.get("s3_prefix", raw["project"]), store.get("kms_key_id")
         ),
@@ -180,6 +237,15 @@ target:
   secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/target
   sslmode: verify-full
   sslrootcert: /opt/liftproof/certs/rds-global-bundle.pem
+
+web:                            # record and replay; omit for database only projects
+  source_url: https://app.example.internal
+  target_url: https://app.example.com
+  capture_bodies: ["/api/*"]    # bodies kept for value comparison; others: hash and shape
+  compare_headers: []           # only these response headers are compared
+  ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag"
+  ignore_text: []               # regular expressions masked in page content
+  step_timeout_ms: 15000
 
 database:
   schemas: [public]
