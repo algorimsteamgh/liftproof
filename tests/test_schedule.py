@@ -197,6 +197,7 @@ def test_overlapping_runs(project, tmp_path, capsys, monkeypatch):
     base = ["--project", str(project), "--workdir", str(work), "--format", "json"]
     metrics = []
     monkeypatch.setattr(aws, "put_metric", lambda *a, **k: metrics.append((a, k)))
+    monkeypatch.setattr(cli, "_instance_config", lambda: {"deployment": "acme-prod"})
     with LocalRunLock(work / "docs" / "locks" / "run.lock", "r-busy", "validate"):
         # by hand: refused with exit code 2, and nothing is written
         assert cli.main(["files", *base, "--run-id", "r-hand"]) == 2
@@ -211,7 +212,11 @@ def test_overlapping_runs(project, tmp_path, capsys, monkeypatch):
     assert report["run"]["schedule"] == "nightly"
     [finding] = [f for f in report["findings"] if f["comparator"] == "run"]
     assert finding["kind"] == "error" and "r-busy" in finding["summary"]
-    assert metrics == [(("ScheduledRunSkipped", 1, {"Project": "docs"}), {})]
+    # one data point for the deployment's alarm, one naming the project
+    assert metrics == [
+        (("ScheduledRunSkipped", 1, {"Deployment": "acme-prod"}), {}),
+        (("ScheduledRunSkipped", 1, {"Deployment": "acme-prod", "Project": "docs"}), {}),
+    ]
 
     # the lock is free again: the run goes ahead and the history shows both
     assert cli.main(["files", *base, "--run-id", "r-ok", "--scheduled", "nightly"]) == 0

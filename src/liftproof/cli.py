@@ -348,8 +348,13 @@ def _skipped(args, project: Project, store: Store, run_id: str, mode: str, exc) 
         )
     )
     writer.close()
+    # The deployment's alarm watches the Deployment dimension alone; the second data point
+    # says which project skipped.
+    deployment = _instance_config().get("deployment")
+    dimensions = [{"Deployment": deployment}, {"Deployment": deployment, "Project": project.name}]
     try:
-        aws.put_metric("ScheduledRunSkipped", 1, {"Project": project.name})
+        for dims in dimensions if deployment else [{"Project": project.name}]:
+            aws.put_metric("ScheduledRunSkipped", 1, dims)
     except Exception as e:  # noqa: BLE001 - the report still records the skip
         log.warning("could not publish the ScheduledRunSkipped metric: %s", e)
     report = _report(

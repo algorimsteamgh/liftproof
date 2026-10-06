@@ -146,7 +146,9 @@ schedule that started each run.
 
 Runs of one project never overlap, whoever starts them. A scheduled run that finds the
 previous one still going is skipped and recorded as a run whose report carries an error
-finding, and the `ScheduledRunSkipped` metric (namespace `Liftproof`, dimension
-`Project`) is published so you can alarm on it. Runs missed while the instance was
+finding, and the `ScheduledRunSkipped` metric (namespace `Liftproof`) is published
+twice: with the `Deployment` dimension, which the deployment's
+`liftproof-NAME-scheduled-run-skipped` alarm watches, and with `Deployment` and
+`Project`, which names the project. Runs missed while the instance was
 stopped are not caught up; the latest missed one fires once when the scheduler starts
 again.
