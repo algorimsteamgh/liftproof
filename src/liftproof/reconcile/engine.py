@@ -316,7 +316,7 @@ class Reconciler:
         # 2. table aggregate
         s_total = reduce_total(sum(a.total for a in s_aggs.values()))
         t_total = reduce_total(sum(a.total for a in t_aggs.values()))
-        self._floats(table, ttable, tp, res)
+        self._floats(table, ttable, tp, res, tschema)
         if s_total == t_total and res.target_rows == source_rows:
             return res
         res.status = "different"
@@ -513,7 +513,14 @@ class Reconciler:
             },
         )
 
-    def _floats(self, table: TableRef, ttable: TableRef, tp: TablePlan, res: TableResult) -> None:
+    def _floats(
+        self,
+        table: TableRef,
+        ttable: TableRef,
+        tp: TablePlan,
+        res: TableResult,
+        tschema: TableSchema,
+    ) -> None:
         if not tp.float_columns or self.source is None:
             if tp.float_columns:
                 self.emit(
@@ -526,7 +533,8 @@ class Reconciler:
         tol = self.o.float_rel_tolerance
         for col in tp.float_columns:
             a = self.source.float_stats(table, col)
-            b = self.target.float_stats(ttable, col)
+            tcol = tschema.column(col)  # the target's own spelling (Oracle: upper case)
+            b = self.target.float_stats(ttable, tcol.name if tcol else col)
             problems = []
             for name in ("non_null", "nan_count", "inf_count"):
                 if getattr(a, name) != getattr(b, name):

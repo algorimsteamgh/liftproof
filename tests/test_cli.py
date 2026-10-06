@@ -161,3 +161,34 @@ def test_mysql_to_postgresql_project_defaults(tmp_path):
     assert (p.source.port, p.target.port) == (3306, 5432)
     assert p.database.schemas == ["shop"]
     assert p.database.schema_map == {"shop": "public"}
+
+
+def test_oracle_home_schema_is_the_login(tmp_path):
+    from liftproof.config import load_project
+
+    f = tmp_path / "p.yaml"
+    f.write_text(
+        "project: p\n"
+        "source: {engine: oracle, host: o, database: ORCLPDB1, user: app}\n"
+        "target: {engine: postgresql, host: p, database: app}\n"
+    )
+    p = load_project(f)
+    assert p.source.port == 1521
+    assert p.database.schemas == ["APP"]
+    assert p.database.schema_map == {"APP": "public"}
+
+
+def test_oracle_without_a_user_needs_schemas(tmp_path):
+    from liftproof.config import load_project
+    from liftproof.errors import ConfigError
+
+    f = tmp_path / "p.yaml"
+    f.write_text(
+        "project: p\n"
+        "source: {engine: oracle, host: o, database: ORCLPDB1, secret_arn: arn:x}\n"
+        "target: {engine: postgresql, host: p, database: app}\n"
+    )
+    with pytest.raises(ConfigError, match="database.schemas"):
+        load_project(f)
+    f.write_text(f.read_text() + "database: {schemas: [APP], schema_map: {APP: public}}\n")
+    assert load_project(f).database.schema_map == {"APP": "public"}

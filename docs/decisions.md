@@ -21,6 +21,9 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 14 | MySQL driver version | PyMySQL below 1.2 | PyMySQL 1.2.3 fails the full `caching_sha2_password` login exchange; lift the cap once fixed upstream | Yes |
 | 15 | Schema names across engines | `database.schema_map`, defaulting to the source home schema mapped onto the target's (MySQL `shop` to PostgreSQL `public`) | In MySQL a schema is the database; a migration usually renames it | Yes |
 | 16 | MySQL replication position | GTID set (or binlog file and position) read immediately after the snapshot opens, recorded with `exact: false` | MySQL does not expose the position of a consistent snapshot atomically; the alternative, a global read lock, is not acceptable on a production source | Yes |
+| 23 | Third database engine | Oracle 19c and later (RDS for Oracle), via python-oracledb in thin mode | The largest legacy source estate; thin mode needs no Oracle client on the image. SQL Server follows | Yes |
+| 24 | Oracle snapshot and position | One `SET TRANSACTION READ ONLY` transaction; the SCN read right after it begins, recorded with `exact: false`, or unknown without `SELECT` on `V$DATABASE` | Oracle answers every query in a read only transaction as of its start; `AS OF SCN` flashback queries need undo retention the source may not have | Yes |
+| 25 | Integer against decimal columns | Planned together as decimal instead of a type change | Oracle `NUMBER` keys move to `bigint`; the renderings agree for whole numbers, so excluding the column would hide real differences | Yes |
 
 ## Not built yet
 
