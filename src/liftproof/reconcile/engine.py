@@ -6,6 +6,8 @@ present on both sides. On a healthy migration most tables stop at the aggregate.
 
 The reference side is either a live source adapter or a stored baseline. Drill-down
 below the bucket level always needs the live source: a baseline holds aggregates only.
+Against a target baseline (rebaseline) there is no live reference at all: the comparison
+says what has changed in the target since it was accepted, down to the bucket.
 """
 
 from __future__ import annotations
@@ -102,6 +104,10 @@ class Reconciler:
     ) -> None:
         if source is None and baseline is None:
             raise ValueError("a live source or a baseline is required")
+        self.against_target = baseline is not None and baseline.side == "target"
+        if self.against_target and source is not None:
+            raise ValueError("a target baseline is compared with the target alone")
+        self.reference = "target baseline" if self.against_target else "source"
         self.source = source
         self.baseline = baseline
         self.target = target
@@ -285,7 +291,11 @@ class Reconciler:
             s_aggs = self.source.bucket_aggregates(plan)
         else:
             res.status = "not_checked"
-            res.reason = "schema changed since the baseline; the live source is needed to re-hash"
+            res.reason = (
+                "schema changed since the target baseline; rebaseline once the change is accepted"
+                if self.against_target
+                else "schema changed since the baseline; the live source is needed to re-hash"
+            )
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, res.reason)
             return res
 
@@ -299,7 +309,8 @@ class Reconciler:
                 Kind.DIFFERENCE,
                 Severity.HIGH,
                 q,
-                f"row count differs: source {source_rows:,}, target {res.target_rows:,} "
+                f"row count differs: {self.reference} {source_rows:,}, "
+                f"target {res.target_rows:,} "
                 f"({res.target_rows - source_rows:+,})",
                 expected=str(source_rows),
                 actual=str(res.target_rows),
@@ -335,7 +346,10 @@ class Reconciler:
                 Kind.NOT_CHECKED,
                 Severity.MEDIUM,
                 q,
-                "row level drill-down needs the live source database; "
+                "the target baseline holds bucket aggregates only and the target's past state "
+                "cannot be re-read; only bucket level differences are reported"
+                if self.against_target
+                else "row level drill-down needs the live source database; "
                 "only bucket level differences are reported",
             )
             return res
@@ -513,7 +527,9 @@ class Reconciler:
                     Kind.NOT_CHECKED,
                     Severity.LOW,
                     table.qualified,
-                    "approximate columns need the live source: " + ", ".join(tp.float_columns),
+                    "approximate columns need a live reference: " + ", ".join(tp.float_columns)
+                    if self.against_target
+                    else "approximate columns need the live source: " + ", ".join(tp.float_columns),
                 )
             return
         tol = self.o.float_rel_tolerance

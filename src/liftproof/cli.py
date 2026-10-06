@@ -156,26 +156,44 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_baseline(args: argparse.Namespace) -> int:
+    return _take_baseline(args, "source")
+
+
+def cmd_rebaseline(args: argparse.Namespace) -> int:
+    """Snapshot the target as the new reference (spec 14), after cutover or once a set of
+    differences has been accepted. Only the target is read; the source may be gone."""
+    return _take_baseline(args, "target")
+
+
+# The id `--baseline` resolves for each side's newest baseline.
+LATEST = {"source": "latest", "target": "latest-target"}
+
+
+def _take_baseline(args: argparse.Namespace, side: str) -> int:
     project = _project(args)
     project.require_database()
     store = _store(project, Path(args.workdir))
-    baseline_id = args.baseline_id or _new_id("b")
+    baseline_id = args.baseline_id or _new_id("b" if side == "source" else "t")
+    if baseline_id in LATEST.values():
+        raise ConfigError(f"{baseline_id!r} is reserved; choose another baseline id")
+    mode = "baseline" if side == "source" else "rebaseline"
     return _locked(
-        args, project, store, baseline_id, "baseline",
-        lambda: _baseline_locked(args, project, store, baseline_id),
+        args, project, store, baseline_id, mode,
+        lambda: _baseline_locked(args, project, store, baseline_id, side),
     )  # fmt: skip
 
 
-def _baseline_locked(args, project: Project, store: Store, baseline_id: str) -> int:
+def _baseline_locked(args, project: Project, store: Store, baseline_id: str, side: str) -> int:
     workdir = Path(args.workdir) / project.name
     manifest = workdir / "baselines" / baseline_id / "manifest.json"
     key = f"baselines/{baseline_id}/manifest.json"
     if args.resume:
         store.get_file(key, manifest)
     o = project.database
-    with connect(project.require_database()[0]) as source:
+    source_conn, target_conn = project.require_database()
+    with connect(source_conn if side == "source" else target_conn) as db:
         b = take_baseline(
-            source,
+            db,
             manifest,
             baseline_id=baseline_id,
             schemas=o.schemas,
@@ -185,12 +203,17 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str) -> 
             rows_per_bucket=o.rows_per_bucket,
             precision=o.precision,
             resume=args.resume,
+            side=side,
             progress=lambda m: log.info(m),
         )
     store.put_file(key, manifest)
-    (workdir / "baselines" / "latest").write_text(baseline_id, encoding="utf-8")
+    # The marker goes to the store too, so a replacement instance still finds it.
+    marker = workdir / "baselines" / LATEST[side]
+    marker.write_text(baseline_id, encoding="utf-8")
+    store.put_file(f"baselines/{LATEST[side]}", marker)
     payload = {
         "baseline_id": baseline_id,
+        "side": side,
         "tables": len(b.tables),
         "rows": sum(t.row_count for t in b.tables.values()),
         "consistency": b.position,
@@ -199,8 +222,9 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str) -> 
     _out(
         args,
         payload,
-        f"baseline {baseline_id}: {payload['tables']} tables, {payload['rows']:,} rows\n"
-        f"consistency position: {b.position.get('position')}\nmanifest: {payload['manifest']}",
+        f"{side} baseline {baseline_id}: {payload['tables']} tables, {payload['rows']:,} rows\n"
+        f"consistency position: {b.position.get('position')}\nmanifest: {payload['manifest']}"
+        + (f"\ncompare against it with: --baseline {LATEST['target']}" if side == "target" else ""),
     )
     return EXIT_OK
 
@@ -209,10 +233,13 @@ def _load_baseline(args, project: Project, store: Store, workdir: Path) -> Basel
     if not args.baseline:
         return None
     bid = args.baseline
-    if bid == "latest":
-        marker = workdir / "baselines" / "latest"
-        if not marker.exists():
-            raise ConfigError("no baseline has been taken for this project")
+    if bid in LATEST.values():
+        # The store's marker wins: another instance may have taken a newer baseline.
+        marker = workdir / "baselines" / bid
+        if not store.get_file(f"baselines/{bid}", marker) and not marker.exists():
+            side = "target" if bid == LATEST["target"] else "source"
+            how = "liftproof rebaseline" if side == "target" else "liftproof baseline"
+            raise ConfigError(f"no {side} baseline has been taken for this project ({how})")
         bid = marker.read_text(encoding="utf-8").strip()
     path = workdir / "baselines" / bid / "manifest.json"
     if not path.exists() and not store.get_file(f"baselines/{bid}/manifest.json", path):
@@ -252,7 +279,9 @@ def _reconcile_into(
     rec = None
     try:
         target = connect(tgt_conn)
-        if not args.no_source:
+        # A target baseline is the reference on its own: reading the source would compare
+        # the target with something other than its accepted state.
+        if not args.no_source and not (baseline is not None and baseline.side == "target"):
             try:
                 source = connect(src_conn)
             except ConfigError:
@@ -668,7 +697,11 @@ def _report(
                 "tables": [t.table for t in result.tables],
                 "source": project.source.describe(),
                 "target": project.target.describe(),
-                "reference": f"baseline {baseline.baseline_id}" if baseline else "live source",
+                "reference": (
+                    f"{baseline.side} baseline {baseline.baseline_id}"
+                    if baseline
+                    else "live source"
+                ),
                 "consistency_position": baseline.position if baseline else "live read",
             }
         )
@@ -1027,8 +1060,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_baseline)
 
+    s = with_project("rebaseline", "snapshot the target as the new reference, after cutover")
+    s.add_argument("--tables", help="comma separated subset")
+    s.add_argument("--baseline-id")
+    s.add_argument("--resume", action="store_true", help="continue an interrupted rebaseline")
+    s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_rebaseline)
+
     s = with_project("reconcile", "compare the target database against the source")
-    s.add_argument("--baseline", help="baseline id, or 'latest'; default: live source only")
+    s.add_argument(
+        "--baseline",
+        help="baseline id, 'latest' (source) or 'latest-target' (rebaseline); "
+        "default: live source only",
+    )
     s.add_argument(
         "--no-source",
         action="store_true",
@@ -1056,7 +1100,7 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--template", help="directory holding a custom report.html.j2")
         s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
         if database:
-            s.add_argument("--baseline", help="baseline id, or 'latest'")
+            s.add_argument("--baseline", help="baseline id, 'latest' or 'latest-target'")
             s.add_argument("--no-source", action="store_true")
             s.add_argument("--tables", help="comma separated subset")
 

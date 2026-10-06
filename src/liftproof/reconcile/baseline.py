@@ -1,11 +1,17 @@
-"""Source baselines (PRD F2, Technical Spec 9.2, 9.16).
+"""Baselines (PRD F2, Technical Spec 9.2, 9.16, 14).
 
 A baseline is taken inside one consistent snapshot and records its consistency position.
 Each table is checkpointed as it completes, so a lost instance or session resumes from
 the last finished table instead of starting again.
 
+A source baseline freezes the source before cutover. A target baseline (`rebaseline`)
+snapshots the target after cutover, so scheduled regression compares the target with its
+own accepted state rather than with a pre migration source that live traffic has long
+since moved away from.
+
 A baseline holds per bucket aggregates, not per row hashes. Row level drill-down at
-validate time therefore needs the source database to still be readable.
+validate time therefore needs the source database to still be readable, and is not
+possible at all against a target baseline: the past state of the target cannot be re-read.
 """
 
 from __future__ import annotations
@@ -29,6 +35,8 @@ from liftproof.adapters.base import (
 from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM, CanonicalType, reduce_total
 from liftproof.errors import ConfigError
 from liftproof.reconcile.plan import IgnoreRule, plan_table
+
+SIDES = ("source", "target")
 
 
 @dataclass
@@ -101,6 +109,7 @@ class Baseline:
     product_version: str = __version__
     selection: list[str] = field(default_factory=list)
     tables: dict[str, BaselineTable] = field(default_factory=dict)
+    side: str = "source"  # target: taken by rebaseline
 
     @property
     def complete(self) -> bool:
@@ -113,6 +122,7 @@ class Baseline:
             "hash_algorithm": self.hash_algorithm,
             "product_version": self.product_version,
             "engine": self.engine,
+            "side": self.side,
             "consistency": self.position,
             "session": self.session,
             "taken_at": self.taken_at,
@@ -149,6 +159,7 @@ class Baseline:
             d["hash_algorithm"],
             d["product_version"],
             list(d["selection"]),
+            side=d.get("side", "source"),  # manifests from before rebaseline existed
         )
         b.tables = {q: BaselineTable.from_dict(q, t) for q, t in d["tables"].items()}
         return b
@@ -166,9 +177,17 @@ def take_baseline(
     rows_per_bucket: int,
     precision: int,
     resume: bool = False,
+    side: str = "source",
     progress: Callable[[str], None] = lambda _m: None,
 ) -> Baseline:
+    if side not in SIDES:
+        raise ValueError(f"side must be one of {SIDES}")
     existing = Baseline.load(manifest_path) if resume and manifest_path.exists() else None
+    if existing is not None and existing.side != side:
+        raise ConfigError(
+            f"baseline {existing.baseline_id} is a {existing.side} baseline; "
+            f"it cannot be resumed as a {side} baseline"
+        )
     position = source.begin_snapshot()
     try:
         refs = source.list_tables(schemas)
@@ -193,6 +212,7 @@ def take_baseline(
                 source.session_settings(),
                 dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
                 selection=[r.qualified for r in refs],
+                side=side,
             )
         for ref in refs:
             if ref.qualified in baseline.tables:

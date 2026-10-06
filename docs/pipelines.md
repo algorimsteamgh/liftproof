@@ -22,8 +22,8 @@ report.
 | Parameter | Default | Values |
 |---|---|---|
 | `project` | | the project file name under `/var/lib/mvt/projects`, without `.yaml` |
-| `mode` | `reconcile` | `validate`, `reconcile`, `files`, `replay`, `smoke`, `baseline`, `doctor` |
-| `baseline` | `latest` | baseline id or `latest`; used by `reconcile` and `validate` |
+| `mode` | `reconcile` | `validate`, `reconcile`, `files`, `replay`, `smoke`, `baseline`, `rebaseline`, `doctor` |
+| `baseline` | `latest` | baseline id, `latest` (newest source baseline) or `latest-target` (newest rebaseline); used by `reconcile` and `validate` |
 | `journeys` | all | comma separated journey ids; `replay`, `smoke`, `validate` |
 | `sets` | all | comma separated file set names; `files`, `validate` |
 | `failOn` | `differences` | `differences`, `errors`, `never` |
@@ -135,7 +135,7 @@ schedules:
   - name: nightly
     cron: "0 2 * * *"           # minute hour day-of-month month day-of-week
     timezone: Asia/Kolkata      # default UTC
-    command: validate           # validate, reconcile, files, replay, smoke or baseline
+    command: validate           # validate, reconcile, files, replay, smoke, baseline or rebaseline
     args: [--baseline, latest]
 ```
 
@@ -152,3 +152,38 @@ twice: with the `Deployment` dimension, which the deployment's
 `Project`, which names the project. Runs missed while the instance was
 stopped are not caught up; the latest missed one fires once when the scheduler starts
 again.
+
+## After cutover: regression against the target itself
+
+Before cutover, runs compare the target with the source (live, or a source baseline).
+After cutover the target takes live traffic, so every night it drifts further from the
+frozen source and the report fills with differences that are not differences. Once the
+target has been signed off, snapshot it as the new reference:
+
+```bash
+liftproof rebaseline --project acme.yaml
+```
+
+and point the scheduled runs at it:
+
+```yaml
+schedules:
+  - name: nightly
+    cron: "0 2 * * *"
+    timezone: Asia/Kolkata
+    command: reconcile
+    args: [--baseline, latest-target]
+```
+
+Nightly runs then report what changed in the target since it was accepted. Tables that
+live traffic is meant to change (orders, sessions, audit) need table ignore rules with a
+reason; the rest (reference data, configuration, closed periods) should not change at
+all, and a difference there is worth a look.
+
+Only the target is read: `rebaseline` and runs against `latest-target` never connect to
+the source, which may already be decommissioned. A target baseline holds bucket
+aggregates, not rows, and the target's earlier state cannot be re-read, so differences
+are reported down to the bucket (a share of the table's rows) rather than the row. To
+move the reference forward after accepting a set of changes, run `rebaseline` again,
+from a pipeline (SSM document mode `rebaseline`) or on a schedule (`command: rebaseline`).
+`latest` keeps meaning the newest source baseline.
