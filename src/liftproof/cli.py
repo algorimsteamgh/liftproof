@@ -38,6 +38,7 @@ from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severit
 from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import Reconciler, ReconcileResult, TableResult
 from liftproof.report.builder import build_report, who_ran_it, write_reports
+from liftproof.runlock import RunInProgress
 from liftproof.store import LocalStore, S3Store, Store
 from liftproof.web.journey import Journey
 from liftproof.web.run import WebResult
@@ -156,9 +157,17 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_baseline(args: argparse.Namespace) -> int:
     project = _project(args)
-    workdir = Path(args.workdir) / project.name
+    project.require_database()
     store = _store(project, Path(args.workdir))
     baseline_id = args.baseline_id or _new_id("b")
+    return _locked(
+        args, project, store, baseline_id, "baseline",
+        lambda: _baseline_locked(args, project, store, baseline_id),
+    )  # fmt: skip
+
+
+def _baseline_locked(args, project: Project, store: Store, baseline_id: str) -> int:
+    workdir = Path(args.workdir) / project.name
     manifest = workdir / "baselines" / baseline_id / "manifest.json"
     key = f"baselines/{baseline_id}/manifest.json"
     if args.resume:
@@ -302,6 +311,57 @@ def _files_into(args: argparse.Namespace, project: Project, writer: FindingWrite
     return compare_files(sets, writer.write, side)
 
 
+def _locked(args, project: Project, store: Store, run_id: str, mode: str, body) -> int:
+    """Runs of one project never overlap (spec 14). A scheduled run that finds another run
+    going is skipped, and the skip is itself a run: a report with an error finding, plus a
+    CloudWatch metric to alarm on. A run started by hand just fails with exit code 2."""
+    lock = store.run_lock(run_id, mode)
+    try:
+        lock.__enter__()
+    except RunInProgress as exc:
+        if getattr(args, "scheduled", None):
+            return _skipped(args, project, store, run_id, mode, exc)
+        raise
+    try:
+        if lock.body.get("took_over"):
+            log.warning("took over the run lock of lost run %s", lock.body["took_over"])
+        return body()
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def _skipped(args, project: Project, store: Store, run_id: str, mode: str, exc) -> int:
+    run_dir = Path(args.workdir) / project.name / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    started = _now()
+    writer = FindingWriter(run_dir, run_id)
+    holder = exc.holder
+    writer.write(
+        Finding(
+            Comparator.RUN,
+            Kind.ERROR,
+            Severity.HIGH,
+            f"schedule:{args.scheduled}",
+            f"scheduled {mode} skipped: run {holder.get('run_id', '?')} of this project was "
+            f"still in progress (started {holder.get('acquired_at', '?')})",
+            detail={"holder": holder, "schedule": args.scheduled},
+        )
+    )
+    writer.close()
+    try:
+        aws.put_metric("ScheduledRunSkipped", 1, {"Project": project.name})
+    except Exception as e:  # noqa: BLE001 - the report still records the skip
+        log.warning("could not publish the ScheduledRunSkipped metric: %s", e)
+    report = _report(
+        project, run_id, mode, run_dir, None, started, None,
+        failure=f"skipped: run {holder.get('run_id', '?')} still in progress",
+        template=getattr(args, "template", None), scheduled=args.scheduled,
+    )  # fmt: skip
+    for f in sorted(run_dir.iterdir()):
+        store.put_file(f"runs/{run_id}/{f.name}", f)
+    return _conclude(args, report, store, run_id)
+
+
 def _run(
     args: argparse.Namespace, mode: str, *, database: bool, web: bool, files: bool = False
 ) -> int:
@@ -309,9 +369,16 @@ def _run(
     and must not then be reconciled or compared against), then one report over every
     finding."""
     project = _project(args)
-    workdir = Path(args.workdir) / project.name
     store = _store(project, Path(args.workdir))
     run_id = args.run_id or _new_id("r")
+    return _locked(
+        args, project, store, run_id, mode,
+        lambda: _run_locked(args, mode, project, store, run_id, database, web, files),
+    )  # fmt: skip
+
+
+def _run_locked(args, mode, project, store, run_id, database, web, files) -> int:
+    workdir = Path(args.workdir) / project.name
     run_dir = workdir / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     logs.set_context(run_id=run_id, project=project.name)
@@ -379,6 +446,7 @@ def _run(
         files_result=files_result,
         failure=failure,
         template=args.template,
+        scheduled=getattr(args, "scheduled", None),
     )
     for f in sorted(run_dir.iterdir()):
         store.put_file(f"runs/{run_id}/{f.name}", f)
@@ -577,6 +645,7 @@ def _report(
     files_result=None,
     failure=None,
     template=None,
+    scheduled=None,
 ) -> dict[str, Any]:
     findings = list(read_findings(run_dir))
     o = project.database
@@ -585,6 +654,8 @@ def _report(
         "invoked_by": who_ran_it(),
         "values_shown": o.show_values,
     }
+    if scheduled:
+        metadata["schedule"] = scheduled
     if result is not None and project.source is not None:
         range_block.update(
             {
@@ -677,6 +748,67 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
     if args.fail_on == "errors":
         return EXIT_DIFFERENCES if c["errors"] else EXIT_OK
     return EXIT_DIFFERENCES if c["differences"] or c["errors"] else EXIT_OK
+
+
+def cmd_runs(args: argparse.Namespace) -> int:
+    """Run history from the reports on this instance (spec 14)."""
+    project = _project(args)
+    runs_dir = Path(args.workdir) / project.name / "runs"
+    rows = []
+    for d in runs_dir.iterdir() if runs_dir.exists() else []:
+        try:
+            r = json.loads((d / "report.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            continue
+        rows.append(
+            {
+                "run_id": r.get("run_id", d.name),
+                "mode": r.get("mode"),
+                "started_at": r.get("run", {}).get("started_at"),
+                "verdict": r.get("verdict"),
+                "differences": r.get("counts", {}).get("differences"),
+                "schedule": r.get("run", {}).get("schedule"),
+            }
+        )
+    rows.sort(key=lambda x: x["started_at"] or "", reverse=True)
+    rows = rows[: args.limit]
+    text = "\n".join(
+        f"{x['started_at']}  {x['run_id']:<34} {x['mode'] or '':<10} {x['verdict'] or '':<16} "
+        f"{x['schedule'] or 'by hand'}"
+        for x in rows
+    )
+    _out(args, {"runs": rows}, text or "no runs yet")
+    return EXIT_OK
+
+
+def cmd_schedule(args: argparse.Namespace) -> int:
+    from liftproof.schedule import next_runs
+
+    project = _project(args)
+    rows = next_runs(project.schedules, dt.datetime.now(dt.UTC))
+    text = "\n".join(
+        f"{r['name']:<16} {r['cron']:<18} {r['timezone']:<16} next {r['next_run_utc']}  "
+        f"{r['command']}"
+        for r in rows
+    )
+    _out(args, {"schedules": rows}, text or "this project has no schedules")
+    return EXIT_OK
+
+
+def cmd_scheduler(args: argparse.Namespace) -> int:
+    from liftproof.schedule import Scheduler
+
+    sched = Scheduler(Path(args.projects_dir), Path(args.workdir))
+    if args.once:
+        fired = sched.tick(wait=True)
+        _out(
+            args,
+            {"fired": [f"{d.project}/{d.schedule.name}" for d in fired]},
+            "\n".join(f"fired {d.project}/{d.schedule.name}" for d in fired) or "nothing due",
+        )
+        return EXIT_OK
+    sched.serve(args.interval)
+    return EXIT_OK
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -887,6 +1019,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tables", help="comma separated subset")
     s.add_argument("--baseline-id")
     s.add_argument("--resume", action="store_true", help="continue an interrupted baseline")
+    s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_baseline)
 
     s = with_project("reconcile", "compare the target database against the source")
@@ -904,6 +1037,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--run-id")
     s.add_argument("--template", help="directory holding a custom report.html.j2")
+    s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_reconcile)
 
     def run_flags(s, database: bool) -> None:
@@ -915,6 +1049,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         s.add_argument("--run-id")
         s.add_argument("--template", help="directory holding a custom report.html.j2")
+        s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
         if database:
             s.add_argument("--baseline", help="baseline id, or 'latest'")
             s.add_argument("--no-source", action="store_true")
@@ -952,12 +1087,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--run-id")
     s.add_argument("--template", help="directory holding a custom report.html.j2")
+    s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_files)
 
     s = with_project("validate", "full run: reconcile, compare files, then replay, then one report")
     run_flags(s, database=True)
     s.add_argument("--sets", help="comma separated file set names; default: all")
     s.set_defaults(fn=cmd_validate)
+
+    s = with_project("runs", "list this project's runs, newest first")
+    s.add_argument("--limit", type=int, default=20)
+    s.set_defaults(fn=cmd_runs)
+
+    s = sub.add_parser("schedule", parents=[common], help="show a project's schedules")
+    s.add_argument("--project", required=True, help="project YAML file")
+    s.set_defaults(fn=cmd_schedule)
+
+    s = sub.add_parser("scheduler", parents=[common], help="run scheduled runs (the service)")
+    s.add_argument("--projects-dir", default=str(DEFAULT_WORKDIR))
+    s.add_argument("--once", action="store_true", help="fire what is due now, then exit")
+    s.add_argument("--interval", type=float, default=30.0, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_scheduler)
 
     s = with_project("report", "regenerate a report from a run's findings")
     s.add_argument("--run", required=True)

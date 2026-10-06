@@ -29,10 +29,14 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 27 | Document types compared as text | PDF (pypdf, no system libraries), JSON (keys sorted), CSV, TSV and pipe delimited (row and column), and plain text types; up to 64 MB per file | Spec 23 leaves the list open and names PDF first. A pure Python reader keeps the AMI free of extra packages | Yes |
 | 28 | Severity of file findings | missing in target: high; different text or unreadable type: high; only in target: medium; same text, different bytes: low; unreadable or symbolic link: not checked | Spec 10: a byte difference with identical text ranks below a real difference. A symbolic link is never followed, because it can leave the tree | Yes |
 | 29 | Order inside `validate` | reconcile, then files, then replay | Replay creates data and generated files on the target; comparing after it would report them | Yes |
+| 30 | Overlapping runs of one project | refused by a run lock: in S3, a conditional put (If-None-Match) with a 15 minute lease renewed while the run lasts and taken over with a conditional put once expired; on a local store, a kernel file lock | Spec 14: runs of one project never overlap. The scheduler, the CLI and SSM Run Command are separate processes, so only the store can arbitrate; S3 conditional writes need no DynamoDB table | Yes |
+| 31 | A scheduled run that would overlap | skipped, and the skip is a run: a report with a high severity error finding and a `ScheduledRunSkipped` CloudWatch metric (namespace Liftproof, dimension Project); exit code 2 | A skip seen only in a log goes unnoticed for weeks. A run started by hand is refused with exit code 2 and writes nothing | Yes |
+| 32 | Scheduler | `mvt-scheduler.service` reads `schedules:` from every project file; five field cron, wall clock in a named time zone; each run is its own process; runs missed while it was down are not caught up, the latest missed one fires once | Customers with richer needs drive runs from their own pipeline through SSM Run Command (F11). No new dependency for cron parsing | Yes |
+| 33 | SSM document modes | validate, reconcile, files, replay, smoke, baseline and doctor, with `journeys` and `sets` parameters restricted by pattern | Every pipeline stage the CLI has can be called without a shell on the instance; the patterns keep parameters out of the shell | Yes |
 
 ## Not built yet
 
-Scheduler, web UI, parallel journeys, the target watermark that
+Web UI, parallel journeys, the target watermark that
 excludes rows a replay created when reconciliation must follow replay (validate already
 reconciles first), extractor transform chains (base64, URL encoding) for correlations,
 CloudFormation version of the deployment module, replication position assertion on the target,
