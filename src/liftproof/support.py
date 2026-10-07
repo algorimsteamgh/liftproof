@@ -133,7 +133,15 @@ def project_summary(project: Project) -> dict[str, Any]:
             "rows_per_bucket": o.rows_per_bucket,
             "precision": o.precision,
             "ignore": [
-                {"table": r.table, "column": r.column, "reason": r.reason} for r in o.ignore
+                {
+                    "table": r.table,
+                    "column": r.column,
+                    "where": r.where,
+                    "source_where": r.source_where,
+                    "target_where": r.target_where,
+                    "reason": r.reason,
+                }
+                for r in o.ignore
             ],
             "business_keys": o.business_keys,
             "show_values": o.show_values,

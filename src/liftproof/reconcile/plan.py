@@ -11,14 +11,40 @@ from liftproof.canonical import CanonicalType
 
 @dataclass
 class IgnoreRule:
+    """Excludes a table, a column, or the rows a predicate matches (spec 9.11). A row
+    predicate is SQL in each side's own dialect: `where` for both sides, or
+    `source_where` and `target_where` where the engines differ."""
+
     table: str  # schema.table or table
     reason: str
     column: str | None = None
+    where: str | None = None
+    source_where: str | None = None
+    target_where: str | None = None
 
     def matches_table(self, qualified: str) -> bool:
         t = self.table.lower()
         q = qualified.lower()
         return t == q or t == q.split(".", 1)[-1]
+
+    @property
+    def rows(self) -> bool:
+        return bool(self.where or self.source_where or self.target_where)
+
+    @property
+    def whole_table(self) -> bool:
+        return self.column is None and not self.rows
+
+    def predicate(self, side: str) -> str | None:
+        return (self.source_where if side == "source" else self.target_where) or self.where
+
+
+def row_filter(ignore: list[IgnoreRule], qualified: str, side: str) -> str | None:
+    """The rows of one side to leave out: any matching rule's predicate."""
+    preds = [
+        p for r in ignore if r.rows and r.matches_table(qualified) and (p := r.predicate(side))
+    ]
+    return " OR ".join(f"({p})" for p in preds) or None
 
 
 @dataclass
@@ -66,6 +92,7 @@ def plan_table(
     precision: int,
     ignore: list[IgnoreRule],
     business_key: list[str] | None = None,
+    side: str = "source",
 ) -> TablePlan:
     """Plan the comparison of one table over the intersection of mapped columns.
 
@@ -77,6 +104,7 @@ def plan_table(
         for r in ignore
         if r.column and r.matches_table(source.table.qualified)
     }
+    rows_filter = row_filter(ignore, source.table.qualified, side)  # the reference's rows
     issues: list[ColumnIssue] = []
     hashed: list[tuple[str, CanonicalType]] = []
     floats: list[str] = []
@@ -161,6 +189,7 @@ def plan_table(
             key_columns=canonical_order(list(key)),
             buckets=bucket_count(rows, rows_per_bucket),
             precision=precision,
+            filter=rows_filter,
         ),
         float_columns=floats,
         issues=issues,

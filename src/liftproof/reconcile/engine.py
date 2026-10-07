@@ -24,7 +24,7 @@ from liftproof.adapters.base import Adapter, BucketAggregate, HashPlan, TableRef
 from liftproof.canonical import RowHasher, column_digest, reduce_total
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity
 from liftproof.reconcile.baseline import Baseline
-from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table
+from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table, row_filter
 from liftproof.reconcile.replication import REASON_BEHIND, ReplicationConfig, check
 
 DB = Comparator.DATABASE
@@ -134,7 +134,7 @@ class Reconciler:
 
     def _table_ignored(self, table: TableRef) -> IgnoreRule | None:
         for r in self.o.ignore:
-            if r.column is None and r.matches_table(table.qualified):
+            if r.whole_table and r.matches_table(table.qualified):
                 return r
         return None
 
@@ -265,6 +265,7 @@ class Reconciler:
             precision=self.o.precision,
             ignore=self.o.ignore,
             business_key=self.o.business_keys.get(q) or self.o.business_keys.get(table.name),
+            side="target" if self.against_target else "source",
         )
         plan = tp.plan
         if base_entry is not None:
@@ -321,11 +322,37 @@ class Reconciler:
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, "no comparable columns")
             return res
 
+        # Row ignore rules: each side leaves out its own rows, in its own dialect.
+        tfilter = row_filter(self.o.ignore, q, "target")
+        for r in (r for r in self.o.ignore if r.rows and r.matches_table(q)):
+            self.emit(
+                Kind.NOTICE,
+                Severity.INFO,
+                q,
+                f"rows excluded by ignore rule: {r.reason}",
+                detail={
+                    "reason": r.reason,
+                    "source_where": r.predicate("source"),
+                    "target_where": r.predicate("target"),
+                },
+            )
+        unsupported = [
+            a.engine
+            for a, f in ((self.source, plan.filter), (self.target, tfilter))
+            if a is not None and f and not a.supports_row_filters
+        ]
+        if unsupported:
+            res.status = "not_checked"
+            res.reason = f"row ignore rules are not supported for {', '.join(unsupported)}"
+            self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, res.reason)
+            return res
+
         # Reference aggregates: a live source, or the baseline when its plan still applies.
         if (
             base_entry is not None
             and base_entry.plan.columns == plan.columns
-            and (base_entry.plan.key_columns == plan.key_columns)
+            and base_entry.plan.key_columns == plan.key_columns
+            and base_entry.plan.filter == plan.filter
         ):
             s_aggs = base_entry.buckets
         elif self.source is not None:
@@ -340,7 +367,7 @@ class Reconciler:
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, res.reason)
             return res
 
-        tplan = _target_plan(plan, tschema)
+        tplan = replace(_target_plan(plan, tschema), filter=tfilter)
         if s_aggs is None:
             # Two databases, two connections: hashing both at once halves the wall time,
             # and each database's own load is unchanged (spec 17: the source is the
@@ -352,6 +379,8 @@ class Reconciler:
         else:
             t_aggs = self.target.bucket_aggregates(tplan)
         res.target_rows = sum(a.count for a in t_aggs.values())
+        if plan.filter:  # the table's row count includes the rows the rules leave out
+            source_rows = res.source_rows = sum(a.count for a in s_aggs.values())
 
         # 1. row counts
         if res.target_rows != source_rows:
@@ -370,7 +399,7 @@ class Reconciler:
         # 2. table aggregate
         s_total = reduce_total(sum(a.total for a in s_aggs.values()))
         t_total = reduce_total(sum(a.total for a in t_aggs.values()))
-        self._floats(table, ttable, tp, res)
+        self._floats(table, ttable, tp, res, plan.filter, tfilter)
         if s_total == t_total and res.target_rows == source_rows:
             return res
         res.status = "different"
@@ -593,7 +622,15 @@ class Reconciler:
             },
         )
 
-    def _floats(self, table: TableRef, ttable: TableRef, tp: TablePlan, res: TableResult) -> None:
+    def _floats(
+        self,
+        table: TableRef,
+        ttable: TableRef,
+        tp: TablePlan,
+        res: TableResult,
+        sfilter: str | None = None,
+        tfilter: str | None = None,
+    ) -> None:
         if not tp.float_columns or self.source is None:
             if tp.float_columns:
                 self.emit(
@@ -607,8 +644,8 @@ class Reconciler:
             return
         tol = self.o.float_rel_tolerance
         for col in tp.float_columns:
-            a = self.source.float_stats(table, col)
-            b = self.target.float_stats(ttable, col)
+            a = self.source.float_stats(table, col, **({"where": sfilter} if sfilter else {}))
+            b = self.target.float_stats(ttable, col, **({"where": tfilter} if tfilter else {}))
             problems = []
             for name in ("non_null", "nan_count", "inf_count"):
                 if getattr(a, name) != getattr(b, name):

@@ -63,6 +63,9 @@ class HashPlan:
     buckets: int
     precision: int = 6
     strategy: str = "hash"
+    # SQL predicate, in this side's dialect, of rows left out (row ignore rules). Each side
+    # has its own; only adapters with supports_row_filters apply it.
+    filter: str | None = None
 
     @property
     def key_positions(self) -> list[int]:
@@ -149,6 +152,10 @@ class Adapter(abc.ABC):
     # Engines that cannot answer leave these as they are; the check then reports that
     # it is not available rather than guessing.
     replication_methods: tuple[str, ...] = ()
+
+    # Row ignore rules (spec 9.11). An adapter without them gets not_checked tables rather
+    # than silently comparing rows it was told to leave out.
+    supports_row_filters: bool = False
 
     def current_position(self) -> dict[str, Any] | None:
         """This database's consistency position now, in the shape begin_snapshot returns."""

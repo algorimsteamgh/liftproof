@@ -64,6 +64,7 @@ class BaselineTable:
                 "buckets": self.plan.buckets,
                 "precision": self.plan.precision,
                 "strategy": self.plan.strategy,
+                "filter": self.plan.filter,
             },
             "row_count": self.row_count,
             "aggregate": self.aggregate,
@@ -90,6 +91,7 @@ class BaselineTable:
             int(p["buckets"]),
             int(p["precision"]),
             p.get("strategy", "hash"),
+            p.get("filter"),
         )
         buckets = {
             int(b): BucketAggregate(int(c), int(t)) for b, (c, t) in d["bucket_aggregates"].items()
@@ -217,7 +219,7 @@ def take_baseline(
         for ref in refs:
             if ref.qualified in baseline.tables:
                 continue
-            ignored = any(r.column is None and r.matches_table(ref.qualified) for r in ignore)
+            ignored = any(r.whole_table and r.matches_table(ref.qualified) for r in ignore)
             if ignored:
                 continue
             progress(f"baselining {ref}")
@@ -231,8 +233,13 @@ def take_baseline(
                 precision=precision,
                 ignore=ignore,
                 business_key=business_keys.get(ref.qualified) or business_keys.get(ref.name),
+                side=side,
             )
+            if tp.plan.filter and not source.supports_row_filters:
+                raise ConfigError(f"{ref}: row ignore rules are not supported for {source.engine}")
             buckets = source.bucket_aggregates(tp.plan) if tp.plan.columns else {}
+            if tp.plan.filter:  # the rows the baseline holds, not the table's
+                rows = sum(b.count for b in buckets.values())
             baseline.tables[ref.qualified] = BaselineTable(
                 schema,
                 tp.plan,
