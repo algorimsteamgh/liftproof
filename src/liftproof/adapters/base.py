@@ -145,6 +145,25 @@ class Adapter(abc.ABC):
         """Pinned session parameters, recorded in the manifest."""
         return {}
 
+    # replication position (spec 9.2) -----------------------------------------------
+    # Engines that cannot answer leave these as they are; the check then reports that
+    # it is not available rather than guessing.
+    replication_methods: tuple[str, ...] = ()
+
+    def current_position(self) -> dict[str, Any] | None:
+        """This database's consistency position now, in the shape begin_snapshot returns."""
+        return None
+
+    def replication_applied(self, method: str, name: str) -> str | None:
+        """How far replication has got, in this engine's position format. Called on the
+        target for a subscription and on the source for a slot. None: nothing found."""
+        raise NotImplementedError(method)
+
+    @staticmethod
+    def position_key(kind: str, position: str) -> Any:
+        """A sortable form of a position of the given type."""
+        raise NotImplementedError(kind)
+
     def __enter__(self) -> Adapter:
         return self
 

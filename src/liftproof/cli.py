@@ -250,7 +250,12 @@ def _load_baseline(args, project: Project, store: Store, workdir: Path) -> Basel
 def _save_results(run_dir: Path, result: ReconcileResult) -> None:
     (run_dir / "db-results.json").write_text(
         json.dumps(
-            {"systemic": result.systemic, "tables": [t.__dict__ for t in result.tables]}, indent=2
+            {
+                "systemic": result.systemic,
+                "replication": result.replication,
+                "tables": [t.__dict__ for t in result.tables],
+            },
+            indent=2,
         ),
         encoding="utf-8",
     )
@@ -261,7 +266,9 @@ def _load_results(run_dir: Path) -> ReconcileResult:
     if not p.exists():
         return ReconcileResult()
     d = json.loads(p.read_text(encoding="utf-8"))
-    return ReconcileResult([TableResult(**t) for t in d["tables"]], d["systemic"])
+    return ReconcileResult(
+        [TableResult(**t) for t in d["tables"]], d["systemic"], d.get("replication")
+    )
 
 
 def _reconcile_into(
@@ -703,6 +710,7 @@ def _report(
                     else "live source"
                 ),
                 "consistency_position": baseline.position if baseline else "live read",
+                "replication": result.replication,
             }
         )
         metadata.update(
@@ -945,6 +953,24 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
             _conn_check,
             "check the route (VPN, Direct Connect, security groups) and the grants: the "
             "source user needs SELECT only",
+        )
+    rep = project.database.replication
+    if rep.method != "none" and project.source is not None and project.target is not None:
+
+        def _replication():
+            conn = project.target if rep.method == "subscription" else project.source
+            with connect(conn) as a:
+                if rep.method not in a.replication_methods:
+                    raise ConfigError(f"{rep.method} is not available for {a.engine}")
+                applied = a.replication_applied(rep.method, rep.name or "")
+                _assert(applied is not None, f"{rep.method} {rep.name!r} not found")
+                return f"{rep.method} {rep.name} has applied {applied}"
+
+        check(
+            f"replication {rep.method} readable",
+            _replication,
+            "check the name; reading pg_stat_subscription or pg_replication_slots needs "
+            "the pg_monitor role (or pg_read_all_stats)",
         )
     if project.web is not None:
         workdir = Path(args.workdir) / project.name
