@@ -13,6 +13,8 @@ per journey, and captures the same evidence again. The rules that keep replay ho
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -102,6 +104,19 @@ def step_duration(acted_ms: float, exchanges: list[Captured]) -> float | None:
     return round(max(max(ends) - acted_ms, 0.0), 1) if ends else None
 
 
+class _Worker(threading.Thread):
+    def __init__(self, replayer: Replayer, todo: queue.SimpleQueue, runs: list) -> None:
+        super().__init__(daemon=True)
+        self.replayer, self.todo, self.runs = replayer, todo, runs
+        self.error: BaseException | None = None
+
+    def run(self) -> None:
+        try:
+            self.replayer._worker(self.todo, self.runs)
+        except BaseException as exc:  # noqa: BLE001 - raised again on the calling thread
+            self.error = exc
+
+
 def _candidate(page: Any, c: dict[str, str]) -> Any:
     match c["kind"]:
         case "testid":
@@ -156,21 +171,59 @@ class Replayer:
         self.headless = headless
         self.executable_path = executable_path
         self.step_flakes: Counter[tuple[str, int]] = Counter()
+        self._lock = threading.Lock()
 
-    def run(self, journeys: list[Journey]) -> list[JourneyRun]:
+    def _flake(self, journey_id: str, step: int) -> None:
+        with self._lock:
+            self.step_flakes[(journey_id, step)] += 1
+
+    def run(self, journeys: list[Journey], workers: int = 1) -> list[JourneyRun]:
+        """Replay journeys, in order by default. workers > 1 replays independent journeys
+        at once (spec 6: an opt in, only where the journeys do not interfere); steps
+        inside a journey always run in recorded order. Results keep the journeys' order."""
+        if workers <= 1 or len(journeys) <= 1:
+            return self._worker(list(enumerate(journeys)), [None] * len(journeys))
+        todo: queue.SimpleQueue[tuple[int, Journey]] = queue.SimpleQueue()
+        for item in enumerate(journeys):
+            todo.put(item)
+        runs: list[JourneyRun | None] = [None] * len(journeys)
+        # Playwright's sync API is per thread: each worker has its own driver and browser
+        threads = [_Worker(self, todo, runs) for _ in range(min(workers, len(journeys)))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for t in threads:
+            if t.error is not None:
+                raise t.error
+        return runs  # type: ignore[return-value]
+
+    def _worker(
+        self,
+        todo: list[tuple[int, Journey]] | queue.SimpleQueue[tuple[int, Journey]],
+        runs: list[JourneyRun | None],
+    ) -> list[JourneyRun]:
         from playwright.sync_api import sync_playwright
 
-        runs = []
         with sync_playwright() as p:
-            # one browser process for the run, a fresh context per journey (spec 13)
+            # one browser process per worker, a fresh context per journey (spec 13)
             browser = launch(p, headless=self.headless, executable_path=self.executable_path)
             self.browser_version = browser.version
             try:
-                for j in journeys:
-                    runs.append(self._journey(browser, j))
+                while True:
+                    if isinstance(todo, list):
+                        if not todo:
+                            break
+                        i, j = todo.pop(0)
+                    else:
+                        try:
+                            i, j = todo.get_nowait()
+                        except queue.Empty:
+                            break
+                    runs[i] = self._journey(browser, j)
             finally:
                 browser.close()
-        return runs
+        return runs  # type: ignore[return-value]
 
     # ------------------------------------------------------------------ journeys
     def _journey(self, browser: Any, journey: Journey) -> JourneyRun:
@@ -197,7 +250,7 @@ class Replayer:
                 return run
             failed_step = next((s.n for s in run.steps if s.status == "failed"), None)
             if failed_step is not None:
-                self.step_flakes[(journey.journey_id, failed_step)] += 1
+                self._flake(journey.journey_id, failed_step)
             run.flakes.append(
                 {"step": failed_step, "attempt": attempt, "error": run.error, "unit": "journey"}
             )
@@ -242,7 +295,7 @@ class Replayer:
                         # time; the journey is the retry unit (spec 6)
                         run.status, run.failure_kind, run.error = "failed", kind, sr.error
                         return whole
-                    self.step_flakes[(journey.journey_id, step.n)] += 1
+                    self._flake(journey.journey_id, step.n)
                     run.flakes.append(
                         {"step": step.n, "attempt": attempt, "error": sr.error, "unit": "step"}
                     )

@@ -43,6 +43,7 @@ class WebResult:
     journeys: list[JourneyResult] = field(default_factory=list)
     endpoints: list[dict[str, Any]] = field(default_factory=list)
     parallel: bool = False
+    workers: int = 1  # journeys replayed at once; above 1 only when the project opts in
     target_url: str = ""
     browser: str | None = None
 
@@ -55,6 +56,7 @@ class WebResult:
             journeys=[JourneyResult(**j) for j in d.get("journeys", [])],
             endpoints=list(d.get("endpoints", [])),
             parallel=bool(d.get("parallel", False)),
+            workers=int(d.get("workers", 1)),
             target_url=d.get("target_url", ""),
             browser=d.get("browser"),
         )
@@ -123,6 +125,7 @@ def run_journeys(
     secret_values: Callable[[Journey], dict[str, str]],
     step_timeout_ms: int = 15_000,
     executable_path: str | None = None,
+    workers: int = 1,
 ) -> WebResult:
     replayer = Replayer(
         target_url,
@@ -130,8 +133,14 @@ def run_journeys(
         step_timeout_ms=step_timeout_ms,
         executable_path=executable_path,
     )
-    runs = replayer.run(journeys)
-    result = WebResult(target_url=target_url, browser=f"chromium {replayer.browser_version}")
+    runs = replayer.run(journeys, workers=workers)
+    workers = max(1, min(workers, len(journeys)))
+    result = WebResult(
+        target_url=target_url,
+        browser=f"chromium {replayer.browser_version}",
+        parallel=workers > 1,
+        workers=workers,
+    )
     timing: dict[str, dict[str, list[float]]] = defaultdict(lambda: {"source": [], "target": []})
     for j, run in zip(journeys, runs, strict=True):
         for f in run.flakes:

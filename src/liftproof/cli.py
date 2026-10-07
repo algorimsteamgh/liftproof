@@ -601,6 +601,7 @@ def _replay_into(
         secret_values=_journey_secrets,
         step_timeout_ms=web.step_timeout_ms,
         executable_path=web.chromium_path,
+        workers=web.parallel_journeys,
     )
 
 
@@ -738,6 +739,7 @@ def _report(
                 "web_source": project.web.source_url if project.web else None,
                 "web_target": web_result.target_url,
                 "journeys_in_parallel": web_result.parallel,
+                "parallel_workers": web_result.workers,
             }
         )
         metadata["browser"] = web_result.browser
