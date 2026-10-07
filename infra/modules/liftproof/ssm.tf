@@ -22,7 +22,7 @@ resource "aws_ssm_document" "run" {
       mode = {
         type          = "String"
         default       = "reconcile"
-        allowedValues = ["validate", "reconcile", "files", "replay", "smoke", "baseline", "rebaseline", "doctor"]
+        allowedValues = ["validate", "reconcile", "files", "replay", "smoke", "baseline", "rebaseline", "doctor", "support-bundle"]
       }
       journeys = {
         type           = "String"
