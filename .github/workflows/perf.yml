@@ -1,0 +1,51 @@
+name: perf
+
+# The KPI suite (PRD N8, N9; docs/kpis.md). Gates every release (release.yml calls it)
+# and runs on pull requests that touch the code paths the KPIs measure.
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/liftproof/adapters/**"
+      - "src/liftproof/reconcile/**"
+      - "src/liftproof/web/**"
+      - "src/liftproof/report/**"
+      - "tests/perf/**"
+      - ".github/workflows/perf.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  kpis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-local-service
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      LIFTPROOF_TEST_PG_HOST: localhost
+      LIFTPROOF_TEST_PG_PORT: "5432"
+      LIFTPROOF_TEST_PG_USER: postgres
+      LIFTPROOF_TEST_PG_PASSWORD: ci-only-local-service
+      LIFTPROOF_PERF_OUT: perf-results.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m playwright install --with-deps chromium
+      - name: KPI suite (fails on any missed threshold)
+        run: python -m pytest -m perf tests/perf -p no:cacheprovider
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-results
+          path: perf-results.json

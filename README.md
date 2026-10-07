@@ -25,6 +25,11 @@ liftproof reconcile --project acme.yaml --baseline latest-target
 liftproof support-bundle --project acme.yaml --doctor
 ```
 
+## Performance
+
+KPIs, thresholds and how each is measured are in `docs/kpis.md`; `pytest -m perf` runs
+the suite that gates every release.
+
 ## Record and replay
 
 ```bash

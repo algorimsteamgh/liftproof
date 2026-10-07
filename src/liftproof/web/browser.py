@@ -110,9 +110,21 @@ class NetworkLog:
     def __init__(self, page: Any) -> None:
         self._pending: list[tuple[Any, Any, bytes | None]] = []
         self._fetched: dict[int, tuple[bytes | None, float]] = {}
+        self._open: set[int] = set()
+        self.started = 0  # requests begun so far: a change means the page did more
         page.route("**/*", self._route)
+        page.on("request", self._begin)
         page.on("requestfinished", self._add)
         page.on("requestfailed", self._add)
+
+    @property
+    def inflight(self) -> int:
+        return len(self._open)
+
+    def _begin(self, req: Any) -> None:
+        if req.resource_type in CAPTURED_TYPES:
+            self._open.add(id(req))
+            self.started += 1
 
     def _route(self, route: Any) -> None:
         req = route.request
@@ -132,6 +144,7 @@ class NetworkLog:
     def _add(self, req: Any) -> None:
         if req.resource_type not in CAPTURED_TYPES:
             return
+        self._open.discard(id(req))
         resp = body = None
         try:
             resp = req.response()
@@ -208,6 +221,34 @@ def dom_settled(page: Any, quiet_ms: int = 150, timeout_ms: int = 5000) -> None:
         page.wait_for_function(f"({QUIET_JS})({quiet_ms})", timeout=timeout_ms)
     except Exception:  # noqa: BLE001, S110 - a page that never settles is compared as it is
         pass
+
+
+POLL_S = 0.1  # longest wait before the request log is checked again
+
+
+def step_settled(page: Any, net: NetworkLog, timeout_ms: int, quiet_ms: int = 150) -> None:
+    """While recording, wait until what an action started has finished: no captured
+    request in flight, the page loaded, and no DOM change for quiet_ms, with no new
+    request or navigation during that quiet period. An action that posts to an API and
+    then navigates to a page which fetches its own data settles only once that data is
+    rendered. Waiting for "networkidle" instead returned at once whenever the page had
+    been idle before the action, so the step was snapshotted half rendered."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while (remaining := deadline - time.monotonic()) > 0:
+        if net.inflight:
+            try:
+                page.wait_for_event("requestfinished", timeout=min(remaining, POLL_S) * 1000)
+            except Exception:  # noqa: BLE001, S110 - a slice ended: look again
+                pass
+            continue
+        try:
+            page.wait_for_load_state("load", timeout=remaining * 1000)
+        except Exception:  # noqa: BLE001, S110 - out of time: snapshot what is there
+            return
+        url, started = page.url, net.started
+        dom_settled(page, quiet_ms, timeout_ms=max(int(remaining * 1000), 1))
+        if not net.inflight and net.started == started and page.url == url:
+            return
 
 
 def region_snapshot(page: Any) -> str:

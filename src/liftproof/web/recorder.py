@@ -24,11 +24,11 @@ from liftproof.web.browser import (
     BodyPolicy,
     Captured,
     NetworkLog,
-    dom_settled,
     launch,
     normalise_path,
     path_of,
     region_snapshot,
+    step_settled,
 )
 from liftproof.web.journey import TOKEN_PREFIX, Journey, Locator, SecretBinding, Step
 
@@ -56,11 +56,7 @@ class RecordingSession:
         self._events.append(json.loads(payload))
 
     def _settle(self) -> None:
-        try:
-            self.page.wait_for_load_state("networkidle", timeout=self.settle_ms)
-        except Exception:  # noqa: BLE001, S110 - a page that never goes idle still records
-            pass
-        dom_settled(self.page)
+        step_settled(self.page, self.net, self.settle_ms)  # a page never idle still records
         self._captured += self.net.drain()
 
     def start(self, url: str) -> None:

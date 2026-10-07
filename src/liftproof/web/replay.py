@@ -22,6 +22,7 @@ from urllib.parse import urljoin
 
 from liftproof.web import correlate
 from liftproof.web.browser import (
+    POLL_S,
     Captured,
     NetworkLog,
     dom_settled,
@@ -304,10 +305,14 @@ class Replayer:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return got
+            # Short slices, then look again: a request that finished before this wait
+            # began (a navigation's own document, typically) is delivered to the log
+            # while waiting but never satisfies the waiter, which used to sit out the
+            # whole step timeout.
             try:
-                page.wait_for_event("requestfinished", timeout=remaining * 1000)
-            except Exception:  # noqa: BLE001 - out of time: compare what arrived
-                return got + net.drain()
+                page.wait_for_event("requestfinished", timeout=min(remaining, POLL_S) * 1000)
+            except Exception:  # noqa: BLE001, S110 - a slice ended: drain and check again
+                pass
 
     def _correlate(self, journey: Journey, sr: StepRun, run: JourneyRun) -> None:
         for c in journey.correlations:

@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
@@ -58,10 +59,12 @@ fetch('/api/orders/{oid}').then(r => r.json()).then(o => {{
 class ShopApp:
     """variant: same | changed. changed renames a status, adds an API field, drops the
     order button's test id (so replay falls back to a weaker locator) and returns 500 for
-    a missing order instead of 404."""
+    a missing order instead of 404. latency_ms delays every response, as a real
+    application across a network does (the performance suite uses it)."""
 
-    def __init__(self, variant: str = "same") -> None:
+    def __init__(self, variant: str = "same", latency_ms: int = 0) -> None:
         self.variant = variant
+        self.latency_ms = latency_ms
         self.orders: dict[str, dict] = {}
         self.sessions: set[str] = set()
         self.csrf: set[str] = set()
@@ -72,6 +75,8 @@ class ShopApp:
                 pass
 
             def _send(self, status, body, ctype="text/html", headers=None):
+                if app.latency_ms:
+                    time.sleep(app.latency_ms / 1000)
                 data = body.encode() if isinstance(body, str) else body
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)

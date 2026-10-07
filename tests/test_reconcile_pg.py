@@ -169,3 +169,25 @@ def test_baseline_then_reconcile(tmp_path, make_db, adapter_for, pair):
     writer.close()
     findings = list(read_findings(tmp_path / "f3"))
     assert [f.locator for f in findings if f.summary == "row missing in target"] == ["id = 7"]
+
+
+@pytest.mark.postgres
+def test_bucket_rows_one_pass_matches_one_query_per_bucket(make_db, adapter_for):
+    """PostgreSQL's single ordered pass yields exactly what the default yields: every
+    wanted bucket in order, empty ones included."""
+    from liftproof.adapters.base import Adapter
+    from liftproof.reconcile.plan import plan_table
+
+    name, conn = make_db("b")
+    conn.execute("CREATE TABLE t (id int PRIMARY KEY, v text);"
+                 "INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 300) g")  # fmt: skip
+    a = adapter_for(name)
+    [ref] = a.list_tables(["public"])
+    plan = plan_table(a.describe(ref), None, rows=300, rows_per_bucket=10, precision=6,
+                      ignore=[], business_key=None).plan  # fmt: skip
+    wanted = set(range(plan.buckets)) | {plan.buckets + 5}  # one bucket that cannot exist
+    one_pass = list(a.bucket_rows(plan, wanted))
+    per_bucket = list(Adapter.bucket_rows(a, plan, wanted))
+    assert one_pass == per_bucket
+    assert [b for b, _ in one_pass] == sorted(wanted)
+    assert sum(len(r) for _, r in one_pass) == 300 and one_pass[-1][1] == {}

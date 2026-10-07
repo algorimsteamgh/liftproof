@@ -14,7 +14,12 @@ env:
   AWS_REGION: ap-south-1
 
 jobs:
+  performance:
+    # PRD N9: the KPI suite gates every release; its numbers are kept with the evidence
+    uses: ./.github/workflows/perf.yml
+
   ami:
+    needs: performance
     runs-on: ubuntu-24.04
     environment: release
     steps:
@@ -49,10 +54,14 @@ jobs:
         run: |
           infra/scripts/scan-ami.sh "$(cat ami-id.txt)" "${{ vars.LIFTPROOF_BUILD_SUBNET }}" \
             "${{ vars.LIFTPROOF_BUILD_SG }}" liftproof-ami-builder
+      - uses: actions/download-artifact@v4
+        if: always()
+        with:
+          name: perf-results
       - name: Keep evidence
         if: always()
         run: |
           prefix="s3://${{ vars.LIFTPROOF_EVIDENCE_BUCKET }}/releases/${GITHUB_REF_NAME}/${GITHUB_RUN_ID}"
-          for f in pip-audit.log packer-manifest.json scan-findings.json ami-id.txt; do
+          for f in pip-audit.log perf-results.json packer-manifest.json scan-findings.json ami-id.txt; do
             [ -f "$f" ] && aws s3 cp "$f" "$prefix/$f"
           done
