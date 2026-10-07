@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import heapq
 import math
+import random
+import secrets
 from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +48,11 @@ class ReconcileOptions:
     breaker_table_ratio: float = 0.8
     breaker_min_tables: int = 5
     replication: ReplicationConfig = field(default_factory=ReplicationConfig)
+    # Sampled reconciliation (spec 9.18): tables with more rows than this compare
+    # sample_percent of their buckets, chosen at random. None: every table in full.
+    sample_above_rows: int | None = None
+    sample_percent: float = 10.0
+    sample_seed: int | None = None  # None: a fresh seed per run, recorded in the report
 
 
 @dataclass
@@ -65,6 +72,8 @@ class TableResult:
     excluded_columns: list[str] = field(default_factory=list)
     approximate_columns: list[str] = field(default_factory=list)
     reason: str | None = None
+    # set when only a sample was compared: the share of the table's rows that was
+    sampled_percent: float | None = None
 
 
 @dataclass
@@ -72,6 +81,7 @@ class ReconcileResult:
     tables: list[TableResult] = field(default_factory=list)
     systemic: bool = False
     replication: dict[str, Any] | None = None  # the position check, for the report
+    sample_seed: int | None = None  # set when a table was sampled: reruns the same sample
 
     def status_counts(self) -> Counter:
         return Counter(t.status for t in self.tables)
@@ -121,6 +131,9 @@ class Reconciler:
         self.progress = progress or (lambda _msg: None)
         self.result = ReconcileResult()
         self._drill = True
+        self._seed = (
+            options.sample_seed if options.sample_seed is not None else secrets.randbelow(2**31)
+        )
 
     # ------------------------------------------------------------------ helpers
     def emit(self, kind: Kind, severity: int, obj: str, summary: str, **kw: Any) -> None:
@@ -346,6 +359,8 @@ class Reconciler:
             res.reason = f"row ignore rules are not supported for {', '.join(unsupported)}"
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, res.reason)
             return res
+        plan = self._sample(q, plan, source_rows)
+        full_rows = source_rows
 
         # Reference aggregates: a live source, or the baseline when its plan still applies.
         if (
@@ -355,6 +370,8 @@ class Reconciler:
             and base_entry.plan.filter == plan.filter
         ):
             s_aggs = base_entry.buckets
+            if plan.sample is not None:
+                s_aggs = {b: a for b, a in s_aggs.items() if b in plan.sample}
         elif self.source is not None:
             s_aggs = None  # hashed below, at the same time as the target
         else:
@@ -379,8 +396,26 @@ class Reconciler:
         else:
             t_aggs = self.target.bucket_aggregates(tplan)
         res.target_rows = sum(a.count for a in t_aggs.values())
-        if plan.filter:  # the table's row count includes the rows the rules leave out
+        if plan.filter or plan.sample is not None:
+            # the table's row count includes rows the rules leave out or the sample skips
             source_rows = res.source_rows = sum(a.count for a in s_aggs.values())
+        compared = plan.buckets if plan.sample is None else len(plan.sample)
+        if plan.sample is not None:
+            res.sampled_percent = round(100 * source_rows / full_rows, 1) if full_rows else 0.0
+            self.result.sample_seed = self._seed
+            self.emit(
+                Kind.NOT_CHECKED,
+                Severity.MEDIUM,
+                q,
+                f"sampled: {compared} of {plan.buckets} buckets compared, "
+                f"{res.sampled_percent}% of the rows; the rest of the table is not checked",
+                detail={
+                    "sampled_buckets": compared,
+                    "buckets": plan.buckets,
+                    "sampled_percent": res.sampled_percent,
+                    "seed": self._seed,
+                },
+            )
 
         # 1. row counts
         if res.target_rows != source_rows:
@@ -413,7 +448,8 @@ class Reconciler:
             Kind.DIFFERENCE,
             Severity.MEDIUM,
             q,
-            f"table aggregate differs; {len(bad)} of {plan.buckets} buckets mismatched",
+            f"table aggregate differs; {len(bad)} of {compared} "
+            f"{'sampled ' if plan.sample is not None else ''}buckets mismatched",
             expected=s_total,
             actual=t_total,
             detail={"buckets": bad[:50], "bucket_count": plan.buckets},
@@ -435,8 +471,8 @@ class Reconciler:
 
         # 4. rows. Circuit breaker: nearly every bucket differs means a systemic cause.
         systemic = (
-            plan.buckets >= self.o.breaker_min_buckets
-            and len(bad) / plan.buckets > self.o.breaker_bucket_ratio
+            compared >= self.o.breaker_min_buckets
+            and len(bad) / compared > self.o.breaker_bucket_ratio
         )
         drill = bad[:1] if systemic else bad
         if plan.key_columns:
@@ -444,6 +480,30 @@ class Reconciler:
         else:
             self._keyless(q, plan, tplan, set(drill), res)
         return res
+
+    def _sample(self, q: str, plan: HashPlan, rows: int) -> HashPlan:
+        """The random buckets a large table is compared on, the same for a given seed."""
+        above = self.o.sample_above_rows
+        if above is None or rows <= above or plan.buckets < 2:
+            return plan
+        k = max(1, math.ceil(plan.buckets * self.o.sample_percent / 100))
+        if k >= plan.buckets:
+            return plan
+        lacking = [
+            a.engine
+            for a in (self.source, self.target)
+            if a is not None and not a.supports_sampling
+        ]
+        if lacking:
+            self.emit(
+                Kind.NOTICE,
+                Severity.INFO,
+                q,
+                f"sampling is not available for {', '.join(lacking)}; compared in full",
+            )
+            return plan
+        rng = random.Random(f"{self._seed}:{q}")  # noqa: S311 - a sample, not a secret
+        return replace(plan, sample=tuple(sorted(rng.sample(range(plan.buckets), k))))
 
     # ------------------------------------------------------------------ details
     def _keyed(self, q, plan, tplan, buckets, res, systemic) -> None:
@@ -585,7 +645,8 @@ class Reconciler:
             Kind.DIFFERENCE,
             Severity.CRITICAL,
             q,
-            f"{res.mismatched_buckets} of {plan.buckets} buckets differ, which points to a "
+            f"{res.mismatched_buckets} of {len(plan.sample or range(plan.buckets))} "
+            f"{'sampled ' if plan.sample is not None else ''}buckets differ, which points to a "
             f"systemic cause rather than lost rows. Columns involved in the sample: "
             f"{', '.join(sorted(cols)) or 'none identified'}. Likely cause: "
             f"{'; '.join(causes) or 'unknown'}. Drill-down stopped.",

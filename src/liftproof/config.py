@@ -184,6 +184,17 @@ def _options(d: dict[str, Any]) -> ReconcileOptions:
     breaker = d.get("circuit_breaker") or {}
     opts.breaker_bucket_ratio = float(breaker.get("bucket_ratio", opts.breaker_bucket_ratio))
     opts.breaker_table_ratio = float(breaker.get("table_ratio", opts.breaker_table_ratio))
+    sampling = d.get("sampling")
+    if sampling:
+        if not isinstance(sampling, dict) or "above_rows" not in sampling:
+            raise ConfigError("database.sampling needs above_rows: tables larger than this are "
+                              "sampled, smaller ones are always compared in full")  # fmt: skip
+        opts.sample_above_rows = int(sampling["above_rows"])
+        opts.sample_percent = float(sampling.get("percent", opts.sample_percent))
+        if not 0 < opts.sample_percent < 100:
+            raise ConfigError("database.sampling.percent is between 0 and 100")
+        if sampling.get("seed") is not None:
+            opts.sample_seed = int(sampling["seed"])
     return opts
 
 
@@ -372,6 +383,9 @@ database:
   diff_row_limit: 100
   show_values: false            # the report is an egress path; values need an explicit opt in
   business_keys: {{}}           # e.g. orders: [order_number] where keys were renumbered
+  # sampling:                    # large tables: compare a random share of the buckets;
+  #   above_rows: 500000000      # the report gives the share and marks the rest not checked
+  #   percent: 10
   ignore:
     # - table: sessions
     #   reason: session tokens are not migrated
