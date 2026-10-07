@@ -58,9 +58,11 @@ class RecordingSession:
     def _settle(self) -> None:
         step_settled(self.page, self.net, self.settle_ms)  # a page never idle still records
         self._captured += self.net.drain()
+        self._settled = time.perf_counter()
 
     def start(self, url: str) -> None:
         t = time.time() * 1000
+        self._began = time.perf_counter()
         self.page.goto(url, wait_until="load")
         self._settle()
         self.journey.steps.append(Step(n=1, action="goto", url=path_of(url)))
@@ -140,6 +142,8 @@ class RecordingSession:
     def finish(self) -> tuple[Journey, dict[str, bytes]]:
         if not self.page.is_closed():
             self._captured += self.net.drain()
+        if hasattr(self, "_began"):
+            self.journey.wall_ms = round((self._settled - self._began) * 1000, 1)
         steps = self.journey.steps
         traffic: list[list[dict[str, Any]]] = [[] for _ in steps]
         assets: dict[str, bytes] = {}

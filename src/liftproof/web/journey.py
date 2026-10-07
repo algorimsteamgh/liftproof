@@ -98,6 +98,9 @@ class Journey:
     writes_tables: list[str] = field(default_factory=list)
     recorded_at: str | None = None
     browser: str | None = None
+    # wall clock of the whole recording, first navigation to last settled step; for a
+    # journey an engineer drove it includes their pauses
+    wall_ms: float | None = None
     format: str = JOURNEY_FORMAT
 
     @property
@@ -143,6 +146,7 @@ class Journey:
             writes_tables=list(d.get("writes_tables", [])),
             recorded_at=d.get("recorded_at"),
             browser=d.get("browser"),
+            wall_ms=d.get("wall_ms"),
             format=d.get("format", JOURNEY_FORMAT),
         )
 
