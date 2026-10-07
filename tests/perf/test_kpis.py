@@ -62,9 +62,9 @@ def test_kpi_replay_time_within_twice_the_recorded_time(replays, kpi):
     """Replay not more than twice the recorded duration, first attempt, retries excluded."""
     journey, results = replays
     ratios = [
-        j.replayed_ms / j.recorded_ms
+        j.replayed_wall_ms / j.recorded_wall_ms
         for j in results
-        if j.status == "passed" and j.attempts == 1 and j.recorded_ms
+        if j.status == "passed" and j.attempts == 1 and j.replayed_wall_ms
     ]
     assert ratios, "no first attempt replay to measure"
     worst = max(ratios)
@@ -73,7 +73,8 @@ def test_kpi_replay_time_within_twice_the_recorded_time(replays, kpi):
         value=round(worst, 2),
         median=round(statistics.median(ratios), 2),
         threshold=REPLAY_RATIO_MAX,
-        unit="replayed / recorded duration (worst of the runs)",
+        unit="replayed / recorded journey wall clock (worst of the runs)",
+        recorded_ms=journey.wall_ms,
         runs=len(ratios),
         steps=len(journey.steps),
         latency_ms=LATENCY_MS,

@@ -33,6 +33,9 @@ class JourneyResult:
     recorded_ms: float
     replayed_ms: float | None
     reason: str | None = None
+    # whole journey wall clock, recording and replay (the replay KPI, docs/kpis.md)
+    recorded_wall_ms: float | None = None
+    replayed_wall_ms: float | None = None
 
 
 @dataclass
@@ -176,6 +179,8 @@ def run_journeys(
                 recorded_ms=round(j.total_ms, 1),
                 replayed_ms=round(run.total_ms, 1) if run.steps else None,
                 reason=run.error,
+                recorded_wall_ms=j.wall_ms,
+                replayed_wall_ms=run.wall_ms,
             )
         )
     for (journey_id, step), n in sorted(replayer.step_flakes.items()):
