@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import queue
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -181,6 +183,7 @@ def take_baseline(
     resume: bool = False,
     side: str = "source",
     progress: Callable[[str], None] = lambda _m: None,
+    workers: int = 1,
 ) -> Baseline:
     if side not in SIDES:
         raise ValueError(f"side must be one of {SIDES}")
@@ -216,15 +219,17 @@ def take_baseline(
                 selection=[r.qualified for r in refs],
                 side=side,
             )
-        for ref in refs:
-            if ref.qualified in baseline.tables:
-                continue
-            ignored = any(r.whole_table and r.matches_table(ref.qualified) for r in ignore)
-            if ignored:
-                continue
+        todo = [
+            ref
+            for ref in refs
+            if ref.qualified not in baseline.tables
+            and not any(r.whole_table and r.matches_table(ref.qualified) for r in ignore)
+        ]
+
+        def one(a: Adapter, ref: TableRef) -> BaselineTable:
             progress(f"baselining {ref}")
-            schema = source.describe(ref)
-            rows = source.row_count(ref)
+            schema = a.describe(ref)
+            rows = a.row_count(ref)
             tp = plan_table(
                 schema,
                 None,
@@ -235,19 +240,53 @@ def take_baseline(
                 business_key=business_keys.get(ref.qualified) or business_keys.get(ref.name),
                 side=side,
             )
-            if tp.plan.filter and not source.supports_row_filters:
-                raise ConfigError(f"{ref}: row ignore rules are not supported for {source.engine}")
-            buckets = source.bucket_aggregates(tp.plan) if tp.plan.columns else {}
+            if tp.plan.filter and not a.supports_row_filters:
+                raise ConfigError(f"{ref}: row ignore rules are not supported for {a.engine}")
+            buckets = a.bucket_aggregates(tp.plan) if tp.plan.columns else {}
             if tp.plan.filter:  # the rows the baseline holds, not the table's
                 rows = sum(b.count for b in buckets.values())
-            baseline.tables[ref.qualified] = BaselineTable(
+            return BaselineTable(
                 schema,
                 tp.plan,
                 rows,
                 buckets,
                 dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
             )
-            baseline.save(manifest_path)  # checkpoint per table
+
+        n = min(workers, len(todo))
+        if n > 1 and not (source.supports_workers and position.get("snapshot_id")):
+            progress(f"parallel workers are not available for {source.engine}; one at a time")
+            n = 1
+        if n <= 1:
+            for ref in todo:
+                baseline.tables[ref.qualified] = one(source, ref)
+                baseline.save(manifest_path)  # checkpoint per table
+        else:
+            # every worker imports the snapshot exported above: one state of the database
+            free: queue.SimpleQueue[Adapter] = queue.SimpleQueue()
+            free.put(source)
+            forks: list[Adapter] = []
+            try:
+                for _ in range(n - 1):
+                    forks.append(source.fork(position))
+                    free.put(forks[-1])
+
+                def job(ref: TableRef) -> tuple[TableRef, BaselineTable]:
+                    a = free.get()
+                    try:
+                        return ref, one(a, ref)
+                    finally:
+                        free.put(a)
+
+                with ThreadPoolExecutor(max_workers=n) as pool:
+                    for f in as_completed([pool.submit(job, ref) for ref in todo]):
+                        ref, entry = f.result()
+                        baseline.tables[ref.qualified] = entry
+                        baseline.save(manifest_path)  # checkpoint per table
+            finally:
+                for a in forks:
+                    a.end_snapshot()
+                    a.close()
         baseline.selection = [r.qualified for r in refs if r.qualified in baseline.tables]
         baseline.save(manifest_path)
         return baseline

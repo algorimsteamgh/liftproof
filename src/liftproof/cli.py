@@ -205,6 +205,7 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
             resume=args.resume,
             side=side,
             progress=lambda m: log.info(m),
+            workers=o.workers,
         )
     store.put_file(key, manifest)
     # The marker goes to the store too, so a replacement instance still finds it.

@@ -160,6 +160,7 @@ class PostgresAdapter(Adapter):
         rows_per_second: int = 0,
         connect_timeout: int = 10,
     ) -> None:
+        self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
         params: dict[str, Any] = {
             "host": host,
             "port": port,
@@ -260,6 +261,23 @@ class PostgresAdapter(Adapter):
             raise NotImplementedError(kind)
         hi, lo = position.split("/")
         return (int(hi, 16) << 32) + int(lo, 16)
+
+    supports_workers = True
+
+    def fork(self, snapshot: dict[str, Any] | None = None) -> PostgresAdapter:
+        other = PostgresAdapter(**self._kwargs)
+        if snapshot is not None:
+            other.conn.autocommit = False
+            other.conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            other.conn.read_only = True
+            with other.conn.cursor() as cur:  # the first statement of the transaction
+                cur.execute(
+                    sql.SQL("SET TRANSACTION SNAPSHOT {}").format(
+                        sql.Literal(snapshot["snapshot_id"])
+                    )
+                )
+            other._in_snapshot = True
+        return other
 
     def end_snapshot(self) -> None:
         if self._in_snapshot:

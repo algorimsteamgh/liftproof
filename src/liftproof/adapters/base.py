@@ -161,6 +161,14 @@ class Adapter(abc.ABC):
     # Sampled reconciliation: bucket_aggregates honours HashPlan.sample. Without it a
     # table is compared in full, and the report says why.
     supports_sampling: bool = False
+    # Parallel workers (spec 9.1, 9.15): fork opens another connection like this one.
+    supports_workers: bool = False
+
+    def fork(self, snapshot: dict[str, Any] | None = None) -> Adapter:
+        """Another connection to the same database, for a worker. Given the position
+        begin_snapshot returned, it reads the same snapshot, so a baseline taken by several
+        workers is still the hash of one state of the database."""
+        raise NotImplementedError(self.engine)
 
     def current_position(self) -> dict[str, Any] | None:
         """This database's consistency position now, in the shape begin_snapshot returns."""

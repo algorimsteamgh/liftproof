@@ -144,6 +144,7 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
         raise ConfigError(f"{role}.{exc.args[0]} is required") from None
 
 
+MAX_WORKERS = 8  # spec 9.15: a ceiling to be measured against the source, not a target
 UNSAFE_SQL = re.compile(r";|--|/\*|\*/")
 
 
@@ -187,6 +188,13 @@ def _options(d: dict[str, Any]) -> ReconcileOptions:
     breaker = d.get("circuit_breaker") or {}
     opts.breaker_bucket_ratio = float(breaker.get("bucket_ratio", opts.breaker_bucket_ratio))
     opts.breaker_table_ratio = float(breaker.get("table_ratio", opts.breaker_table_ratio))
+    workers = d.get("workers", 1)
+    if not isinstance(workers, int) or not 1 <= workers <= MAX_WORKERS:
+        raise ConfigError(
+            f"database.workers is 1 (one table at a time, the default) to {MAX_WORKERS}; "
+            "each worker is another connection reading the source"
+        )
+    opts.workers = workers
     sampling = d.get("sampling")
     if sampling:
         if not isinstance(sampling, dict) or "above_rows" not in sampling:
@@ -403,6 +411,7 @@ database:
   diff_row_limit: 100
   show_values: false            # the report is an egress path; values need an explicit opt in
   business_keys: {{}}           # e.g. orders: [order_number] where keys were renumbered
+  workers: 1                    # tables hashed at once; each is another source connection
   # sampling:                    # large tables: compare a random share of the buckets;
   #   above_rows: 500000000      # the report gives the share and marks the rest not checked
   #   percent: 10

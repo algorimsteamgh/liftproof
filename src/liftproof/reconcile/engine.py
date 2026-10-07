@@ -12,13 +12,16 @@ says what has changed in the target since it was accepted, down to the bucket.
 
 from __future__ import annotations
 
+import copy
 import heapq
 import math
+import queue
 import random
 import secrets
+import threading
 from collections import Counter
-from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -53,6 +56,9 @@ class ReconcileOptions:
     sample_above_rows: int | None = None
     sample_percent: float = 10.0
     sample_seed: int | None = None  # None: a fresh seed per run, recorded in the report
+    # tables reconciled at once, each worker on its own connections (spec 9.15: worker
+    # concurrency multiplies source load, so this is a ceiling to be measured)
+    workers: int = 1
 
 
 @dataclass
@@ -130,14 +136,22 @@ class Reconciler:
         self.o = options
         self.progress = progress or (lambda _msg: None)
         self.result = ReconcileResult()
-        self._drill = True
+        # shared by the workers, which are shallow copies of this object
+        self._flags = {"drill": True}
+        self._lock = threading.Lock()
+        self._tally = [0, 0]  # tables different, tables done
         self._seed = (
             options.sample_seed if options.sample_seed is not None else secrets.randbelow(2**31)
         )
 
     # ------------------------------------------------------------------ helpers
+    @property
+    def _drill(self) -> bool:
+        return self._flags["drill"]
+
     def emit(self, kind: Kind, severity: int, obj: str, summary: str, **kw: Any) -> None:
-        self.writer.write(Finding(DB, kind, severity, obj, summary, **kw))
+        with self._lock:
+            self.writer.write(Finding(DB, kind, severity, obj, summary, **kw))
 
     def _selected(self, tables: Sequence[TableRef]) -> list[TableRef]:
         if not self.o.tables:
@@ -172,10 +186,9 @@ class Reconciler:
                 "table exists on the target only",
             )
 
-        mismatched = 0
-        done = 0
+        order = {t.qualified: i for i, t in enumerate(source_tables)}
+        work: list[tuple[TableRef, TableRef]] = []
         for table in source_tables:
-            self.progress(f"reconciling {table}")
             rule = self._table_ignored(table)
             if rule:
                 self.emit(
@@ -194,35 +207,89 @@ class Reconciler:
                 self.emit(
                     Kind.DIFFERENCE, Severity.HIGH, table.qualified, "table missing in target"
                 )
-                self.result.tables.append(
-                    TableResult(table.qualified, "different", reason="missing in target")
-                )
-                mismatched += 1
-                done += 1
+                res = TableResult(table.qualified, "different", reason="missing in target")
+                self.result.tables.append(res)
+                self._count(res)
                 continue
-            res = self._table(table, ttable)
+            work.append((table, ttable))
+        for res in self._each(work):
             self.result.tables.append(res)
-            done += 1
-            if res.status == "different":
-                mismatched += 1
-            if (
-                self._drill
-                and done >= self.o.breaker_min_tables
-                and mismatched / done > self.o.breaker_table_ratio
-            ):
-                self._drill = False
-                self.result.systemic = True
-                self.emit(
-                    Kind.DIFFERENCE,
-                    Severity.CRITICAL,
-                    "database",
-                    f"{mismatched} of {done} tables differ; row level drill-down stopped. "
-                    "This pattern usually means a systemic cause (character set, collation, "
-                    "time zone or type mapping) rather than lost data. See the per table "
-                    "findings for the columns involved.",
-                    detail={"tables_checked": done, "tables_different": mismatched},
-                )
+            self._count(res)
+        self.result.tables.sort(key=lambda r: order.get(r.table, len(order)))
         return self.result
+
+    def _count(self, res: TableResult) -> None:
+        """Circuit breaker across tables: most tables differing means a systemic cause."""
+        self._tally[1] += 1
+        if res.status == "different":
+            self._tally[0] += 1
+        mismatched, done = self._tally
+        if (
+            self._drill
+            and done >= self.o.breaker_min_tables
+            and mismatched / done > self.o.breaker_table_ratio
+        ):
+            self._flags["drill"] = False
+            self.result.systemic = True
+            self.emit(
+                Kind.DIFFERENCE,
+                Severity.CRITICAL,
+                "database",
+                f"{mismatched} of {done} tables differ; row level drill-down stopped. "
+                "This pattern usually means a systemic cause (character set, collation, "
+                "time zone or type mapping) rather than lost data. See the per table "
+                "findings for the columns involved.",
+                detail={"tables_checked": done, "tables_different": mismatched},
+            )
+
+    def _each(self, work: list[tuple[TableRef, TableRef]]) -> Iterator[TableResult]:
+        """Reconcile the tables, in order on one worker, or on several at once when the
+        project asks for it and both engines can open more connections."""
+        n = min(self.o.workers, len(work))
+        if n > 1:
+            lacking = [a.engine for a in (self.source, self.target) if a and not a.supports_workers]
+            if lacking:
+                self.emit(
+                    Kind.NOTICE,
+                    Severity.INFO,
+                    "database",
+                    f"parallel workers are not available for {', '.join(lacking)}; "
+                    "tables are reconciled one at a time",
+                )
+                n = 1
+        if n <= 1:
+            for table, ttable in work:
+                self.progress(f"reconciling {table}")
+                yield self._table(table, ttable)
+            return
+        free: queue.SimpleQueue[Reconciler] = queue.SimpleQueue()
+        free.put(self)
+        clones: list[Reconciler] = []
+        try:
+            for _ in range(n - 1):
+                c = copy.copy(self)  # shares the writer, the result, the lock and the flags
+                c.source = self.source.fork() if self.source is not None else None
+                c.target = self.target.fork()
+                clones.append(c)
+                free.put(c)
+
+            def job(table: TableRef, ttable: TableRef) -> TableResult:
+                w = free.get()
+                try:
+                    self.progress(f"reconciling {table}")
+                    return w._table(table, ttable)
+                finally:
+                    free.put(w)
+
+            with ThreadPoolExecutor(max_workers=n) as pool:
+                futures = [pool.submit(job, t, tt) for t, tt in work]
+                for f in as_completed(futures):
+                    yield f.result()
+        finally:
+            for c in clones:
+                for a in (c.source, c.target):
+                    if a is not None:
+                        a.close()
 
     def _replication_behind(self, tables: Sequence[TableRef]) -> bool:
         """Spec 9.2: before any difference is reported, replication must have applied
