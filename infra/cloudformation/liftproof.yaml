@@ -1,0 +1,962 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Liftproof migration validation (AWS Marketplace). One private instance with no inbound
+  access, a KMS encrypted S3 bucket for projects, baselines and reports, Session Manager
+  access and a Run Command document for pipelines. The same deployment as the Terraform
+  module infra/modules/liftproof; keep the two in step (tests/test_cloudformation.py).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Deployment }
+        Parameters: [DeploymentName, ImageId, InstanceType, RootVolumeGiB]
+      - Label: { default: Network (the instance gets no inbound rule and no public address) }
+        Parameters:
+          - VpcId
+          - SubnetId
+          - CreateVpcEndpoints
+          - EndpointSubnetIds
+          - PrivateRouteTableIds
+      - Label: { default: Databases the instance may reach (leave CIDR empty to skip) }
+        Parameters:
+          - Database1Cidr
+          - Database1Port
+          - Database2Cidr
+          - Database2Port
+          - Database3Cidr
+          - Database3Port
+          - Database4Cidr
+          - Database4Port
+      - Label: { default: Applications recorded and replayed (leave empty to skip) }
+        Parameters: [ApplicationCidrs, ApplicationPort]
+      - Label: { default: Credentials and encryption }
+        Parameters: [SecretArns, SecretKmsKeyArns, KmsKeyArn]
+      - Label: { default: Storage and retention }
+        Parameters:
+          - BucketName
+          - ReportLockDays
+          - AssetRetentionDays
+          - NoncurrentVersionDays
+          - AccessLogBucket
+          - LogRetentionDays
+      - Label: { default: Operators and alarms }
+        Parameters: [OperatorPrincipalArns, AlarmTopicArn]
+    ParameterLabels:
+      ImageId: { default: Liftproof AMI }
+      SecretArns: { default: Secrets the product may read }
+      CreateVpcEndpoints: { default: Create VPC endpoints }
+
+Parameters:
+  DeploymentName:
+    Type: String
+    Description: Deployment name, used in resource names (for example acme-prod).
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,30}$"
+    ConstraintDescription: 2 to 31 lower case letters, digits or hyphens.
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: >-
+      The Liftproof AMI. Leave the default: AWS Marketplace publishes each version under
+      this public parameter in every Region.
+    Default: /aws/service/marketplace/prod-REPLACE-AT-LISTING/latest
+  InstanceType:
+    Type: String
+    Description: 4 vCPU and 16 GiB is the starting point.
+    Default: m7i.xlarge
+    AllowedValues: [m7i.large, m7i.xlarge, m7i.2xlarge, m7i.4xlarge, m6i.xlarge, m6i.2xlarge, r7i.xlarge, r7i.2xlarge]
+  RootVolumeGiB:
+    Type: Number
+    Description: Root volume size. Holds working copies and transient hashes only.
+    Default: 100
+    MinValue: 30
+    MaxValue: 4096
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet for the instance. It needs no internet gateway route.
+  CreateVpcEndpoints:
+    Type: String
+    Description: >-
+      Create the interface endpoints (Systems Manager, Secrets Manager, KMS, CloudWatch)
+      and the S3 gateway endpoint. Choose false if the VPC already has them.
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  EndpointSubnetIds:
+    Type: CommaDelimitedList
+    Description: Subnets for the interface endpoints, one per Availability Zone. Empty uses the instance subnet.
+    Default: ""
+  PrivateRouteTableIds:
+    Type: CommaDelimitedList
+    Description: Route tables that get the S3 gateway endpoint. Needed when endpoints are created.
+    Default: ""
+  Database1Cidr:
+    Type: String
+    Description: Source or target database network, for example 10.20.0.0/24.
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  Database1Port:
+    Type: Number
+    Default: 5432
+    MinValue: 1
+    MaxValue: 65535
+  Database2Cidr:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  Database2Port:
+    Type: Number
+    Default: 5432
+    MinValue: 1
+    MaxValue: 65535
+  Database3Cidr:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  Database3Port:
+    Type: Number
+    Default: 3306
+    MinValue: 1
+    MaxValue: 65535
+  Database4Cidr:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  Database4Port:
+    Type: Number
+    Default: 1433
+    MinValue: 1
+    MaxValue: 65535
+  ApplicationCidrs:
+    Type: CommaDelimitedList
+    Description: Up to three networks hosting the source and target applications. Empty skips the rules.
+    Default: ""
+  ApplicationPort:
+    Type: Number
+    Description: Port the recorded applications listen on.
+    Default: 443
+    MinValue: 1
+    MaxValue: 65535
+  SecretArns:
+    Type: CommaDelimitedList
+    Description: >-
+      Secrets Manager secrets the product may read (database and replay credentials).
+      Wildcards allowed, for example arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/*
+  SecretKmsKeyArns:
+    Type: CommaDelimitedList
+    Description: KMS keys that encrypt those secrets, when not the product key. The usual cause of access denied on the first run.
+    Default: ""
+  KmsKeyArn:
+    Type: String
+    Description: Existing customer managed KMS key. Empty creates a dedicated key with rotation.
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:\\d{12}:key/.+$"
+  BucketName:
+    Type: String
+    Description: Bucket name. Empty derives lp-NAME-ACCOUNT-REGION.
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  ReportLockDays:
+    Type: Number
+    Description: Object Lock retention (governance mode) the product applies to reports. A report is a go live sign off record.
+    Default: 365
+    MinValue: 0
+    MaxValue: 3650
+  AssetRetentionDays:
+    Type: Number
+    Description: Recorded request and response bodies and page snapshots expire after this many days.
+    Default: 90
+    MinValue: 1
+    MaxValue: 3650
+  NoncurrentVersionDays:
+    Type: Number
+    Description: Old object versions expire after this many days.
+    Default: 90
+    MinValue: 1
+    MaxValue: 3650
+  AccessLogBucket:
+    Type: String
+    Description: Existing bucket for S3 server access logs. Empty disables access logging.
+    Default: ""
+  LogRetentionDays:
+    Type: Number
+    Description: CloudWatch Logs retention for the product log group.
+    Default: 365
+    AllowedValues: [30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+  OperatorPrincipalArns:
+    Type: CommaDelimitedList
+    Description: IAM principals (people's and pipelines' roles) allowed to assume the operator role. Empty skips the role; the operator policy is still created.
+    Default: ""
+  AlarmTopicArn:
+    Type: String
+    Description: SNS topic for alarms. Empty creates alarms without notifications.
+    Default: ""
+
+Conditions:
+  CreateKey: { "Fn::Equals": [{ Ref: KmsKeyArn }, ""] }
+  DeriveBucketName: { "Fn::Equals": [{ Ref: BucketName }, ""] }
+  CreateEndpoints: { "Fn::Equals": [{ Ref: CreateVpcEndpoints }, "true"] }
+  EndpointSubnetsGiven:
+    "Fn::Not": [{ "Fn::Equals": [{ "Fn::Join": ["", { Ref: EndpointSubnetIds }] }, ""] }]
+  AccessLogging: { "Fn::Not": [{ "Fn::Equals": [{ Ref: AccessLogBucket }, ""] }] }
+  SecretKeysGiven:
+    "Fn::Not": [{ "Fn::Equals": [{ "Fn::Join": ["", { Ref: SecretKmsKeyArns }] }, ""] }]
+  OperatorRole:
+    "Fn::Not": [{ "Fn::Equals": [{ "Fn::Join": ["", { Ref: OperatorPrincipalArns }] }, ""] }]
+  AlarmNotifications: { "Fn::Not": [{ "Fn::Equals": [{ Ref: AlarmTopicArn }, ""] }] }
+  Database1: { "Fn::Not": [{ "Fn::Equals": [{ Ref: Database1Cidr }, ""] }] }
+  Database2: { "Fn::Not": [{ "Fn::Equals": [{ Ref: Database2Cidr }, ""] }] }
+  Database3: { "Fn::Not": [{ "Fn::Equals": [{ Ref: Database3Cidr }, ""] }] }
+  Database4: { "Fn::Not": [{ "Fn::Equals": [{ Ref: Database4Cidr }, ""] }] }
+  Application1:
+    "Fn::Not": [{ "Fn::Equals": [{ "Fn::Select": [0, { "Fn::Split": [",", { "Fn::Join": [",", [{ "Fn::Join": [",", { Ref: ApplicationCidrs }] }, "", "", ""]] }] }] }, ""] }]
+  Application2:
+    "Fn::Not": [{ "Fn::Equals": [{ "Fn::Select": [1, { "Fn::Split": [",", { "Fn::Join": [",", [{ "Fn::Join": [",", { Ref: ApplicationCidrs }] }, "", "", ""]] }] }] }, ""] }]
+  Application3:
+    "Fn::Not": [{ "Fn::Equals": [{ "Fn::Select": [2, { "Fn::Split": [",", { "Fn::Join": [",", [{ "Fn::Join": [",", { Ref: ApplicationCidrs }] }, "", "", ""]] }] }] }, ""] }]
+
+Resources:
+  # --- encryption (N7 / SECOPS-004) --------------------------------------------------
+  Key:
+    Type: AWS::KMS::Key
+    Condition: CreateKey
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: { "Fn::Sub": "Liftproof ${DeploymentName}: recordings, baselines, reports, logs and volumes" }
+      EnableKeyRotation: true
+      RotationPeriodInDays: 365
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: { "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" } }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal: { Service: { "Fn::Sub": "logs.${AWS::Region}.amazonaws.com" } }
+            Action: [kms:Encrypt, kms:Decrypt, kms:ReEncrypt*, kms:GenerateDataKey*, kms:DescribeKey]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: { "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/liftproof/${DeploymentName}*" }
+      Tags:
+        - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
+        - { Key: liftproof:managed-by, Value: cloudformation }
+
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateKey
+    Properties:
+      AliasName: { "Fn::Sub": "alias/liftproof-${DeploymentName}" }
+      TargetKeyId: { Ref: Key }
+
+  # --- storage (F15): everything durable lives in the bucket -------------------------
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain # reports are sign off records under Object Lock
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Access logging is a customer choice (AccessLogBucket)
+    Properties:
+      BucketName:
+        "Fn::If":
+          - DeriveBucketName
+          - { "Fn::Sub": "lp-${DeploymentName}-${AWS::AccountId}-${AWS::Region}" }
+          - { Ref: BucketName }
+      ObjectLockEnabled: true # the product applies governance retention to runs/
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: journey-assets-retention
+            Status: Enabled
+            TagFilters: [{ Key: liftproof:class, Value: asset }]
+            ExpirationInDays: { Ref: AssetRetentionDays }
+            NoncurrentVersionExpiration: { NoncurrentDays: { Ref: AssetRetentionDays } }
+          - Id: housekeeping
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 2 }
+            NoncurrentVersionExpiration: { NoncurrentDays: { Ref: NoncurrentVersionDays } }
+      LoggingConfiguration:
+        "Fn::If":
+          - AccessLogging
+          - DestinationBucketName: { Ref: AccessLogBucket }
+            LogFilePrefix:
+              "Fn::If":
+                - DeriveBucketName
+                - { "Fn::Sub": "s3/lp-${DeploymentName}-${AWS::AccountId}-${AWS::Region}/" }
+                - { "Fn::Sub": "s3/${BucketName}/" }
+          - { Ref: AWS::NoValue }
+      Tags:
+        - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
+        - { Key: liftproof:managed-by, Value: cloudformation }
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: { Ref: Bucket }
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [{ "Fn::GetAtt": [Bucket, Arn] }, { "Fn::Sub": "${Bucket.Arn}/*" }]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+          - Sid: DenyOtherEncryption
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: { "Fn::Sub": "${Bucket.Arn}/*" }
+            Condition:
+              StringNotEqualsIfExists:
+                s3:x-amz-server-side-encryption-aws-kms-key-id:
+                  "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }]
+          - Sid: DenyOldTls
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [{ "Fn::GetAtt": [Bucket, Arn] }, { "Fn::Sub": "${Bucket.Arn}/*" }]
+            Condition: { NumericLessThan: { s3:TlsVersion: "1.2" } }
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: { "Fn::Sub": "/liftproof/${DeploymentName}" }
+      RetentionInDays: { Ref: LogRetentionDays }
+      KmsKeyId: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+
+  # --- network: no inbound rule anywhere ----------------------------------------------
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: { "Fn::Sub": "liftproof-${DeploymentName}-instance" }
+      GroupDescription: "Liftproof instance: no inbound, scoped egress"
+      VpcId: { Ref: VpcId }
+      SecurityGroupEgress:
+        - Description: AWS service endpoints inside the VPC
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: { "Fn::GetAtt": [VpcInfo, CidrBlock] }
+        - Description: Amazon S3 through the gateway endpoint
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: { "Fn::GetAtt": [VpcInfo, PrefixListId] }
+      Tags:
+        - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}-instance" } }
+        - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
+
+  Database1Egress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: Database1
+    Properties:
+      GroupId: { Ref: InstanceSecurityGroup }
+      Description: Database 1
+      IpProtocol: tcp
+      FromPort: { Ref: Database1Port }
+      ToPort: { Ref: Database1Port }
+      CidrIp: { Ref: Database1Cidr }
+  Database2Egress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: Database2
+    Properties:
+      GroupId: { Ref: InstanceSecurityGroup }
+      Description: Database 2
+      IpProtocol: tcp
+      FromPort: { Ref: Database2Port }
+      ToPort: { Ref: Database2Port }
+      CidrIp: { Ref: Database2Cidr }
+  Database3Egress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: Database3
+    Properties:
+      GroupId: { Ref: InstanceSecurityGroup }
+      Description: Database 3
+      IpProtocol: tcp
+      FromPort: { Ref: Database3Port }
+      ToPort: { Ref: Database3Port }
+      CidrIp: { Ref: Database3Cidr }
+  Database4Egress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: Database4
+    Properties:
+      GroupId: { Ref: InstanceSecurityGroup }
+      Description: Database 4
+      IpProtocol: tcp
+      FromPort: { Ref: Database4Port }
+      ToPort: { Ref: Database4Port }
+      CidrIp: { Ref: Database4Cidr }
+
+  Application1Egress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: Application1
+    Properties:
+      GroupId: { Ref: InstanceSecurityGroup }
+      Description: Source and target applications (record and replay)
+      IpProtocol: tcp
+      FromPort: { Ref: ApplicationPort }
+      ToPort: { Ref: ApplicationPort }
+      CidrIp: { "Fn::Select": [0, { Ref: ApplicationCidrs }] }
+  Application2Egress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: Application2
+    Properties:
+      GroupId: { Ref: InstanceSecurityGroup }
+      Description: Source and target applications (record and replay)
+      IpProtocol: tcp
+      FromPort: { Ref: ApplicationPort }
+      ToPort: { Ref: ApplicationPort }
+      CidrIp: { "Fn::Select": [1, { Ref: ApplicationCidrs }] }
+  Application3Egress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: Application3
+    Properties:
+      GroupId: { Ref: InstanceSecurityGroup }
+      Description: Source and target applications (record and replay)
+      IpProtocol: tcp
+      FromPort: { Ref: ApplicationPort }
+      ToPort: { Ref: ApplicationPort }
+      CidrIp: { "Fn::Select": [2, { Ref: ApplicationCidrs }] }
+
+  # Looks up the VPC CIDR and the S3 prefix list. CloudFormation has no data sources,
+  # so a small read only function answers both at create and update time.
+  LookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Liftproof template lookup (VPC CIDR, S3 prefix list); read only
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { aws:SourceAccount: { Ref: AWS::AccountId } } }
+      Policies:
+        - PolicyName: lookup
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DescribeOnly
+                Effect: Allow
+                Action: [ec2:DescribeVpcs, ec2:DescribeManagedPrefixLists]
+                Resource: "*" # Describe actions have no resource level permissions
+              - Sid: OwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: { "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/liftproof-${DeploymentName}-lookup:*" }
+
+  LookupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: { "Fn::Sub": "/aws/lambda/liftproof-${DeploymentName}-lookup" }
+      RetentionInDays: 30
+      KmsKeyId: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+
+  LookupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LookupLogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: Custom resource handler; CloudFormation retries, a dead letter queue adds nothing
+          - id: CKV_AWS_117
+            comment: Needs only the EC2 API; running it in the VPC would require more endpoints
+          - id: CKV_AWS_115
+            comment: Runs a few times per stack operation
+          - id: CKV_AWS_173
+            comment: No environment variables
+    Properties:
+      FunctionName: { "Fn::Sub": "liftproof-${DeploymentName}-lookup" }
+      Description: Liftproof template lookup (VPC CIDR, S3 prefix list)
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: { "Fn::GetAtt": [LookupRole, Arn] }
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+
+          import boto3
+
+
+          def respond(event, status, data=None, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or "see the function's log",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or event["LogicalResourceId"],
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": ""})
+              urllib.request.urlopen(req, timeout=10)
+
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      return respond(event, "SUCCESS")
+                  props = event["ResourceProperties"]
+                  ec2 = boto3.client("ec2")
+                  vpc = ec2.describe_vpcs(VpcIds=[props["VpcId"]])["Vpcs"][0]
+                  name = "com.amazonaws.%s.s3" % props["Region"]
+                  lists = ec2.describe_managed_prefix_lists(
+                      Filters=[{"Name": "prefix-list-name", "Values": [name]}]
+                  )["PrefixLists"]
+                  respond(event, "SUCCESS", {
+                      "CidrBlock": vpc["CidrBlock"],
+                      "PrefixListId": lists[0]["PrefixListId"],
+                  })
+              except Exception as exc:
+                  print(repr(exc))
+                  respond(event, "FAILED", reason=str(exc)[:200])
+
+  VpcInfo:
+    Type: Custom::LiftproofLookup
+    Properties:
+      ServiceToken: { "Fn::GetAtt": [LookupFunction, Arn] }
+      VpcId: { Ref: VpcId }
+      Region: { Ref: AWS::Region }
+
+  # --- VPC endpoints (a prerequisite in private subnets) -------------------------------
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateEndpoints
+    Properties:
+      GroupName: { "Fn::Sub": "liftproof-${DeploymentName}-endpoints" }
+      GroupDescription: Interface endpoints used by Liftproof
+      VpcId: { Ref: VpcId }
+      SecurityGroupIngress:
+        - Description: HTTPS from the Liftproof instance
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: { Ref: InstanceSecurityGroup }
+      SecurityGroupEgress:
+        - Description: No egress needed by an endpoint
+          IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}-endpoints" } }
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: { Ref: VpcId }
+      ServiceName: { "Fn::Sub": "com.amazonaws.${AWS::Region}.ssm" }
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: { "Fn::If": [EndpointSubnetsGiven, { Ref: EndpointSubnetIds }, [{ Ref: SubnetId }]] }
+      SecurityGroupIds: [{ Ref: EndpointSecurityGroup }]
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: { Ref: VpcId }
+      ServiceName: { "Fn::Sub": "com.amazonaws.${AWS::Region}.ssmmessages" }
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: { "Fn::If": [EndpointSubnetsGiven, { Ref: EndpointSubnetIds }, [{ Ref: SubnetId }]] }
+      SecurityGroupIds: [{ Ref: EndpointSecurityGroup }]
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: { Ref: VpcId }
+      ServiceName: { "Fn::Sub": "com.amazonaws.${AWS::Region}.ec2messages" }
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: { "Fn::If": [EndpointSubnetsGiven, { Ref: EndpointSubnetIds }, [{ Ref: SubnetId }]] }
+      SecurityGroupIds: [{ Ref: EndpointSecurityGroup }]
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: { Ref: VpcId }
+      ServiceName: { "Fn::Sub": "com.amazonaws.${AWS::Region}.secretsmanager" }
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: { "Fn::If": [EndpointSubnetsGiven, { Ref: EndpointSubnetIds }, [{ Ref: SubnetId }]] }
+      SecurityGroupIds: [{ Ref: EndpointSecurityGroup }]
+  KmsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: { Ref: VpcId }
+      ServiceName: { "Fn::Sub": "com.amazonaws.${AWS::Region}.kms" }
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: { "Fn::If": [EndpointSubnetsGiven, { Ref: EndpointSubnetIds }, [{ Ref: SubnetId }]] }
+      SecurityGroupIds: [{ Ref: EndpointSecurityGroup }]
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: { Ref: VpcId }
+      ServiceName: { "Fn::Sub": "com.amazonaws.${AWS::Region}.logs" }
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: { "Fn::If": [EndpointSubnetsGiven, { Ref: EndpointSubnetIds }, [{ Ref: SubnetId }]] }
+      SecurityGroupIds: [{ Ref: EndpointSecurityGroup }]
+  MonitoringEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: { Ref: VpcId }
+      ServiceName: { "Fn::Sub": "com.amazonaws.${AWS::Region}.monitoring" }
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: { "Fn::If": [EndpointSubnetsGiven, { Ref: EndpointSubnetIds }, [{ Ref: SubnetId }]] }
+      SecurityGroupIds: [{ Ref: EndpointSecurityGroup }]
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: { Ref: VpcId }
+      ServiceName: { "Fn::Sub": "com.amazonaws.${AWS::Region}.s3" }
+      VpcEndpointType: Gateway
+      RouteTableIds: { Ref: PrivateRouteTableIds }
+
+  # --- identity (spec 15): the instance role and the operator policy -----------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: { "Fn::Sub": "liftproof-${DeploymentName}-instance" }
+      Description: Liftproof product instance role
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { aws:SourceAccount: { Ref: AWS::AccountId } } }
+      ManagedPolicyArns:
+        - { "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore" }
+      Policies:
+        - PolicyName: liftproof-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ObjectsReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: { "Fn::Sub": "${Bucket.Arn}/*" }
+              - Sid: LockReports
+                Effect: Allow
+                Action: [s3:PutObjectRetention, s3:GetObjectRetention]
+                Resource: { "Fn::Sub": "${Bucket.Arn}/*/runs/*" }
+              - Sid: ReleaseRunLocks
+                Effect: Allow
+                Action: s3:DeleteObject
+                Resource: { "Fn::Sub": "${Bucket.Arn}/*/locks/*" }
+              - Sid: BucketLevel
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation, s3:ListBucketMultipartUploads]
+                Resource: { "Fn::GetAtt": [Bucket, Arn] }
+              - Sid: UseKeys
+                Effect: Allow
+                Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+                Resource:
+                  "Fn::If":
+                    - SecretKeysGiven
+                    - "Fn::Split":
+                        - ","
+                        - "Fn::Join":
+                            - ","
+                            - - { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+                              - { "Fn::Join": [",", { Ref: SecretKmsKeyArns }] }
+                    - { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+              - Sid: ReadCredentials
+                Effect: Allow
+                Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: { Ref: SecretArns }
+              - Sid: ShipLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: { "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/liftproof/${DeploymentName}:*" }
+              - Sid: PublishMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*" # PutMetricData has no resource type; scoped by namespace
+                Condition: { StringEquals: { cloudwatch:namespace: Liftproof } }
+      Tags:
+        - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: { "Fn::Sub": "liftproof-${DeploymentName}-instance" }
+      Roles: [{ Ref: InstanceRole }]
+
+  OperatorPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: { "Fn::Sub": "liftproof-${DeploymentName}-operator" }
+      Description: Reach the Liftproof UI over Session Manager, start runs with Run Command, read reports
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PortForwardToUi
+            Effect: Allow
+            Action: ssm:StartSession
+            Resource:
+              - { "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}" }
+              - { "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartPortForwardingSession" }
+            Condition: { BoolIfExists: { ssm:SessionDocumentAccessCheck: "true" } }
+          - Sid: ManageOwnSessions
+            Effect: Allow
+            Action: [ssm:TerminateSession, ssm:ResumeSession]
+            Resource: { "Fn::Sub": "arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:session/${!aws:userid}-*" }
+          - Sid: RunValidation
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource:
+              - { "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}" }
+              - { "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${RunDocument}" }
+          - Sid: ReadCommandResults
+            Effect: Allow
+            Action: [ssm:GetCommandInvocation, ssm:ListCommandInvocations]
+            Resource: "*" # these actions do not support resource level permissions
+          - Sid: ReadReports
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: { "Fn::Sub": "${Bucket.Arn}/*/runs/*" }
+          - Sid: DecryptReports
+            Effect: Allow
+            Action: kms:Decrypt
+            Resource: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+
+  OperatorRole:
+    Type: AWS::IAM::Role
+    Condition: OperatorRole
+    Properties:
+      RoleName: { "Fn::Sub": "liftproof-${DeploymentName}-operator" }
+      Description: People and pipelines operating Liftproof
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: { Ref: OperatorPrincipalArns } }
+            Action: [sts:AssumeRole, sts:TagSession]
+      ManagedPolicyArns: [{ Ref: OperatorPolicy }]
+
+  # --- compute: one disposable instance ------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: { "Fn::Sub": "liftproof-${DeploymentName}" }
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required # IMDSv2 only (AWSAPI-004)
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: disabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1 # Ubuntu root device
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: { Ref: RootVolumeGiB }
+              Encrypted: true
+              KmsKeyId: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}" } }
+              - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: { Ref: ImageId }
+      InstanceType: { Ref: InstanceType }
+      LaunchTemplate:
+        LaunchTemplateId: { Ref: LaunchTemplate }
+        Version: { "Fn::GetAtt": [LaunchTemplate, LatestVersionNumber] }
+      IamInstanceProfile: { Ref: InstanceProfile }
+      Monitoring: true
+      EbsOptimized: true
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: { Ref: SubnetId }
+          GroupSet: [{ Ref: InstanceSecurityGroup }]
+          AssociatePublicIpAddress: false
+      # Instance level settings only; no credentials. Nothing for the customer to run.
+      UserData:
+        "Fn::Base64":
+          "Fn::Sub":
+            - |
+              #cloud-config
+              write_files:
+                - path: /etc/mvt/config.yaml
+                  permissions: "0640"
+                  owner: root:root
+                  content: |
+                    deployment: ${DeploymentName}
+                    region: ${AWS::Region}
+                    bucket: ${Bucket}
+                    kms_key: ${KeyArn}
+                    log_group: ${LogGroup}
+                    report_lock_days: ${ReportLockDays}
+            - KeyArn: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+      Tags:
+        - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}" } }
+        - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
+        - { Key: liftproof:managed-by, Value: cloudformation }
+
+  # --- pipelines (F11, ATS-005): Run Command, no inbound path --------------------------
+  RunDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: { "Fn::Sub": "Algorims-MVT-Run-${DeploymentName}" }
+      DocumentType: Command
+      DocumentFormat: YAML
+      TargetType: /AWS::EC2::Instance
+      Content:
+        schemaVersion: "2.2"
+        description: Run a Liftproof validation and return its exit code
+        parameters:
+          project:
+            type: String
+            description: Project name (the project file under /var/lib/mvt/projects)
+            allowedPattern: "^[a-z0-9][a-z0-9-]{0,39}$"
+          mode:
+            type: String
+            default: reconcile
+            allowedValues: [validate, reconcile, files, replay, smoke, baseline, doctor]
+          journeys:
+            type: String
+            description: Comma separated journey ids for replay, smoke and validate; empty = all
+            default: ""
+            allowedPattern: "^([a-z0-9][a-z0-9-]{0,63}(,[a-z0-9][a-z0-9-]{0,63})*)?$"
+          sets:
+            type: String
+            description: Comma separated file set names for files and validate; empty = all
+            default: ""
+            allowedPattern: "^([A-Za-z0-9][A-Za-z0-9_-]{0,63}(,[A-Za-z0-9][A-Za-z0-9_-]{0,63})*)?$"
+          baseline:
+            type: String
+            default: latest
+            allowedPattern: "^(latest|b-[0-9]{8}-[0-9]{6}|[a-z0-9-]{1,40})$"
+          failOn:
+            type: String
+            default: differences
+            allowedValues: [differences, errors, never]
+          executionTimeout:
+            type: String
+            default: "14400"
+            allowedPattern: "^[0-9]{1,6}$"
+        mainSteps:
+          - action: aws:runShellScript
+            name: liftproof
+            inputs:
+              timeoutSeconds: "{{ executionTimeout }}"
+              runCommand:
+                - set -o pipefail
+                - "args=(--project /var/lib/mvt/projects/{{ project }}.yaml --fail-on {{ failOn }} --format json)"
+                - "case '{{ mode }}' in reconcile|validate) args+=(--baseline {{ baseline }});; esac"
+                - "case '{{ mode }}' in replay|smoke|validate) [ -z '{{ journeys }}' ] || args+=(--journeys '{{ journeys }}');; esac"
+                - "case '{{ mode }}' in files|validate) [ -z '{{ sets }}' ] || args+=(--sets '{{ sets }}');; esac"
+                - "systemd-run --unit=liftproof-{{ project }}-$(date +%s) --wait --pipe --collect --quiet -p User=mvt -E LIFTPROOF_INVOKED_BY=ssm-run-command /opt/mvt/bin/liftproof {{ mode }} \"${args[@]}\""
+
+  # --- alarms ---------------------------------------------------------------------------
+  SystemStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: { "Fn::Sub": "liftproof-${DeploymentName}-system-status" }
+      AlarmDescription: Underlying host failed; EC2 recovers the instance onto new hardware
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions: [{ Name: InstanceId, Value: { Ref: Instance } }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        "Fn::If":
+          - AlarmNotifications
+          - [{ "Fn::Sub": "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover" }, { Ref: AlarmTopicArn }]
+          - [{ "Fn::Sub": "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover" }]
+
+  SkippedRunsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: { "Fn::Sub": "liftproof-${DeploymentName}-scheduled-run-skipped" }
+      AlarmDescription: >-
+        A scheduled validation was skipped because the previous one was still running
+        (spec 14). Nightly validation may have silently stopped.
+      Namespace: Liftproof
+      MetricName: ScheduledRunSkipped
+      Dimensions: [{ Name: Deployment, Value: { Ref: DeploymentName } }]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: { "Fn::If": [AlarmNotifications, [{ Ref: AlarmTopicArn }], { Ref: AWS::NoValue }] }
+
+Outputs:
+  InstanceId:
+    Value: { Ref: Instance }
+  BucketName:
+    Value: { Ref: Bucket }
+  KmsKeyArn:
+    Value: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+  InstanceRoleArn:
+    Value: { "Fn::GetAtt": [InstanceRole, Arn] }
+  OperatorPolicyArn:
+    Description: Attach to people's and pipelines' roles, or assume OperatorRoleArn.
+    Value: { Ref: OperatorPolicy }
+  OperatorRoleArn:
+    Condition: OperatorRole
+    Value: { "Fn::GetAtt": [OperatorRole, Arn] }
+  RunDocumentName:
+    Value: { Ref: RunDocument }
+  LogGroupName:
+    Value: { Ref: LogGroup }
+  ConnectUi:
+    Description: Open the web UI on localhost:8080 over Session Manager.
+    Value: { "Fn::Sub": "aws ssm start-session --target ${Instance} --document-name AWS-StartPortForwardingSession --parameters portNumber=8080,localPortNumber=8080" }
+  StartRun:
+    Description: What a pipeline calls at cutover.
+    Value: { "Fn::Sub": "aws ssm send-command --instance-ids ${Instance} --document-name ${RunDocument} --parameters project=PROJECT,mode=reconcile" }
