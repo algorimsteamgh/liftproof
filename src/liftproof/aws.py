@@ -72,3 +72,21 @@ def client(service: str, region: str | None = None) -> Any:
 
     c.meta.events.register("before-call.*.*", _limit)
     return c
+
+
+METRIC_NAMESPACE = "Liftproof"  # the instance role may publish to this namespace only
+
+
+def put_metric(name: str, value: float, dimensions: dict[str, str], unit: str = "Count") -> None:
+    """One CloudWatch metric data point. Alarms on these are the customer's to set."""
+    client("cloudwatch").put_metric_data(
+        Namespace=METRIC_NAMESPACE,
+        MetricData=[
+            {
+                "MetricName": name,
+                "Dimensions": [{"Name": k, "Value": v} for k, v in dimensions.items()],
+                "Value": value,
+                "Unit": unit,
+            }
+        ],
+    )

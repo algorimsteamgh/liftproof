@@ -63,6 +63,11 @@ class HashPlan:
     buckets: int
     precision: int = 6
     strategy: str = "hash"
+    # SQL predicate, in this side's dialect, of rows left out (row ignore rules). Each side
+    # has its own; only adapters with supports_row_filters apply it.
+    filter: str | None = None
+    # Sampled reconciliation (spec 9.18): only these buckets are hashed. None: all of them.
+    sample: tuple[int, ...] | None = None
 
     @property
     def key_positions(self) -> list[int]:
@@ -122,6 +127,17 @@ class Adapter(abc.ABC):
         For a keyless plan the key values are the empty tuple.
         """
 
+    def bucket_rows(
+        self, plan: HashPlan, buckets: set[int]
+    ) -> Iterator[tuple[int, dict[tuple[Any, ...], str]]]:
+        """Yield (bucket, {key values: row hash}) for each wanted bucket in ascending order,
+        including empty ones, one bucket in memory at a time (spec 17: nothing loads a
+        table). For a keyless plan use row_hashes: keys are not unique there.
+
+        This default issues one query per bucket; an adapter can do it in one pass."""
+        for b in sorted(buckets):
+            yield b, dict(self.row_hashes(plan, {b}))
+
     @abc.abstractmethod
     def fetch_rows(
         self, plan: HashPlan, keys: Sequence[tuple[Any, ...]]
@@ -134,6 +150,40 @@ class Adapter(abc.ABC):
     def session_settings(self) -> dict[str, str]:
         """Pinned session parameters, recorded in the manifest."""
         return {}
+
+    # replication position (spec 9.2) -----------------------------------------------
+    # Engines that cannot answer leave these as they are; the check then reports that
+    # it is not available rather than guessing.
+    replication_methods: tuple[str, ...] = ()
+
+    # Row ignore rules (spec 9.11). An adapter without them gets not_checked tables rather
+    # than silently comparing rows it was told to leave out.
+    supports_row_filters: bool = False
+    # Sampled reconciliation: bucket_aggregates honours HashPlan.sample. Without it a
+    # table is compared in full, and the report says why.
+    supports_sampling: bool = False
+    # Parallel workers (spec 9.1, 9.15): fork opens another connection like this one.
+    supports_workers: bool = False
+
+    def fork(self, snapshot: dict[str, Any] | None = None) -> Adapter:
+        """Another connection to the same database, for a worker. Given the position
+        begin_snapshot returned, it reads the same snapshot, so a baseline taken by several
+        workers is still the hash of one state of the database."""
+        raise NotImplementedError(self.engine)
+
+    def current_position(self) -> dict[str, Any] | None:
+        """This database's consistency position now, in the shape begin_snapshot returns."""
+        return None
+
+    def replication_applied(self, method: str, name: str) -> str | None:
+        """How far replication has got, in this engine's position format. Called on the
+        target for a subscription and on the source for a slot. None: nothing found."""
+        raise NotImplementedError(method)
+
+    @staticmethod
+    def position_key(kind: str, position: str) -> Any:
+        """A sortable form of a position of the given type."""
+        raise NotImplementedError(kind)
 
     def __enter__(self) -> Adapter:
         return self

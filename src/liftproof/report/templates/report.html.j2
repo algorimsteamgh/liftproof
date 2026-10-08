@@ -51,22 +51,36 @@
 
   <h2>Counts</h2>
   <div class="tiles">
-    <div class="tile"><b>{{ r.counts.tables|num }}</b><span>tables in scope</span></div>
+    {% set show_tables = r.counts.tables or not (r.counts.journeys or r.counts.files) %}
+    {% if show_tables %}<div class="tile"><b>{{ r.counts.tables|num }}</b><span>tables in scope</span></div>
     <div class="tile"><b>{{ r.counts.tables_matched|num }}</b><span>tables matched</span></div>
-    <div class="tile"><b>{{ r.counts.tables_different|num }}</b><span>tables with differences</span></div>
+    <div class="tile"><b>{{ r.counts.tables_different|num }}</b><span>tables with differences</span></div>{% endif %}
+    {% if r.counts.files %}<div class="tile"><b>{{ r.counts.files|num }}</b><span>files in scope</span></div>
+    <div class="tile"><b>{{ r.counts.files_matched|num }}</b><span>files matched</span></div>{% endif %}
+    {% if r.counts.journeys %}<div class="tile"><b>{{ r.counts.journeys|num }}</b><span>journeys in scope</span></div>
+    <div class="tile"><b>{{ r.counts.journeys_passed|num }}</b><span>journeys passed</span></div>{% endif %}
     <div class="tile"><b>{{ r.counts.differences|num }}</b><span>differences</span></div>
     <div class="tile"><b>{{ r.counts.not_checked|num }}</b><span>items not checked</span></div>
   </div>
 
   <h2>Coverage</h2>
   <div class="tiles">
-    <div class="tile"><b>{{ r.coverage.tables_coverage_pct|pct }}</b><span>coverage: tables compared of tables in scope</span></div>
-    <div class="tile"><b>{{ r.coverage.tables_success_pct|pct }}</b><span>success rate: tables matched of tables compared</span></div>
+    {% if show_tables %}<div class="tile"><b>{{ r.coverage.tables_coverage_pct|pct }}</b><span>coverage: tables compared of tables in scope</span></div>
+    <div class="tile"><b>{{ r.coverage.tables_success_pct|pct }}</b><span>success rate: tables matched of tables compared</span></div>{% endif %}
+    {% if r.counts.files %}<div class="tile"><b>{{ r.coverage.files_coverage_pct|pct }}</b><span>coverage: files compared of files in scope</span></div>
+    <div class="tile"><b>{{ r.coverage.files_success_pct|pct }}</b><span>success rate: files identical of files compared</span></div>{% endif %}
+    {% if r.counts.journeys %}<div class="tile"><b>{{ r.coverage.journeys_coverage_pct|pct }}</b><span>coverage: journeys replayed of journeys recorded</span></div>
+    <div class="tile"><b>{{ r.coverage.journeys_success_pct|pct }}</b><span>success rate: journeys passed of journeys replayed</span></div>{% endif %}
   </div>
   {% if r.coverage.not_covered %}
   <p><strong>Not covered</strong></p>
   <table><tr><th>Object</th><th>Reason</th></tr>
   {% for n in r.coverage.not_covered %}<tr><td>{{ n.object }}</td><td>{{ n.reason }}</td></tr>{% endfor %}
+  </table>{% endif %}
+  {% if r.coverage.sampled %}
+  <p><strong>Sampled: only part of these tables was compared</strong></p>
+  <table><tr><th>Table</th><th class="num">Rows compared</th></tr>
+  {% for s in r.coverage.sampled %}<tr><td>{{ s.object }}</td><td class="num">{{ s.percent }}%</td></tr>{% endfor %}
   </table>{% endif %}
   {% if r.coverage.partially_compared %}
   <p><strong>Compared on a subset of columns</strong></p>
@@ -101,12 +115,47 @@
   <div class="scroll"><table>
     <tr><th>Table</th><th>Status</th><th class="num">Source rows</th><th class="num">Target rows</th><th class="num">Missing</th><th class="num">Only in target</th><th class="num">Changed</th><th>Key</th></tr>
     {% for t in r.tables %}
-    <tr><td><code>{{ t.table }}</code>{% if t.partial %} <span class="sub">(partial)</span>{% endif %}</td>
+    <tr><td><code>{{ t.table }}</code>{% if t.partial %} <span class="sub">(partial)</span>{% endif %}{% if t.sampled_percent is not none %} <span class="sub">(sampled, {{ t.sampled_percent }}% of rows)</span>{% endif %}</td>
       <td class="status-{{ t.status }}">{{ t.status|replace("_"," ") }}</td>
       <td class="num">{{ t.source_rows|num }}</td><td class="num">{{ t.target_rows|num }}</td>
       <td class="num">{{ t.missing_rows|num }}</td><td class="num">{{ t.extra_rows|num }}</td>
       <td class="num">{{ t.changed_rows|num }}</td><td>{{ t.key }}</td></tr>
     {% endfor %}
+  </table></div>
+  {% endif %}
+
+  {% if r.file_sets %}
+  <h2>Files</h2>
+  <div class="scroll"><table>
+    <tr><th>File set</th><th>Source</th><th>Target</th><th class="num">Files</th><th class="num">Identical</th><th class="num">Different</th><th class="num">Same text only</th><th class="num">Missing</th><th class="num">Only in target</th><th class="num">Not checked</th></tr>
+    {% for s in r.file_sets %}
+    <tr><td><code>{{ s.name }}</code></td><td><code>{{ s.source }}</code></td><td><code>{{ s.target }}</code></td>
+      <td class="num">{{ s.files|num }}</td><td class="num">{{ s.matched|num }}</td>
+      <td class="num">{{ s.different|num }}</td><td class="num">{{ s.text_equal|num }}</td>
+      <td class="num">{{ s.missing|num }}</td><td class="num">{{ s.extra|num }}</td>
+      <td class="num">{{ s.not_checked|num }}</td></tr>
+    {% endfor %}
+  </table></div>
+  <p class="sub">Files are paired by path and compared by size and SHA-256. "Same text only" counts files whose bytes differ while the extracted text is identical; they are reported at low severity.</p>
+  {% endif %}
+
+  {% if r.journeys %}
+  <h2>Journeys</h2>
+  <div class="scroll"><table>
+    <tr><th>Journey</th><th>Story</th><th>Status</th><th class="num">Steps run</th><th class="num">Differences</th><th class="num">Attempts</th><th class="num">Flakes</th></tr>
+    {% for j in r.journeys %}
+    <tr><td><code>{{ j.journey }}</code></td><td>{{ j.story or "" }}</td>
+      <td class="status-{{ j.status }}">{{ j.status|replace("_"," ") }}</td>
+      <td class="num">{{ j.steps_run }} of {{ j.steps }}</td><td class="num">{{ j.differences }}</td>
+      <td class="num">{{ j.attempts }}</td><td class="num">{{ j.flakes }}</td></tr>
+    {% endfor %}
+  </table></div>
+  <h2>Response times, source and AWS</h2>
+  <p class="sub">Recorded for comparison only; a slower response is never a pass or fail condition on its own.</p>
+  <div class="scroll"><table>
+    <tr><th>Journey or endpoint</th><th class="num">Source ms</th><th class="num">AWS ms</th><th class="num">Change</th></tr>
+    {% for t in r.timings.journeys %}<tr><td><code>{{ t.journey }}</code></td><td class="num">{{ t.source_ms|num }}</td><td class="num">{{ t.target_ms|num }}</td><td class="num">{{ t.change_pct|pct }}</td></tr>{% endfor %}
+    {% for t in r.timings.endpoints %}<tr><td><code>{{ t.endpoint }}</code></td><td class="num">{{ t.source_ms|num }}</td><td class="num">{{ t.target_ms|num }}</td><td class="num">{{ t.change_pct|pct }}</td></tr>{% endfor %}
   </table></div>
   {% endif %}
 

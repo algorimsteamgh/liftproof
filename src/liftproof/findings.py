@@ -23,6 +23,7 @@ class Comparator(StrEnum):
     API = "api"
     DATABASE = "database"
     FILE = "file"
+    RUN = "run"  # about the run itself: a scheduled run skipped, for example
 
 
 class Kind(StrEnum):

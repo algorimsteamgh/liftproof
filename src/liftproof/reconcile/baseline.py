@@ -1,18 +1,26 @@
-"""Source baselines (PRD F2, Technical Spec 9.2, 9.16).
+"""Baselines (PRD F2, Technical Spec 9.2, 9.16, 14).
 
 A baseline is taken inside one consistent snapshot and records its consistency position.
 Each table is checkpointed as it completes, so a lost instance or session resumes from
 the last finished table instead of starting again.
 
+A source baseline freezes the source before cutover. A target baseline (`rebaseline`)
+snapshots the target after cutover, so scheduled regression compares the target with its
+own accepted state rather than with a pre migration source that live traffic has long
+since moved away from.
+
 A baseline holds per bucket aggregates, not per row hashes. Row level drill-down at
-validate time therefore needs the source database to still be readable.
+validate time therefore needs the source database to still be readable, and is not
+possible at all against a target baseline: the past state of the target cannot be re-read.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import queue
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +37,8 @@ from liftproof.adapters.base import (
 from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM, CanonicalType, reduce_total
 from liftproof.errors import ConfigError
 from liftproof.reconcile.plan import IgnoreRule, plan_table
+
+SIDES = ("source", "target")
 
 
 @dataclass
@@ -56,6 +66,7 @@ class BaselineTable:
                 "buckets": self.plan.buckets,
                 "precision": self.plan.precision,
                 "strategy": self.plan.strategy,
+                "filter": self.plan.filter,
             },
             "row_count": self.row_count,
             "aggregate": self.aggregate,
@@ -82,6 +93,7 @@ class BaselineTable:
             int(p["buckets"]),
             int(p["precision"]),
             p.get("strategy", "hash"),
+            p.get("filter"),
         )
         buckets = {
             int(b): BucketAggregate(int(c), int(t)) for b, (c, t) in d["bucket_aggregates"].items()
@@ -101,6 +113,7 @@ class Baseline:
     product_version: str = __version__
     selection: list[str] = field(default_factory=list)
     tables: dict[str, BaselineTable] = field(default_factory=dict)
+    side: str = "source"  # target: taken by rebaseline
 
     @property
     def complete(self) -> bool:
@@ -113,6 +126,7 @@ class Baseline:
             "hash_algorithm": self.hash_algorithm,
             "product_version": self.product_version,
             "engine": self.engine,
+            "side": self.side,
             "consistency": self.position,
             "session": self.session,
             "taken_at": self.taken_at,
@@ -149,6 +163,7 @@ class Baseline:
             d["hash_algorithm"],
             d["product_version"],
             list(d["selection"]),
+            side=d.get("side", "source"),  # manifests from before rebaseline existed
         )
         b.tables = {q: BaselineTable.from_dict(q, t) for q, t in d["tables"].items()}
         return b
@@ -166,9 +181,18 @@ def take_baseline(
     rows_per_bucket: int,
     precision: int,
     resume: bool = False,
+    side: str = "source",
     progress: Callable[[str], None] = lambda _m: None,
+    workers: int = 1,
 ) -> Baseline:
+    if side not in SIDES:
+        raise ValueError(f"side must be one of {SIDES}")
     existing = Baseline.load(manifest_path) if resume and manifest_path.exists() else None
+    if existing is not None and existing.side != side:
+        raise ConfigError(
+            f"baseline {existing.baseline_id} is a {existing.side} baseline; "
+            f"it cannot be resumed as a {side} baseline"
+        )
     position = source.begin_snapshot()
     try:
         refs = source.list_tables(schemas)
@@ -193,16 +217,19 @@ def take_baseline(
                 source.session_settings(),
                 dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
                 selection=[r.qualified for r in refs],
+                side=side,
             )
-        for ref in refs:
-            if ref.qualified in baseline.tables:
-                continue
-            ignored = any(r.column is None and r.matches_table(ref.qualified) for r in ignore)
-            if ignored:
-                continue
+        todo = [
+            ref
+            for ref in refs
+            if ref.qualified not in baseline.tables
+            and not any(r.whole_table and r.matches_table(ref.qualified) for r in ignore)
+        ]
+
+        def one(a: Adapter, ref: TableRef) -> BaselineTable:
             progress(f"baselining {ref}")
-            schema = source.describe(ref)
-            rows = source.row_count(ref)
+            schema = a.describe(ref)
+            rows = a.row_count(ref)
             tp = plan_table(
                 schema,
                 None,
@@ -211,16 +238,55 @@ def take_baseline(
                 precision=precision,
                 ignore=ignore,
                 business_key=business_keys.get(ref.qualified) or business_keys.get(ref.name),
+                side=side,
             )
-            buckets = source.bucket_aggregates(tp.plan) if tp.plan.columns else {}
-            baseline.tables[ref.qualified] = BaselineTable(
+            if tp.plan.filter and not a.supports_row_filters:
+                raise ConfigError(f"{ref}: row ignore rules are not supported for {a.engine}")
+            buckets = a.bucket_aggregates(tp.plan) if tp.plan.columns else {}
+            if tp.plan.filter:  # the rows the baseline holds, not the table's
+                rows = sum(b.count for b in buckets.values())
+            return BaselineTable(
                 schema,
                 tp.plan,
                 rows,
                 buckets,
                 dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
             )
-            baseline.save(manifest_path)  # checkpoint per table
+
+        n = min(workers, len(todo))
+        if n > 1 and not (source.supports_workers and position.get("snapshot_id")):
+            progress(f"parallel workers are not available for {source.engine}; one at a time")
+            n = 1
+        if n <= 1:
+            for ref in todo:
+                baseline.tables[ref.qualified] = one(source, ref)
+                baseline.save(manifest_path)  # checkpoint per table
+        else:
+            # every worker imports the snapshot exported above: one state of the database
+            free: queue.SimpleQueue[Adapter] = queue.SimpleQueue()
+            free.put(source)
+            forks: list[Adapter] = []
+            try:
+                for _ in range(n - 1):
+                    forks.append(source.fork(position))
+                    free.put(forks[-1])
+
+                def job(ref: TableRef) -> tuple[TableRef, BaselineTable]:
+                    a = free.get()
+                    try:
+                        return ref, one(a, ref)
+                    finally:
+                        free.put(a)
+
+                with ThreadPoolExecutor(max_workers=n) as pool:
+                    for f in as_completed([pool.submit(job, ref) for ref in todo]):
+                        ref, entry = f.result()
+                        baseline.tables[ref.qualified] = entry
+                        baseline.save(manifest_path)  # checkpoint per table
+            finally:
+                for a in forks:
+                    a.end_snapshot()
+                    a.close()
         baseline.selection = [r.qualified for r in refs if r.qualified in baseline.tables]
         baseline.save(manifest_path)
         return baseline

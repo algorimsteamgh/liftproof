@@ -6,13 +6,22 @@ present on both sides. On a healthy migration most tables stop at the aggregate.
 
 The reference side is either a live source adapter or a stored baseline. Drill-down
 below the bucket level always needs the live source: a baseline holds aggregates only.
+Against a target baseline (rebaseline) there is no live reference at all: the comparison
+says what has changed in the target since it was accepted, down to the bucket.
 """
 
 from __future__ import annotations
 
+import copy
+import heapq
 import math
+import queue
+import random
+import secrets
+import threading
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -20,7 +29,8 @@ from liftproof.adapters.base import Adapter, BucketAggregate, HashPlan, TableRef
 from liftproof.canonical import RowHasher, column_digest, reduce_total
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity
 from liftproof.reconcile.baseline import Baseline
-from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table
+from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table, row_filter
+from liftproof.reconcile.replication import REASON_BEHIND, ReplicationConfig, check
 
 DB = Comparator.DATABASE
 
@@ -43,6 +53,15 @@ class ReconcileOptions:
     breaker_min_buckets: int = 4
     breaker_table_ratio: float = 0.8
     breaker_min_tables: int = 5
+    replication: ReplicationConfig = field(default_factory=ReplicationConfig)
+    # Sampled reconciliation (spec 9.18): tables with more rows than this compare
+    # sample_percent of their buckets, chosen at random. None: every table in full.
+    sample_above_rows: int | None = None
+    sample_percent: float = 10.0
+    sample_seed: int | None = None  # None: a fresh seed per run, recorded in the report
+    # tables reconciled at once, each worker on its own connections (spec 9.15: worker
+    # concurrency multiplies source load, so this is a ceiling to be measured)
+    workers: int = 1
 
 
 @dataclass
@@ -62,12 +81,16 @@ class TableResult:
     excluded_columns: list[str] = field(default_factory=list)
     approximate_columns: list[str] = field(default_factory=list)
     reason: str | None = None
+    # set when only a sample was compared: the share of the table's rows that was
+    sampled_percent: float | None = None
 
 
 @dataclass
 class ReconcileResult:
     tables: list[TableResult] = field(default_factory=list)
     systemic: bool = False
+    replication: dict[str, Any] | None = None  # the position check, for the report
+    sample_seed: int | None = None  # set when a table was sampled: reruns the same sample
 
     def status_counts(self) -> Counter:
         return Counter(t.status for t in self.tables)
@@ -105,6 +128,10 @@ class Reconciler:
     ) -> None:
         if source is None and baseline is None:
             raise ValueError("a live source or a baseline is required")
+        self.against_target = baseline is not None and baseline.side == "target"
+        if self.against_target and source is not None:
+            raise ValueError("a target baseline is compared with the target alone")
+        self.reference = "target baseline" if self.against_target else "source"
         self.source = source
         self.baseline = baseline
         self.target = target
@@ -112,11 +139,22 @@ class Reconciler:
         self.o = options
         self.progress = progress or (lambda _msg: None)
         self.result = ReconcileResult()
-        self._drill = True
+        # shared by the workers, which are shallow copies of this object
+        self._flags = {"drill": True}
+        self._lock = threading.Lock()
+        self._tally = [0, 0]  # tables different, tables done
+        self._seed = (
+            options.sample_seed if options.sample_seed is not None else secrets.randbelow(2**31)
+        )
 
     # ------------------------------------------------------------------ helpers
+    @property
+    def _drill(self) -> bool:
+        return self._flags["drill"]
+
     def emit(self, kind: Kind, severity: int, obj: str, summary: str, **kw: Any) -> None:
-        self.writer.write(Finding(DB, kind, severity, obj, summary, **kw))
+        with self._lock:
+            self.writer.write(Finding(DB, kind, severity, obj, summary, **kw))
 
     def _selected(self, tables: Sequence[TableRef]) -> list[TableRef]:
         if not self.o.tables:
@@ -126,7 +164,7 @@ class Reconciler:
 
     def _table_ignored(self, table: TableRef) -> IgnoreRule | None:
         for r in self.o.ignore:
-            if r.column is None and r.matches_table(table.qualified):
+            if r.whole_table and r.matches_table(table.qualified):
                 return r
         return None
 
@@ -142,6 +180,8 @@ class Reconciler:
         target_schemas = list(dict.fromkeys(self.o.schema_map.get(x, x) for x in self.o.schemas))
         target_tables = {t.qualified.lower(): t for t in self.target.list_tables(target_schemas)}
         source_tables = self._selected(source_tables)
+        if self._replication_behind(source_tables):
+            return self.result
 
         for t in sorted(set(target_tables) - {self._target_key(s) for s in source_tables}):
             if self.o.tables:
@@ -153,10 +193,9 @@ class Reconciler:
                 "table exists on the target only",
             )
 
-        mismatched = 0
-        done = 0
+        order = {t.qualified: i for i, t in enumerate(source_tables)}
+        work: list[tuple[TableRef, TableRef]] = []
         for table in source_tables:
-            self.progress(f"reconciling {table}")
             rule = self._table_ignored(table)
             if rule:
                 self.emit(
@@ -175,35 +214,123 @@ class Reconciler:
                 self.emit(
                     Kind.DIFFERENCE, Severity.HIGH, table.qualified, "table missing in target"
                 )
-                self.result.tables.append(
-                    TableResult(table.qualified, "different", reason="missing in target")
-                )
-                mismatched += 1
-                done += 1
+                res = TableResult(table.qualified, "different", reason="missing in target")
+                self.result.tables.append(res)
+                self._count(res)
                 continue
-            res = self._table(table, ttable)
+            work.append((table, ttable))
+        for res in self._each(work):
             self.result.tables.append(res)
-            done += 1
-            if res.status == "different":
-                mismatched += 1
-            if (
-                self._drill
-                and done >= self.o.breaker_min_tables
-                and mismatched / done > self.o.breaker_table_ratio
-            ):
-                self._drill = False
-                self.result.systemic = True
-                self.emit(
-                    Kind.DIFFERENCE,
-                    Severity.CRITICAL,
-                    "database",
-                    f"{mismatched} of {done} tables differ; row level drill-down stopped. "
-                    "This pattern usually means a systemic cause (character set, collation, "
-                    "time zone or type mapping) rather than lost data. See the per table "
-                    "findings for the columns involved.",
-                    detail={"tables_checked": done, "tables_different": mismatched},
-                )
+            self._count(res)
+        self.result.tables.sort(key=lambda r: order.get(r.table, len(order)))
         return self.result
+
+    def _count(self, res: TableResult) -> None:
+        """Circuit breaker across tables: most tables differing means a systemic cause."""
+        self._tally[1] += 1
+        if res.status == "different":
+            self._tally[0] += 1
+        mismatched, done = self._tally
+        if (
+            self._drill
+            and done >= self.o.breaker_min_tables
+            and mismatched / done > self.o.breaker_table_ratio
+        ):
+            self._flags["drill"] = False
+            self.result.systemic = True
+            self.emit(
+                Kind.DIFFERENCE,
+                Severity.CRITICAL,
+                "database",
+                f"{mismatched} of {done} tables differ; row level drill-down stopped. "
+                "This pattern usually means a systemic cause (character set, collation, "
+                "time zone or type mapping) rather than lost data. See the per table "
+                "findings for the columns involved.",
+                detail={"tables_checked": done, "tables_different": mismatched},
+            )
+
+    def _each(self, work: list[tuple[TableRef, TableRef]]) -> Iterator[TableResult]:
+        """Reconcile the tables, in order on one worker, or on several at once when the
+        project asks for it and both engines can open more connections."""
+        n = min(self.o.workers, len(work))
+        if n > 1:
+            lacking = [a.engine for a in (self.source, self.target) if a and not a.supports_workers]
+            if lacking:
+                self.emit(
+                    Kind.NOTICE,
+                    Severity.INFO,
+                    "database",
+                    f"parallel workers are not available for {', '.join(lacking)}; "
+                    "tables are reconciled one at a time",
+                )
+                n = 1
+        if n <= 1:
+            for table, ttable in work:
+                self.progress(f"reconciling {table}")
+                yield self._table(table, ttable)
+            return
+        free: queue.SimpleQueue[Reconciler] = queue.SimpleQueue()
+        free.put(self)
+        clones: list[Reconciler] = []
+        try:
+            for _ in range(n - 1):
+                c = copy.copy(self)  # shares the writer, the result, the lock and the flags
+                c.source = self.source.fork() if self.source is not None else None
+                c.target = self.target.fork()
+                clones.append(c)
+                free.put(c)
+
+            def job(table: TableRef, ttable: TableRef) -> TableResult:
+                w = free.get()
+                try:
+                    self.progress(f"reconciling {table}")
+                    return w._table(table, ttable)
+                finally:
+                    free.put(w)
+
+            with ThreadPoolExecutor(max_workers=n) as pool:
+                futures = [pool.submit(job, t, tt) for t, tt in work]
+                for f in as_completed(futures):
+                    yield f.result()
+        finally:
+            for c in clones:
+                for a in (c.source, c.target):
+                    if a is not None:
+                        a.close()
+
+    def _replication_behind(self, tables: Sequence[TableRef]) -> bool:
+        """Spec 9.2: before any difference is reported, replication must have applied
+        through the reference position. Not compared against a target baseline: there
+        the reference is the target itself."""
+        if self.against_target:
+            return False
+        if self.baseline is not None:
+            position = self.baseline.position
+        else:
+            position = self.source.current_position() if self.source else None
+        r = check(self.o.replication, position, source=self.source, target=self.target)
+        self.result.replication = {
+            "status": r.status,
+            "method": r.method,
+            "position": r.position,
+            "applied": r.applied,
+            "detail": r.detail,
+            "waited_seconds": r.waited_seconds,
+        }
+        if not r.behind:
+            return False
+        for table in tables:
+            self.emit(
+                Kind.NOT_CHECKED,
+                Severity.MEDIUM,
+                table.qualified,
+                f"{REASON_BEHIND}: {r.detail}",
+                detail={"reason": REASON_BEHIND, "position": r.position, "applied": r.applied},
+            )
+            self.result.tables.append(
+                TableResult(table.qualified, "not_checked", reason=REASON_BEHIND)
+            )
+        return True
 
     # -------------------------------------------------------------------- table
     def _table(self, table: TableRef, ttable: TableRef) -> TableResult:
@@ -225,6 +352,7 @@ class Reconciler:
             precision=self.o.precision,
             ignore=self.o.ignore,
             business_key=self.o.business_keys.get(q) or self.o.business_keys.get(table.name),
+            side="target" if self.against_target else "source",
         )
         plan = tp.plan
         if base_entry is not None:
@@ -281,24 +409,87 @@ class Reconciler:
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, "no comparable columns")
             return res
 
+        # Row ignore rules: each side leaves out its own rows, in its own dialect.
+        tfilter = row_filter(self.o.ignore, q, "target")
+        for r in (r for r in self.o.ignore if r.rows and r.matches_table(q)):
+            self.emit(
+                Kind.NOTICE,
+                Severity.INFO,
+                q,
+                f"rows excluded by ignore rule: {r.reason}",
+                detail={
+                    "reason": r.reason,
+                    "source_where": r.predicate("source"),
+                    "target_where": r.predicate("target"),
+                },
+            )
+        unsupported = [
+            a.engine
+            for a, f in ((self.source, plan.filter), (self.target, tfilter))
+            if a is not None and f and not a.supports_row_filters
+        ]
+        if unsupported:
+            res.status = "not_checked"
+            res.reason = f"row ignore rules are not supported for {', '.join(unsupported)}"
+            self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, res.reason)
+            return res
+        plan = self._sample(q, plan, source_rows)
+        full_rows = source_rows
+
         # Reference aggregates: a live source, or the baseline when its plan still applies.
         if (
             base_entry is not None
             and base_entry.plan.columns == plan.columns
-            and (base_entry.plan.key_columns == plan.key_columns)
+            and base_entry.plan.key_columns == plan.key_columns
+            and base_entry.plan.filter == plan.filter
         ):
             s_aggs = base_entry.buckets
+            if plan.sample is not None:
+                s_aggs = {b: a for b, a in s_aggs.items() if b in plan.sample}
         elif self.source is not None:
-            s_aggs = self.source.bucket_aggregates(plan)
+            s_aggs = None  # hashed below, at the same time as the target
         else:
             res.status = "not_checked"
-            res.reason = "schema changed since the baseline; the live source is needed to re-hash"
+            res.reason = (
+                "schema changed since the target baseline; rebaseline once the change is accepted"
+                if self.against_target
+                else "schema changed since the baseline; the live source is needed to re-hash"
+            )
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, res.reason)
             return res
 
-        tplan = _target_plan(plan, tschema)
-        t_aggs = self.target.bucket_aggregates(tplan)
+        tplan = replace(_target_plan(plan, tschema), filter=tfilter)
+        if s_aggs is None:
+            # Two databases, two connections: hashing both at once halves the wall time,
+            # and each database's own load is unchanged (spec 17: the source is the
+            # resource to protect, not the clock).
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                s_job = pool.submit(self.source.bucket_aggregates, plan)
+                t_aggs = self.target.bucket_aggregates(tplan)
+                s_aggs = s_job.result()
+        else:
+            t_aggs = self.target.bucket_aggregates(tplan)
         res.target_rows = sum(a.count for a in t_aggs.values())
+        if plan.filter or plan.sample is not None:
+            # the table's row count includes rows the rules leave out or the sample skips
+            source_rows = res.source_rows = sum(a.count for a in s_aggs.values())
+        compared = plan.buckets if plan.sample is None else len(plan.sample)
+        if plan.sample is not None:
+            res.sampled_percent = round(100 * source_rows / full_rows, 1) if full_rows else 0.0
+            self.result.sample_seed = self._seed
+            self.emit(
+                Kind.NOT_CHECKED,
+                Severity.MEDIUM,
+                q,
+                f"sampled: {compared} of {plan.buckets} buckets compared, "
+                f"{res.sampled_percent}% of the rows; the rest of the table is not checked",
+                detail={
+                    "sampled_buckets": compared,
+                    "buckets": plan.buckets,
+                    "sampled_percent": res.sampled_percent,
+                    "seed": self._seed,
+                },
+            )
 
         # 1. row counts
         if res.target_rows != source_rows:
@@ -306,7 +497,8 @@ class Reconciler:
                 Kind.DIFFERENCE,
                 Severity.HIGH,
                 q,
-                f"row count differs: source {source_rows:,}, target {res.target_rows:,} "
+                f"row count differs: {self.reference} {source_rows:,}, "
+                f"target {res.target_rows:,} "
                 f"({res.target_rows - source_rows:+,})",
                 expected=str(source_rows),
                 actual=str(res.target_rows),
@@ -316,7 +508,7 @@ class Reconciler:
         # 2. table aggregate
         s_total = reduce_total(sum(a.total for a in s_aggs.values()))
         t_total = reduce_total(sum(a.total for a in t_aggs.values()))
-        self._floats(table, ttable, tp, res, tschema)
+        self._floats(table, ttable, tp, res, tschema, plan.filter, tfilter)
         if s_total == t_total and res.target_rows == source_rows:
             return res
         res.status = "different"
@@ -330,7 +522,8 @@ class Reconciler:
             Kind.DIFFERENCE,
             Severity.MEDIUM,
             q,
-            f"table aggregate differs; {len(bad)} of {plan.buckets} buckets mismatched",
+            f"table aggregate differs; {len(bad)} of {compared} "
+            f"{'sampled ' if plan.sample is not None else ''}buckets mismatched",
             expected=s_total,
             actual=t_total,
             detail={"buckets": bad[:50], "bucket_count": plan.buckets},
@@ -342,41 +535,85 @@ class Reconciler:
                 Kind.NOT_CHECKED,
                 Severity.MEDIUM,
                 q,
-                "row level drill-down needs the live source database; "
+                "the target baseline holds bucket aggregates only and the target's past state "
+                "cannot be re-read; only bucket level differences are reported"
+                if self.against_target
+                else "row level drill-down needs the live source database; "
                 "only bucket level differences are reported",
             )
             return res
 
         # 4. rows. Circuit breaker: nearly every bucket differs means a systemic cause.
         systemic = (
-            plan.buckets >= self.o.breaker_min_buckets
-            and len(bad) / plan.buckets > self.o.breaker_bucket_ratio
+            compared >= self.o.breaker_min_buckets
+            and len(bad) / compared > self.o.breaker_bucket_ratio
         )
         drill = bad[:1] if systemic else bad
-        src_rows = list(self.source.row_hashes(plan, set(drill)))
-        tgt_rows = list(self.target.row_hashes(tplan, set(drill)))
         if plan.key_columns:
-            self._keyed(q, plan, tplan, src_rows, tgt_rows, res, systemic)
+            self._keyed(q, plan, tplan, set(drill), res, systemic)
         else:
-            self._keyless(q, src_rows, tgt_rows, res)
+            self._keyless(q, plan, tplan, set(drill), res)
         return res
 
+    def _sample(self, q: str, plan: HashPlan, rows: int) -> HashPlan:
+        """The random buckets a large table is compared on, the same for a given seed."""
+        above = self.o.sample_above_rows
+        if above is None or rows <= above or plan.buckets < 2:
+            return plan
+        k = max(1, math.ceil(plan.buckets * self.o.sample_percent / 100))
+        if k >= plan.buckets:
+            return plan
+        lacking = [
+            a.engine
+            for a in (self.source, self.target)
+            if a is not None and not a.supports_sampling
+        ]
+        if lacking:
+            self.emit(
+                Kind.NOTICE,
+                Severity.INFO,
+                q,
+                f"sampling is not available for {', '.join(lacking)}; compared in full",
+            )
+            return plan
+        rng = random.Random(f"{self._seed}:{q}")  # noqa: S311 - a sample, not a secret
+        return replace(plan, sample=tuple(sorted(rng.sample(range(plan.buckets), k))))
+
     # ------------------------------------------------------------------ details
-    def _keyed(self, q, plan, tplan, src_rows, tgt_rows, res, systemic) -> None:
-        s = dict(src_rows)
-        t = dict(tgt_rows)
-        missing = sorted(set(s) - set(t), key=_natural)
-        extra = sorted(set(t) - set(s), key=_natural)
-        changed = sorted((k for k in set(s) & set(t) if s[k] != t[k]), key=_natural)
-        res.missing_rows, res.extra_rows, res.changed_rows = len(missing), len(extra), len(changed)
+    def _keyed(self, q, plan, tplan, buckets, res, systemic) -> None:
+        """Bucket by bucket, both sides in step: one bucket's keys are held at a time, and
+        of each kind of difference only the rows that can be shown are kept."""
         limit = self.o.diff_row_limit
+        keep = 5 if systemic else limit
+        missing: list[tuple] = []
+        extra: list[tuple] = []
+        changed: list[tuple] = []
+        counts = [0, 0, 0]
+        pairs = zip(
+            self.source.bucket_rows(plan, buckets),
+            self.target.bucket_rows(tplan, buckets),
+            strict=True,
+        )
+        for (sb, s), (tb, t) in pairs:
+            if sb != tb:
+                raise RuntimeError(f"adapters yielded buckets {sb} and {tb} out of step")
+            found = (
+                [k for k in s if k not in t],
+                [k for k in t if k not in s],
+                [k for k in s if k in t and s[k] != t[k]],
+            )
+            for i, (kept, new) in enumerate(zip((missing, extra, changed), found, strict=True)):
+                counts[i] += len(new)
+                kept[:] = heapq.nsmallest(keep, kept + new, key=_natural)
+        res.missing_rows, res.extra_rows, res.changed_rows = counts
+        n_missing, n_extra, n_changed = counts
         keyname = ", ".join(plan.key_columns)
 
         def fmt(k: tuple) -> str:
             return f"{keyname} = {', '.join('NULL' if v is None else v for v in k)}"
 
         if systemic:
-            self._systemic(q, plan, tplan, changed[:5], len(changed), res)
+            self._systemic(q, plan, tplan, changed[:5], n_changed, res)
             return
         shown = 0
         for k in missing:
@@ -407,18 +644,18 @@ class Reconciler:
         if changed and remaining:
             self._changed(q, plan, tplan, changed[:remaining], fmt)
             shown += min(len(changed), remaining)
-        total = len(missing) + len(extra) + len(changed)
+        total = n_missing + n_extra + n_changed
         self.emit(
             Kind.DIFFERENCE,
             Severity.HIGH,
             q,
-            f"{total:,} differing rows: {len(missing):,} missing in target, "
-            f"{len(extra):,} only in target, {len(changed):,} changed "
+            f"{total:,} differing rows: {n_missing:,} missing in target, "
+            f"{n_extra:,} only in target, {n_changed:,} changed "
             f"(showing {min(total, limit):,})",
             detail={
-                "missing": len(missing),
-                "extra": len(extra),
-                "changed": len(changed),
+                "missing": n_missing,
+                "extra": n_extra,
+                "changed": n_changed,
                 "shown": min(total, limit),
                 "limit": limit,
             },
@@ -482,7 +719,8 @@ class Reconciler:
             Kind.DIFFERENCE,
             Severity.CRITICAL,
             q,
-            f"{res.mismatched_buckets} of {plan.buckets} buckets differ, which points to a "
+            f"{res.mismatched_buckets} of {len(plan.sample or range(plan.buckets))} "
+            f"{'sampled ' if plan.sample is not None else ''}buckets differ, which points to a "
             f"systemic cause rather than lost rows. Columns involved in the sample: "
             f"{', '.join(sorted(cols)) or 'none identified'}. Likely cause: "
             f"{'; '.join(causes) or 'unknown'}. Drill-down stopped.",
@@ -494,13 +732,19 @@ class Reconciler:
             },
         )
 
-    def _keyless(self, q, src_rows, tgt_rows, res) -> None:
-        s = Counter(h for _, h in src_rows)
-        t = Counter(h for _, h in tgt_rows)
-        missing = s - t
-        extra = t - s
-        res.missing_rows = sum(missing.values())
-        res.extra_rows = sum(extra.values())
+    def _keyless(self, q, plan, tplan, buckets, res) -> None:
+        """A multiset of row hashes per bucket (identical rows share a bucket), one bucket
+        at a time; only the first hashes of each kind are kept for the report."""
+        missing: list[str] = []
+        extra: list[str] = []
+        for b in sorted(buckets):
+            s = Counter(h for _, h in self.source.row_hashes(plan, {b}))
+            t = Counter(h for _, h in self.target.row_hashes(tplan, {b}))
+            m, e = s - t, t - s
+            res.missing_rows += sum(m.values())
+            res.extra_rows += sum(e.values())
+            missing += list(m)[: 20 - len(missing)]
+            extra += list(e)[: 20 - len(extra)]
         self.emit(
             Kind.DIFFERENCE,
             Severity.HIGH,
@@ -508,8 +752,8 @@ class Reconciler:
             f"table has no key; compared as a multiset of rows: "
             f"{res.missing_rows:,} rows missing in target, {res.extra_rows:,} only in target",
             detail={
-                "missing_hashes": [_short(h) for h in list(missing)[:20]],
-                "extra_hashes": [_short(h) for h in list(extra)[:20]],
+                "missing_hashes": [_short(h) for h in missing],
+                "extra_hashes": [_short(h) for h in extra],
             },
         )
 
@@ -520,6 +764,8 @@ class Reconciler:
         tp: TablePlan,
         res: TableResult,
         tschema: TableSchema,
+        sfilter: str | None = None,
+        tfilter: str | None = None,
     ) -> None:
         if not tp.float_columns or self.source is None:
             if tp.float_columns:
@@ -527,14 +773,18 @@ class Reconciler:
                     Kind.NOT_CHECKED,
                     Severity.LOW,
                     table.qualified,
-                    "approximate columns need the live source: " + ", ".join(tp.float_columns),
+                    "approximate columns need a live reference: " + ", ".join(tp.float_columns)
+                    if self.against_target
+                    else "approximate columns need the live source: " + ", ".join(tp.float_columns),
                 )
             return
         tol = self.o.float_rel_tolerance
         for col in tp.float_columns:
-            a = self.source.float_stats(table, col)
+            a = self.source.float_stats(table, col, **({"where": sfilter} if sfilter else {}))
             tcol = tschema.column(col)  # the target's own spelling (Oracle: upper case)
-            b = self.target.float_stats(ttable, tcol.name if tcol else col)
+            b = self.target.float_stats(
+                ttable, tcol.name if tcol else col, **({"where": tfilter} if tfilter else {})
+            )
             problems = []
             for name in ("non_null", "nan_count", "inf_count"):
                 if getattr(a, name) != getattr(b, name):

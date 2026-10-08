@@ -1,6 +1,8 @@
 """CLI behaviour a pipeline relies on: exit codes, reports, and credential rules."""
 
+import argparse
 import json
+import shutil
 
 import pytest
 import yaml
@@ -8,6 +10,7 @@ import yaml
 from liftproof import cli
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_OK, EXIT_RUN_FAILED
+from liftproof.store import LocalStore
 from tests.conftest import PG
 
 SCHEMA = """
@@ -145,6 +148,132 @@ def test_version_reports_sdk(capsys):
 def test_init_writes_template(tmp_path):
     assert cli.main(["init", "demo", "--dir", str(tmp_path)]) == EXIT_OK
     assert "secret_arn" in (tmp_path / "demo.yaml").read_text()
+
+
+@pytest.fixture
+def opened(monkeypatch):
+    """The databases each command connects to."""
+    seen = []
+    real = cli.connect
+
+    def spy(conn):
+        seen.append(conn.database)
+        return real(conn)
+
+    monkeypatch.setattr(cli, "connect", spy)
+    return seen
+
+
+@pytest.mark.postgres
+def test_rebaseline_then_regression_against_the_target_alone(tmp_path, dbs, capsys, opened):
+    s, t, tc = dbs
+    p = _project(tmp_path, s, t)
+    # live traffic after cutover: the target no longer matches the frozen source
+    tc.execute("UPDATE orders SET status = 'DELIVERED' WHERE id <= 300")
+    assert run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "t1") == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["side"] == "target"
+    assert opened == [t]  # the source is never read; it may be decommissioned
+    manifest = json.loads((tmp_path / "work/acme/baselines/t1/manifest.json").read_text())
+    assert manifest["side"] == "target"
+
+    opened.clear()
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target",
+               "--run-id", "r1") == EXIT_OK  # fmt: skip
+    assert opened == [t]
+    report = json.loads((tmp_path / "work/acme/runs/r1/report.json").read_text())
+    assert report["range"]["reference"] == "target baseline t1"
+
+    # a change since the rebaseline is found, down to the bucket
+    tc.execute("UPDATE orders SET total = total + 1 WHERE id = 7")
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target",
+               "--run-id", "r2") == EXIT_DIFFERENCES  # fmt: skip
+    summaries = [f["summary"] for f in json.loads(
+        (tmp_path / "work/acme/runs/r2/report.json").read_text())["findings"]]  # fmt: skip
+    assert any("1 of 4 buckets mismatched" in x for x in summaries)
+    assert any("target's past state cannot be re-read" in x for x in summaries)
+
+    # rows added since: the count names the target baseline as the reference
+    tc.execute("INSERT INTO notes VALUES ('late')")
+    run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target", "--run-id", "r3")
+    summaries = [f["summary"] for f in json.loads(
+        (tmp_path / "work/acme/runs/r3/report.json").read_text())["findings"]]  # fmt: skip
+    assert "row count differs: target baseline 10, target 11 (+1)" in summaries
+
+
+@pytest.mark.postgres
+def test_latest_and_latest_target_are_separate(tmp_path, dbs, capsys):
+    s, t, _ = dbs
+    p = _project(tmp_path, s, t)
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target") == \
+        EXIT_CONFIG
+    assert "liftproof rebaseline" in capsys.readouterr().err
+    assert run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "t1") == EXIT_OK
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest") == EXIT_CONFIG
+    assert run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "latest") == \
+        EXIT_CONFIG
+    # a replacement instance (empty work directory) finds the marker through the store
+    store_root = tmp_path / "store"
+    shutil.copytree(tmp_path / "work/acme", store_root)
+    shutil.rmtree(tmp_path / "work")
+    args = argparse.Namespace(baseline="latest-target")
+    b = cli._load_baseline(args, None, LocalStore(store_root), tmp_path / "work/acme")
+    assert (b.baseline_id, b.side) == ("t1", "target")
+
+
+@pytest.mark.postgres
+def test_support_bundle_carries_the_run_without_values(tmp_path, dbs, capsys, monkeypatch):
+    import zipfile
+
+    s, t, tc = dbs
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setenv("LIFTPROOF_LOG_DIR", str(log_dir))
+    tc.execute("UPDATE orders SET status = 'SECRET-VALUE-42' WHERE id = 7")
+    p = _project(tmp_path, s, t, show_values=True)
+    assert run(tmp_path, "reconcile", "--project", str(p), "--run-id", "r1") == EXIT_DIFFERENCES
+    html = (tmp_path / "work/acme/runs/r1/report.html").read_text()
+    assert "SECRET-VALUE-42" in html  # the run itself was asked to show values
+    capsys.readouterr()
+
+    assert run(tmp_path, "support-bundle", "--project", str(p)) == EXIT_OK
+    out = json.loads(capsys.readouterr().out)
+    assert out["run_id"] == "r1"  # the latest run by default
+    with zipfile.ZipFile(out["bundle"]) as z:
+        names = set(z.namelist())
+        assert {"MANIFEST.json", "environment.json", "project.json", "run/report.json",
+                "run/findings.jsonl", "run/db-results.json", "run.log"} <= names
+        assert not [n for n in names if n.endswith(".html")]
+        everything = "".join(z.read(n).decode() for n in names)
+    assert "SECRET-VALUE-42" not in everything
+    assert "id = 7" not in everything  # database locators name key values
+    bundle = zipfile.ZipFile(out["bundle"])
+    findings = [json.loads(x) for x in bundle.read("run/findings.jsonl").decode().splitlines()]
+    changed = [f for f in findings if f["column"] == "status" and f["expected"]]
+    assert changed and changed[0]["expected"] == "[redacted]"
+    env = json.loads(bundle.read("environment.json"))
+    assert env["canonical_version"] and env["packages"]["psycopg"]
+    # also in the store, for an operator who has no shell on the instance
+    assert (tmp_path / "work/acme/support" / out["bundle"].rsplit("/", 1)[1]).exists()
+
+
+def test_support_bundle_unknown_run_is_a_configuration_error(tmp_path, capsys):
+    p = _project(tmp_path, "s", "t")
+    assert run(tmp_path, "support-bundle", "--project", str(p), "--run", "nope") == EXIT_CONFIG
+
+
+def test_redaction_rules():
+    from liftproof.support import REDACTED, redact_finding
+
+    f = redact_finding({
+        "comparator": "database", "locator": "id = 7", "expected": "a", "actual": "b",
+        "detail": {"key": ["7"], "column": "status", "nested": {"source": {"max": 9.5}},
+                   "buckets": [3]},
+    })  # fmt: skip
+    assert f["locator"] == f["expected"] == f["actual"] == REDACTED
+    assert f["detail"] == {"key": REDACTED, "column": "status",
+                           "nested": {"source": REDACTED}, "buckets": [3]}  # fmt: skip
+    ui = redact_finding({"comparator": "ui", "locator": "#total", "expected": None})
+    assert ui["locator"] == "#total" and ui["expected"] is None
 
 
 def test_mysql_to_postgresql_project_defaults(tmp_path):

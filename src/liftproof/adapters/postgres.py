@@ -104,9 +104,12 @@ def render_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sql
 
 
 def digest_sql(rendered: sql.Composable) -> sql.Composable:
-    return sql.SQL(
-        "CASE WHEN {r} IS NULL THEN {n} ELSE md5(octet_length({r})::text || chr(31) || {r}) END"
-    ).format(r=rendered, n=sql.Literal(NULL_DIGEST))
+    # A NULL rendering makes the concatenation, and so the md5, NULL. Naming the rendering
+    # twice rather than three times (CASE WHEN r IS NULL ...) matters: the planner does not
+    # share repeated expressions, and the rendering is most of the per row cost.
+    return sql.SQL("coalesce(md5(octet_length({r})::text || chr(31) || {r}), {n})").format(
+        r=rendered, n=sql.Literal(NULL_DIGEST)
+    )
 
 
 def combine_sql(digests: Sequence[sql.Composable]) -> sql.Composable:
@@ -123,13 +126,24 @@ def unsigned64_sql(hex_hash: sql.Composable) -> sql.Composable:
     bit(64)::bigint is signed, so negative values are lifted by 2**64.
     """
     signed = sql.SQL("(('x' || substr({}, 1, 16))::bit(64)::bigint)").format(hex_hash)
-    return sql.SQL("({s}::numeric + CASE WHEN {s} < 0 THEN {m} ELSE 0 END)").format(
-        s=signed, m=sql.SQL(TWO_64)
-    )
+    # One reference to the hash: the subquery is flattened, so each reference to rh or kh
+    # recomputes the whole row hash.
+    return sql.SQL("mod({s}::numeric + {m}, {m})").format(s=signed, m=sql.SQL(TWO_64))
+
+
+def _excluding(predicate: str | None) -> sql.Composable:
+    """Keep the rows the predicate does not match; a NULL result keeps the row too. The
+    predicate comes from the project file (config refuses statement separators and
+    comments) and runs in a read only transaction."""
+    if not predicate:
+        return sql.SQL("")
+    return sql.SQL(" WHERE ({}) IS NOT TRUE").format(sql.SQL(predicate))  # noqa: S608
 
 
 class PostgresAdapter(Adapter):
     engine = "postgresql"
+    supports_row_filters = True
+    supports_sampling = True
 
     def __init__(
         self,
@@ -146,6 +160,7 @@ class PostgresAdapter(Adapter):
         rows_per_second: int = 0,
         connect_timeout: int = 10,
     ) -> None:
+        self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
         params: dict[str, Any] = {
             "host": host,
             "port": port,
@@ -208,6 +223,61 @@ class PostgresAdapter(Adapter):
             "snapshot_id": snapshot_id,
             "taken_at": at.isoformat(),
         }
+
+    replication_methods = ("subscription", "slot")
+
+    def current_position(self) -> dict[str, Any] | None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text "
+                "ELSE pg_current_wal_lsn()::text END"
+            )
+            (lsn,) = cur.fetchone()
+        return {"type": "lsn", "position": lsn}
+
+    def replication_applied(self, method: str, name: str) -> str | None:
+        """subscription: run on the target, native logical replication from a PostgreSQL
+        source. slot: run on the source, any consumer of a logical slot (AWS DMS included);
+        the slot's confirmed position is what the consumer has applied and acknowledged."""
+        if method == "subscription":
+            q = (
+                "SELECT latest_end_lsn::text FROM pg_stat_subscription "
+                "WHERE subname = %s AND relid IS NULL"
+            )
+        elif method == "slot":
+            q = "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = %s"
+        else:
+            raise NotImplementedError(method)
+        with self.conn.cursor() as cur:
+            cur.execute(q, (name,))
+            row = cur.fetchone()
+        if not self.conn.autocommit and not self._in_snapshot:
+            self.conn.rollback()
+        return row[0] if row and row[0] else None
+
+    @staticmethod
+    def position_key(kind: str, position: str) -> Any:
+        if kind != "lsn":
+            raise NotImplementedError(kind)
+        hi, lo = position.split("/")
+        return (int(hi, 16) << 32) + int(lo, 16)
+
+    supports_workers = True
+
+    def fork(self, snapshot: dict[str, Any] | None = None) -> PostgresAdapter:
+        other = PostgresAdapter(**self._kwargs)
+        if snapshot is not None:
+            other.conn.autocommit = False
+            other.conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            other.conn.read_only = True
+            with other.conn.cursor() as cur:  # the first statement of the transaction
+                cur.execute(
+                    sql.SQL("SET TRANSACTION SNAPSHOT {}").format(
+                        sql.Literal(snapshot["snapshot_id"])
+                    )
+                )
+            other._in_snapshot = True
+        return other
 
     def end_snapshot(self) -> None:
         if self._in_snapshot:
@@ -275,7 +345,7 @@ class PostgresAdapter(Adapter):
         digests = self._digests_sql(plan)
         row = combine_sql(digests)
         key = combine_sql([digests[i] for i in plan.key_positions]) if plan.key_columns else row
-        return sql.SQL("SELECT {row} AS rh, {key} AS kh{keys} FROM {t}").format(
+        return sql.SQL("SELECT {row} AS rh, {key} AS kh{keys} FROM {t}{where}").format(
             row=row,
             key=key,
             keys=sql.SQL("").join(
@@ -283,26 +353,37 @@ class PostgresAdapter(Adapter):
                 for i, e in enumerate(self._key_sql(plan))
             ),
             t=self._ident(plan.table),
+            where=_excluding(plan.filter),
         )
 
     def bucket_aggregates(self, plan: HashPlan) -> dict[int, BucketAggregate]:
         if not self._pushdown(plan):
             return self._bucket_aggregates_fallback(plan)
         q = sql.SQL(
-            "SELECT mod({kh}, {n})::int AS b, count(*), sum({rh}) FROM ({inner}) h GROUP BY 1"
+            "SELECT mod({kh}, {n})::int AS b, count(*), sum({rh}) FROM ({inner}) h{sample} "
+            "GROUP BY 1"
         ).format(
             kh=unsigned64_sql(sql.SQL("kh")),
             rh=unsigned64_sql(sql.SQL("rh")),
             n=sql.Literal(plan.buckets),
             inner=self._hash_query(plan),
+            # the bucket test is pushed into the scan, so rows outside the sample are
+            # never row hashed: sampling saves the expensive part of the work
+            sample=sql.SQL("")
+            if plan.sample is None
+            else sql.SQL(" WHERE mod({kh}, {n})::int = ANY(%s)").format(
+                kh=unsigned64_sql(sql.SQL("kh")), n=sql.Literal(plan.buckets)
+            ),
         )
         with self.conn.cursor() as cur:
-            cur.execute(q)
+            cur.execute(q, None if plan.sample is None else (list(plan.sample),))
             return {b: BucketAggregate(c, int(t)) for b, c, t in cur.fetchall()}
 
     def _stream(self, plan: HashPlan) -> Iterator[tuple[Any, ...]]:
         cols = sql.SQL(", ").join(sql.Identifier(c) for c, _ in plan.columns)
-        q = sql.SQL("SELECT {} FROM {}").format(cols, self._ident(plan.table))
+        q = sql.SQL("SELECT {} FROM {}{}").format(
+            cols, self._ident(plan.table), _excluding(plan.filter)
+        )
         interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         with self.conn.transaction(), self.conn.cursor(name="liftproof_stream") as cur:
             cur.itersize = 5000
@@ -318,6 +399,8 @@ class PostgresAdapter(Adapter):
         for row in self._stream(plan):
             rh, kh = hasher.hash_row(row)
             b = value64(kh) % plan.buckets
+            if plan.sample is not None and b not in plan.sample:
+                continue
             agg = out.setdefault(b, BucketAggregate(0, 0))
             agg.count += 1
             agg.total += value64(rh)
@@ -347,6 +430,45 @@ class PostgresAdapter(Adapter):
             for row in cur:
                 yield tuple(row[2:]), row[0]
 
+    def bucket_rows(
+        self, plan: HashPlan, buckets: set[int]
+    ) -> Iterator[tuple[int, dict[tuple[Any, ...], str]]]:
+        """One pass over the table, ordered by bucket through a server side cursor, so
+        only one bucket's keys and hashes are held here at a time."""
+        if not self._pushdown(plan):
+            yield from super().bucket_rows(plan, buckets)
+            return
+        wanted = sorted(set(buckets))
+        q = sql.SQL(
+            "SELECT b, rh, {keys} FROM (SELECT mod({kh}, {n})::int AS b, h.* FROM ({inner}) h) x "
+            "WHERE b = ANY(%s) ORDER BY b"
+        ).format(
+            keys=sql.SQL(", ").join(sql.Identifier(f"k{i}") for i in range(len(plan.key_columns))),
+            kh=unsigned64_sql(sql.SQL("kh")),
+            n=sql.Literal(plan.buckets),
+            inner=self._hash_query(plan),
+        )
+        pending = iter(wanted)
+        current: int | None = None
+        rows: dict[tuple[Any, ...], str] = {}
+        with self.conn.transaction(), self.conn.cursor(name="liftproof_buckets") as cur:
+            cur.itersize = 5000
+            cur.execute(q, (wanted,))
+            for b, rh, *key in cur:
+                if b != current:
+                    if current is not None:
+                        yield current, rows
+                    for empty in pending:  # buckets before this one had no rows
+                        if empty == b:
+                            break
+                        yield empty, {}
+                    current, rows = b, {}
+                rows[tuple(key)] = rh
+        if current is not None:
+            yield current, rows
+        for empty in pending:
+            yield empty, {}
+
     def fetch_rows(
         self, plan: HashPlan, keys: Sequence[tuple[Any, ...]]
     ) -> dict[tuple[Any, ...], list[Any]]:
@@ -368,15 +490,15 @@ class PostgresAdapter(Adapter):
             cur.execute(q)
             return {tuple(r[:nk]): list(r[nk:]) for r in cur.fetchall()}
 
-    def float_stats(self, table: TableRef, column: str) -> FloatStats:
+    def float_stats(self, table: TableRef, column: str, where: str | None = None) -> FloatStats:
         c = sql.Identifier(column)
         finite = sql.SQL("{c} NOT IN ('NaN', 'Infinity', '-Infinity')").format(c=c)
         q = sql.SQL(
             "SELECT count(*), count({c}), min({c}) FILTER (WHERE {f}), max({c}) FILTER (WHERE {f}),"
             " sum({c}::numeric) FILTER (WHERE {f}),"
             " count(*) FILTER (WHERE {c} = 'NaN'),"
-            " count(*) FILTER (WHERE {c} IN ('Infinity', '-Infinity')) FROM {t}"
-        ).format(c=c, f=finite, t=self._ident(table))
+            " count(*) FILTER (WHERE {c} IN ('Infinity', '-Infinity')) FROM {t}{w}"
+        ).format(c=c, f=finite, t=self._ident(table), w=_excluding(where))
         with self.conn.cursor() as cur:
             cur.execute(q)
             n, nn, lo, hi, total, nan, inf = cur.fetchone()
