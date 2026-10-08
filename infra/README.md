@@ -15,7 +15,7 @@ infra/
   modules/build-account     GitHub OIDC release role, AMI builder, evidence store, Marketplace ingestion
   envs/customer-example     example customer root: network + liftproof
   envs/algorims-build       Algorims build account root: baseline + network + build
-  packer/                   the product AMI (Amazon Linux 2023, IMDSv2, no SSH, hardened)
+  packer/                   the product AMI (Ubuntu 24.04 LTS, IMDSv2, no SSH, hardened)
   scripts/scan-ami.sh       Amazon Inspector release gate for the AMI's OS layer
 ```
 
@@ -113,6 +113,4 @@ endpoints can be shared with other workloads in the same VPC by setting
 
 - A test launch of `cloudformation/liftproof.yaml`; it has passed `cfn-lint` and Checkov
   only. `tests/test_cloudformation.py` keeps it in step with `modules/liftproof`.
-- Chromium and its libraries in the AMI once the recorder lands (the base image
-  decision, Amazon Linux 2023 or Ubuntu, is still open).
 - Remote state bucket for the Terraform roots (backend blocks are in place, commented).
