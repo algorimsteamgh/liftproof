@@ -15,6 +15,11 @@ dependencies = [
   "playwright>=1.47",
   "psycopg[binary]>=3.2",
   "pypdf>=5",
+  # rsa: caching_sha2_password logins without TLS. Below 1.2: 1.2.3 fails the full
+  # caching_sha2_password exchange (AttributeError in _request_authentication).
+  "pymysql[rsa]>=1.1.1,<1.2",
+  # thin mode: no Oracle client libraries on the image
+  "oracledb>=2.5,<4",
   "pyyaml>=6.0.1",
 ]
 
@@ -37,6 +42,8 @@ addopts = "-q -m 'not perf'"
 markers = [
   "postgres: needs a PostgreSQL server (LIFTPROOF_TEST_PG_HOST)",
   "browser: needs Chromium for Playwright (or LIFTPROOF_CHROMIUM)",
+  "mysql: needs a MySQL server (LIFTPROOF_TEST_MYSQL_HOST)",
+  "oracle: needs an Oracle server (LIFTPROOF_TEST_ORACLE_HOST)",
   "perf: the KPI performance suite (PRD N8, N9); run with -m perf",
 ]
 
