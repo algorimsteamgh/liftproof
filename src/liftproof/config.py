@@ -19,6 +19,7 @@ from liftproof.errors import ConfigError
 from liftproof.files.compare import FileSetConfig, IgnoreFile
 from liftproof.reconcile.engine import ReconcileOptions
 from liftproof.reconcile.plan import IgnoreRule
+from liftproof.schedule import Schedule, parse_schedules
 
 FORBIDDEN_KEYS = re.compile(
     r"(password|passwd|secret_access_key|access_key_id|session_token)", re.I
@@ -82,6 +83,7 @@ class Project:
     path: Path | None = None
     web: WebConfig | None = None
     files: list[FileSetConfig] = field(default_factory=list)
+    schedules: list[Schedule] = field(default_factory=list)
 
     def require_database(self) -> tuple[Connection, Connection]:
         if self.source is None or self.target is None:
@@ -321,6 +323,7 @@ def load_project(path: Path) -> Project:
         target=target,
         web=web,
         files=files,
+        schedules=parse_schedules(raw.get("schedules")),
         store=StoreConfig(
             store.get("s3_bucket"), store.get("s3_prefix", raw["project"]), store.get("kms_key_id")
         ),
@@ -396,4 +399,11 @@ database:
     # - table: orders
     #   column: last_synced_at
     #   reason: rewritten by ETL
+
+# schedules:                    # run by mvt-scheduler.service; runs never overlap
+#   - name: nightly
+#     cron: "0 2 * * *"         # minute hour day-of-month month day-of-week
+#     timezone: Asia/Kolkata    # default UTC
+#     command: validate         # validate, reconcile, files, replay, smoke or baseline
+#     args: [--baseline, latest]
 """

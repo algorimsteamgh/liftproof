@@ -15,10 +15,13 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from liftproof import aws
 from liftproof.errors import ConfigError, RunFailed
+from liftproof.runlock import LOCK_KEY, LocalRunLock, RunLock, S3RunLock
 
 
 class Store:
     def put_file(self, key: str, path: Path) -> None: ...
+
+    def run_lock(self, run_id: str, command: str) -> RunLock: ...
 
     def get_file(self, key: str, path: Path) -> bool: ...
 
@@ -47,6 +50,9 @@ class LocalStore(Store):
 
     def location(self, key: str) -> str:
         return str(self.root / key)
+
+    def run_lock(self, run_id: str, command: str) -> RunLock:
+        return LocalRunLock(self.root / LOCK_KEY, run_id, command)
 
 
 class S3Store(Store):
@@ -116,3 +122,9 @@ class S3Store(Store):
 
     def location(self, key: str) -> str:
         return f"s3://{self.bucket}/{self._key(key)}"
+
+    def run_lock(self, run_id: str, command: str) -> RunLock:
+        return S3RunLock(
+            self.s3, self.bucket, self._key(LOCK_KEY), run_id, command,
+            put_args=self._object_args(LOCK_KEY),
+        )  # fmt: skip

@@ -129,7 +129,7 @@ build {
   provisioner "shell" {
     execute_command  = "sudo -E bash -euo pipefail '{{ .Path }}'"
     environment_vars = ["LIFTPROOF_VERSION=${var.version}"]
-    scripts          = ["${path.root}/files/provision.sh", "${path.root}/files/harden.sh", "${path.root}/files/cleanup.sh"]
+    scripts          = ["${path.root}/files/provision.sh", "${path.root}/files/scheduler.sh", "${path.root}/files/harden.sh", "${path.root}/files/cleanup.sh"]
   }
 
   post-processor "manifest" {

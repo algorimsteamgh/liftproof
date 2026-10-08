@@ -1,0 +1,23 @@
+[Unit]
+Description=Liftproof scheduled runs (the schedules in each project file)
+After=network-online.target cloud-final.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mvt
+Group=mvt
+ExecStart=/opt/mvt/bin/liftproof scheduler --projects-dir /var/lib/mvt/projects --workdir /var/lib/mvt/projects
+Environment=LIFTPROOF_INVOKED_BY=scheduler
+Restart=on-failure
+RestartSec=30
+# a stopped scheduler must not take running validations with it
+KillMode=process
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/mvt /var/log/mvt
+
+[Install]
+WantedBy=multi-user.target

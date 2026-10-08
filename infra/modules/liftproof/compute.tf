@@ -10,6 +10,7 @@ resource "aws_cloudwatch_log_group" "this" {
 
 locals {
   instance_config = yamlencode({
+    deployment       = var.name # the dimension the skipped run alarm watches
     region           = local.region
     bucket           = aws_s3_bucket.this.bucket
     kms_key          = local.kms_key_arn

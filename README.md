@@ -54,6 +54,20 @@ is a low severity difference that says why, and different text is located to the
 line, or row and column. What the text says stays out of the report unless the set sets
 `show_content: true`. `validate` compares files after reconciling and before replaying.
 
+## Scheduled and pipeline runs
+
+```bash
+liftproof schedule --project acme.yaml     # the project's schedules and their next run
+liftproof runs     --project acme.yaml     # run history on this instance, newest first
+```
+
+A project file can carry `schedules:` (a name, a five field cron expression, a time zone
+and the command to run). The `mvt-scheduler.service` on the instance starts each run when
+it falls due. Runs of one project never overlap: a second run is refused with exit code
+2, and a scheduled run that finds the previous one still going is skipped and recorded as
+a run with an error finding and a `ScheduledRunSkipped` CloudWatch metric. CI and CD
+pipelines start runs through the SSM document; see [docs/pipelines.md](docs/pipelines.md).
+
 ## Exit codes
 
 | Code | Meaning | Pipeline action |
