@@ -40,6 +40,73 @@ requires a new `CANONICAL_VERSION`.
 Every connection pins its session settings (PostgreSQL: `TimeZone=UTC`,
 `DateStyle=ISO, YMD`, `extra_float_digits=3`, UTF-8 client encoding) and the manifest
 records them.
+MySQL sessions pin `time_zone='+00:00'`, `sql_mode='NO_ENGINE_SUBSTITUTION'` (so no
+`ANSI_QUOTES`, `PIPES_AS_CONCAT` or `PAD_CHAR_TO_FULL_LENGTH`) and `utf8mb4`.
+
+### MySQL type mapping and engine specific rules
+
+| MySQL | Canonical | Note |
+|---|---|---|
+| tinyint(1) | boolean | MySQL's `BOOLEAN`; any non zero value is `1` |
+| tinyint, smallint, mediumint, int, bigint (signed or unsigned), year | integer | |
+| decimal | decimal | |
+| float, double | float | statistical comparison only |
+| varchar, text types, enum, set | text | enum and set as their label text |
+| char | char | |
+| date | date | |
+| time | time | |
+| datetime | timestamp (naive) | |
+| timestamp | timestamptz | stored as UTC and read in a UTC session |
+| binary, varbinary, blob types | binary | `binary(n)` keeps its zero padding, which is the stored value |
+| json | json | always hashed application side |
+| bit, geometry and the rest | unsupported | reported as not checked |
+
+Values MySQL can store that no other engine can, rendered as MySQL prints them so that
+they always show up as a difference against another engine rather than matching by
+accident:
+
+- zero and partial dates: `0000-00-00`, `2026-00-15`, and as timestamps
+  `0000-00-00T00:00:00[.f]`;
+- a `TIME` outside one day: `-01:02:03.5` renders `-01:02:03.500000` at precision 6,
+  `125:00:00` renders `125:00:00`.
+
+MySQL has no Unicode normalisation function, so a row whose text and char values are all
+ASCII is hashed in the database and every other row is hashed application side; the two
+are summed. The cost is proportional to the non-ASCII rows only.
+
+Oracle sessions pin `TIME_ZONE='+00:00'` and `NLS_NUMERIC_CHARACTERS='.,'`; every
+rendering uses an explicit format, so no other NLS setting matters.
+
+### Oracle type mapping and engine specific rules
+
+| Oracle | Canonical | Note |
+|---|---|---|
+| NUMBER(p), NUMBER(p,0), INTEGER, NUMBER(p,-s) | integer | |
+| NUMBER(p,s), NUMBER | decimal | unconstrained NUMBER compares with an integer column (below) |
+| FLOAT, BINARY_FLOAT, BINARY_DOUBLE | float | statistical comparison only; NaN and infinity counted for the binary types |
+| VARCHAR2, NVARCHAR2, CLOB, NCLOB | text | LOB tables are hashed application side |
+| CHAR, NCHAR | char | |
+| DATE | timestamp (naive) | an Oracle DATE has a time of day; a target `date` column is reported as a type change |
+| TIMESTAMP(n) | timestamp (naive) | nanoseconds are truncated to the precision, as everywhere |
+| TIMESTAMP WITH TIME ZONE, WITH LOCAL TIME ZONE | timestamptz | converted to UTC |
+| RAW, BLOB | binary | |
+| JSON (21c and later) | json | always hashed application side |
+| BOOLEAN (23ai) | boolean | |
+| LONG, LONG RAW, INTERVAL, ROWID, XMLTYPE, spatial and the rest | unsupported | reported as not checked |
+
+An integer column on one side and a decimal column on the other (the common Oracle
+`NUMBER` to PostgreSQL `bigint` move) are both rendered as decimal: a whole number renders
+identically under either rule, and a fraction lost in the move is a changed value.
+
+Oracle stores the empty string as NULL. Text that is empty on the other engine and NULL in
+Oracle is reported as a difference: it is one, and an application that tests for `''` or
+`IS NULL` behaves differently after the move.
+
+Oracle has no exact NFC function (`COMPOSE` composes without decomposing first) and SQL
+strings stop at 4000 bytes, so a row is hashed in the database only when its text values
+are plain ASCII of at most 3990 characters, its RAW values are at most 1995 bytes, and its
+decimals print without an exponent. Every other row is hashed application side; the two
+are summed.
 
 ## 3. Framing and hashing
 
@@ -87,5 +154,5 @@ bucket       = v(key_hash) mod N;  key_hash = the same pipeline over the key col
 
 - SHA-256 as an alternative for FIPS hosts (MD5 is a hard error there). The pipeline is
   unchanged except the digest function; `v` still takes the first 8 bytes.
-- Engine specific rules still to be written with their adapters: MySQL zero date,
-  SQL Server `datetime` rounding, Oracle empty string, negative zero in floats.
+- Engine specific rules still to be written with their adapters: SQL Server `datetime`
+  rounding, Oracle empty string, negative zero in floats.

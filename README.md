@@ -5,7 +5,8 @@ its database behave before a migration, checks the same behaviour afterwards, an
 produces the report a release manager signs at go live.
 
 This repository is being built against the *Migration Validation Tool* PRD and Technical
-Specification (Draft 1). Built so far: the database core, PRD F2 (baseline), F6 (reconcile), F8/F9 (reports),
+Specification (Draft 1). Supported databases: PostgreSQL, MySQL (8.0 and later, including Aurora) and Oracle (19c and later, including RDS for Oracle), as source
+or target, in any combination. Built so far: the database core, PRD F2 (baseline), F6 (reconcile), F8/F9 (reports),
 F11 (CLI and exit codes), F14 (credentials) and F15 (storage); and record and replay,
 F1 (record), F3 (replay), F4 (user interface comparison), F5 (API comparison) and F16
 (response times).
@@ -83,9 +84,13 @@ pipelines start runs through the SSM document; see [docs/pipelines.md](docs/pipe
 
 `pytest` runs everything. Record and replay tests need Chromium
 (`python -m playwright install chromium`, or point `LIFTPROOF_CHROMIUM` at a binary) and run
-against a small shop application in `tests/webapp.py` that is served twice, once changed. Database tests need PostgreSQL: set `LIFTPROOF_TEST_PG_HOST`,
-`LIFTPROOF_TEST_PG_PORT` and `LIFTPROOF_TEST_PG_USER` (CI uses a service container); they are
-skipped when no server is reachable. The suite includes the golden vectors that pin the
+against a small shop application in `tests/webapp.py` that is served twice, once changed.
+Database tests need PostgreSQL, MySQL and Oracle: set
+`LIFTPROOF_TEST_PG_HOST`, `_PORT`, `_USER`, `_PASSWORD`, `LIFTPROOF_TEST_MYSQL_HOST`,
+`_PORT`, `_USER`, `_PASSWORD` and `LIFTPROOF_TEST_ORACLE_HOST`, `_PORT`, `_SERVICE`,
+`_USER`, `_PASSWORD` (CI uses service containers; for Oracle,
+`gvenzl/oracle-free:23-slim-faststart`); they are skipped when no server is reachable.
+Cross engine tests load the same data into each engine and require identical hashes. The suite includes the golden vectors that pin the
 canonical wire format, pushdown against fallback parity for every type rule, and the
 PRD F6 acceptance test (a ten row injected difference, reported exactly).
 
