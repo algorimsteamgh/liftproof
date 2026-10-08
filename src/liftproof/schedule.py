@@ -30,7 +30,8 @@ from liftproof.errors import ConfigError
 
 log = logging.getLogger("liftproof.scheduler")
 
-COMMANDS = ("validate", "reconcile", "files", "replay", "smoke", "baseline")
+BASELINES = ("baseline", "rebaseline")  # take a baseline id, not a run id
+COMMANDS = ("validate", "reconcile", "files", "replay", "smoke", "baseline", "rebaseline")
 FIELDS = (("minute", 0, 59), ("hour", 0, 23), ("day of month", 1, 31), ("month", 1, 12),
           ("day of week", 0, 7))  # fmt: skip
 NAMES = {
@@ -280,7 +281,7 @@ def command_line(d: Due, workdir: Path) -> list[str]:
         sys.executable, "-m", "liftproof.cli", d.schedule.command,
         "--project", str(d.path), "--workdir", str(workdir),
         "--scheduled", d.schedule.name, "--format", "json",
-        *([] if d.schedule.command == "baseline" else ["--run-id", run_id_for(d)]),
+        *([] if d.schedule.command in BASELINES else ["--run-id", run_id_for(d)]),
         *d.schedule.args,
     ]  # fmt: skip
 

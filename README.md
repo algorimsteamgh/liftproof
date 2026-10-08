@@ -19,6 +19,9 @@ liftproof init acme                   # writes acme.yaml; no credentials go in i
 liftproof doctor --project acme.yaml  # connections, read only source, TLS, S3 and KMS
 liftproof baseline --project acme.yaml
 liftproof reconcile --project acme.yaml --baseline latest
+# after cutover: the target becomes the reference for scheduled regression
+liftproof rebaseline --project acme.yaml
+liftproof reconcile --project acme.yaml --baseline latest-target
 ```
 
 ## Record and replay

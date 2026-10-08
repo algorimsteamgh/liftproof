@@ -22,7 +22,7 @@ resource "aws_ssm_document" "run" {
       mode = {
         type          = "String"
         default       = "reconcile"
-        allowedValues = ["validate", "reconcile", "files", "replay", "smoke", "baseline", "doctor"]
+        allowedValues = ["validate", "reconcile", "files", "replay", "smoke", "baseline", "rebaseline", "doctor"]
       }
       journeys = {
         type           = "String"
@@ -38,6 +38,7 @@ resource "aws_ssm_document" "run" {
       }
       baseline = {
         type           = "String"
+        description    = "Reference for reconcile and validate: latest (source), latest-target (after rebaseline) or a baseline id"
         default        = "latest"
         allowedPattern = "^(latest|b-[0-9]{8}-[0-9]{6}|[a-z0-9-]{1,40})$"
       }

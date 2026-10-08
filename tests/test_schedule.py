@@ -273,3 +273,12 @@ def test_scheduler_runs_the_real_command(project, tmp_path):
     report = json.loads((run / "report.json").read_text())
     assert run.name.startswith("s-") and report["run"]["schedule"] == "nightly"
     assert report["verdict"] == "passed"
+
+
+def test_rebaseline_can_be_scheduled_and_takes_no_run_id(tmp_path):
+    from liftproof.schedule import Due
+
+    [s] = parse_schedules([{"name": "weekly", "cron": "0 3 * * 0", "command": "rebaseline"}])
+    cmd = command_line(Due("docs", tmp_path / "docs.yaml", s, at("2026-10-11 03:00+00:00")),
+                       tmp_path)  # fmt: skip
+    assert cmd[3] == "rebaseline" and "--run-id" not in cmd

@@ -1,6 +1,8 @@
 """CLI behaviour a pipeline relies on: exit codes, reports, and credential rules."""
 
+import argparse
 import json
+import shutil
 
 import pytest
 import yaml
@@ -8,6 +10,7 @@ import yaml
 from liftproof import cli
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_OK, EXIT_RUN_FAILED
+from liftproof.store import LocalStore
 from tests.conftest import PG
 
 SCHEMA = """
@@ -145,6 +148,76 @@ def test_version_reports_sdk(capsys):
 def test_init_writes_template(tmp_path):
     assert cli.main(["init", "demo", "--dir", str(tmp_path)]) == EXIT_OK
     assert "secret_arn" in (tmp_path / "demo.yaml").read_text()
+
+
+@pytest.fixture
+def opened(monkeypatch):
+    """The databases each command connects to."""
+    seen = []
+    real = cli.connect
+
+    def spy(conn):
+        seen.append(conn.database)
+        return real(conn)
+
+    monkeypatch.setattr(cli, "connect", spy)
+    return seen
+
+
+@pytest.mark.postgres
+def test_rebaseline_then_regression_against_the_target_alone(tmp_path, dbs, capsys, opened):
+    s, t, tc = dbs
+    p = _project(tmp_path, s, t)
+    # live traffic after cutover: the target no longer matches the frozen source
+    tc.execute("UPDATE orders SET status = 'DELIVERED' WHERE id <= 300")
+    assert run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "t1") == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["side"] == "target"
+    assert opened == [t]  # the source is never read; it may be decommissioned
+    manifest = json.loads((tmp_path / "work/acme/baselines/t1/manifest.json").read_text())
+    assert manifest["side"] == "target"
+
+    opened.clear()
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target",
+               "--run-id", "r1") == EXIT_OK  # fmt: skip
+    assert opened == [t]
+    report = json.loads((tmp_path / "work/acme/runs/r1/report.json").read_text())
+    assert report["range"]["reference"] == "target baseline t1"
+
+    # a change since the rebaseline is found, down to the bucket
+    tc.execute("UPDATE orders SET total = total + 1 WHERE id = 7")
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target",
+               "--run-id", "r2") == EXIT_DIFFERENCES  # fmt: skip
+    summaries = [f["summary"] for f in json.loads(
+        (tmp_path / "work/acme/runs/r2/report.json").read_text())["findings"]]  # fmt: skip
+    assert any("1 of 4 buckets mismatched" in x for x in summaries)
+    assert any("target's past state cannot be re-read" in x for x in summaries)
+
+    # rows added since: the count names the target baseline as the reference
+    tc.execute("INSERT INTO notes VALUES ('late')")
+    run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target", "--run-id", "r3")
+    summaries = [f["summary"] for f in json.loads(
+        (tmp_path / "work/acme/runs/r3/report.json").read_text())["findings"]]  # fmt: skip
+    assert "row count differs: target baseline 10, target 11 (+1)" in summaries
+
+
+@pytest.mark.postgres
+def test_latest_and_latest_target_are_separate(tmp_path, dbs, capsys):
+    s, t, _ = dbs
+    p = _project(tmp_path, s, t)
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target") == \
+        EXIT_CONFIG
+    assert "liftproof rebaseline" in capsys.readouterr().err
+    assert run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "t1") == EXIT_OK
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest") == EXIT_CONFIG
+    assert run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "latest") == \
+        EXIT_CONFIG
+    # a replacement instance (empty work directory) finds the marker through the store
+    store_root = tmp_path / "store"
+    shutil.copytree(tmp_path / "work/acme", store_root)
+    shutil.rmtree(tmp_path / "work")
+    args = argparse.Namespace(baseline="latest-target")
+    b = cli._load_baseline(args, None, LocalStore(store_root), tmp_path / "work/acme")
+    assert (b.baseline_id, b.side) == ("t1", "target")
 
 
 def test_mysql_to_postgresql_project_defaults(tmp_path):

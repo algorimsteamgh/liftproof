@@ -861,7 +861,7 @@ Resources:
           mode:
             type: String
             default: reconcile
-            allowedValues: [validate, reconcile, files, replay, smoke, baseline, doctor]
+            allowedValues: [validate, reconcile, files, replay, smoke, baseline, rebaseline, doctor]
           journeys:
             type: String
             description: Comma separated journey ids for replay, smoke and validate; empty = all
@@ -874,6 +874,7 @@ Resources:
             allowedPattern: "^([A-Za-z0-9][A-Za-z0-9_-]{0,63}(,[A-Za-z0-9][A-Za-z0-9_-]{0,63})*)?$"
           baseline:
             type: String
+            description: "Reference for reconcile and validate: latest (source), latest-target (after rebaseline) or a baseline id"
             default: latest
             allowedPattern: "^(latest|b-[0-9]{8}-[0-9]{6}|[a-z0-9-]{1,40})$"
           failOn:
