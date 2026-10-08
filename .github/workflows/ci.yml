@@ -64,7 +64,7 @@ jobs:
       LIFTPROOF_TEST_MSSQL_USER: sa
       LIFTPROOF_TEST_MSSQL_PASSWORD: Ci-only-local-service1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -91,7 +91,7 @@ jobs:
     # ATS-009: a known vulnerability blocks the build; keep these logs as evidence.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
