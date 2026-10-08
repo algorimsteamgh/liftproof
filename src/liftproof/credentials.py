@@ -32,12 +32,7 @@ def _region_of(arn: str) -> str | None:
     return parts[3] if len(parts) > 3 and parts[3] else None
 
 
-def from_secrets_manager(
-    arn: str,
-    *,
-    username_key: str = "username",
-    password_key: str = "password",  # noqa: S107
-) -> DbCredentials:
+def _secret_json(arn: str) -> dict:
     try:
         resp = aws.client("secretsmanager", _region_of(arn)).get_secret_value(SecretId=arn)
     except ClientError as exc:
@@ -49,7 +44,30 @@ def from_secrets_manager(
         data = json.loads(resp["SecretString"])
     except (KeyError, ValueError):
         raise ConfigError(f"secret {arn} is not a JSON key/value secret") from None
+    if not isinstance(data, dict):
+        raise ConfigError(f"secret {arn} is not a JSON key/value secret")
+    return data
+
+
+def from_secrets_manager(
+    arn: str,
+    *,
+    username_key: str = "username",
+    password_key: str = "password",  # noqa: S107
+) -> DbCredentials:
+    data = _secret_json(arn)
     if password_key not in data:
         raise ConfigError(f"secret {arn} has no key {password_key!r}")
     register_secret(data[password_key])
     return DbCredentials(data.get(username_key), data[password_key])
+
+
+def secret_value(arn: str, key: str) -> str:
+    """One value from a key/value secret: the real value behind a journey's redaction
+    token (spec 5). Registered with the log scrubber before it is returned."""
+    data = _secret_json(arn)
+    if key not in data:
+        raise ConfigError(f"secret {arn} has no key {key!r}")
+    value = str(data[key])
+    register_secret(value)
+    return value
