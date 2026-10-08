@@ -477,7 +477,11 @@ database:
     #   reason: test tenant renamed in the target
   # replication:                # has replication applied everything up to the reference point?
   #   method: slot              # slot (on a PostgreSQL source, e.g. read by AWS DMS),
-  #                             # subscription (PostgreSQL logical replication, on the target)
+  #                             # subscription (PostgreSQL logical replication, on the target),
+  #                             # replica (MySQL replication, on the target; name: channel),
+  #                             # dms (any engines: the task's awsdms_status table on the
+  #                             # target; name: the task's resource ID; control_schema if
+  #                             # the task sets ControlSchema)
   #   name: dms_slot
   #   wait_seconds: 300         # wait this long for it to catch up; then not_checked
 

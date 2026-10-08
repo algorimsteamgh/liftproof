@@ -31,6 +31,8 @@ from liftproof.adapters.base import (
     HashPlan,
     TableRef,
     TableSchema,
+    all_of,
+    in_list,
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, Verbatim, column_digest
 from liftproof.canonical import value64 as _value64
@@ -153,6 +155,13 @@ def _ascii_sql(columns: Sequence[tuple[str, CanonicalType]]) -> str | None:
     return " AND ".join(parts) if parts else None
 
 
+def _excluding(predicate: str | None) -> str | None:
+    """Keep the rows a row ignore rule's predicate does not match; a NULL result keeps
+    the row too. The predicate comes from the project file (config refuses statement
+    separators and comments) and runs in a read only transaction."""
+    return f"({predicate}) IS NOT TRUE" if predicate else None
+
+
 def _fraction(text: str, precision: int) -> str:
     p = min(precision, 6)
     return "." + (text + "000000")[:p] if p > 0 else ""
@@ -225,6 +234,13 @@ def _ssl_args(sslmode: str, sslrootcert: str | None) -> dict[str, Any]:
 
 class MySQLAdapter(Adapter):
     engine = "mysql"
+    supports_row_filters = True
+    supports_sampling = True
+    # Each connection opens its own snapshot: workers reconcile live tables, a baseline
+    # is taken on one connection (see shares_snapshot).
+    supports_workers = True
+    replication_methods = ("replica", "dms")
+    dms_schema = "awsdms_control"
 
     def __init__(
         self,
@@ -241,6 +257,7 @@ class MySQLAdapter(Adapter):
         rows_per_second: int = 0,
         connect_timeout: int = 10,
     ) -> None:
+        self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
         params: dict[str, Any] = {
             "host": host,
             "port": port,
@@ -288,6 +305,75 @@ class MySQLAdapter(Adapter):
         with self.conn.cursor() as cur:
             cur.execute(q, args)
             return list(cur.fetchall())
+
+    def _rows(self, q: str, args: Sequence[Any]) -> list[tuple[Any, ...]]:
+        return self._query(q.format(*["%s"] * len(args)), list(args))
+
+    def fork(self, snapshot: dict[str, Any] | None = None) -> MySQLAdapter:
+        if snapshot is not None:
+            raise NotImplementedError("MySQL cannot share a snapshot between connections")
+        return MySQLAdapter(**self._kwargs)
+
+    # replication ----------------------------------------------------------------
+    def _replica_status(self, channel: str) -> dict[str, Any] | None:
+        for stmt in ("SHOW REPLICA STATUS", "SHOW SLAVE STATUS"):
+            try:
+                with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
+                    cur.execute(stmt)
+                    rows = list(cur.fetchall())
+            except pymysql.err.MySQLError:
+                continue
+            for r in rows:
+                if (r.get("Channel_Name") or "") == channel:
+                    return r
+            return None
+        return None
+
+    def _executed(self, channel: str) -> str | None:
+        """The replica channel's executed source binlog position, as file:offset."""
+        r = self._replica_status(channel)
+        if r is None:
+            return None
+        log = r.get("Relay_Source_Log_File") or r.get("Relay_Master_Log_File")
+        pos = r.get("Exec_Source_Log_Pos") or r.get("Exec_Master_Log_Pos")
+        return f"{log}:{pos}" if log else None
+
+    def replication_applied(self, method: str, name: str) -> str | None:
+        """replica: run on the target. The GTID set it has executed when GTIDs are on,
+        else the replica channel's executed source position (name; empty for the
+        default channel). SHOW REPLICA STATUS needs the REPLICATION CLIENT privilege."""
+        if method != "replica":
+            raise NotImplementedError(method)
+        (executed,) = self._query("SELECT @@GLOBAL.gtid_executed")[0]
+        executed = (executed or "").replace("\n", "")
+        return executed or self._executed(name)
+
+    def replication_reached(
+        self, method: str, name: str, kind: str, position: str
+    ) -> tuple[str, bool] | None:
+        """With a GTID position the target must have executed every transaction in the
+        source's set (an RDS or Aurora read replica promoted at cutover included); with a
+        binlog position the replica channel must have executed up to it."""
+        if method != "replica":
+            raise NotImplementedError(method)
+        if kind == "gtid":
+            (executed,) = self._query("SELECT @@GLOBAL.gtid_executed")[0]
+            executed = (executed or "").replace("\n", "")
+            (subset,) = self._query("SELECT GTID_SUBSET(%s, %s)", (position, executed))[0]
+            return executed or "(no transactions)", bool(subset)
+        if kind != "binlog":
+            raise NotImplementedError(kind)
+        applied = self._executed(name)
+        if applied is None:
+            return None
+        return applied, self.position_key(kind, applied) >= self.position_key(kind, position)
+
+    @staticmethod
+    def position_key(kind: str, position: str) -> Any:
+        if kind != "binlog":
+            raise NotImplementedError(kind)
+        log, _, pos = position.rpartition(":")
+        return int(log.rpartition(".")[2] or 0), int(pos)
 
     # snapshot -----------------------------------------------------------------
     def begin_snapshot(self) -> dict[str, Any]:
@@ -382,15 +468,20 @@ class MySQLAdapter(Adapter):
         key = combine_sql([digests[i] for i in plan.key_positions]) if plan.key_columns else row
         keys = "".join(f", {e} AS k{i}" for i, e in enumerate(self._key_sql(plan)))
         q = f"SELECT {row} AS rh, {key} AS kh{keys} FROM {self._ident(plan.table)}"
+        where = all_of(where, _excluding(plan.filter))
         return q + (f" WHERE {where}" if where else "")
 
     def bucket_aggregates(self, plan: HashPlan) -> dict[int, BucketAggregate]:
         if not self._pushdown(plan):
             return self._bucket_aggregates_fallback(plan)
         ascii_rows = _ascii_sql(plan.columns)
+        bucket = f"MOD({unsigned64_sql('kh')}, {int(plan.buckets)})"
+        # the bucket test sits on the scan, so rows outside a sample are never hashed
+        # past the key
+        sample = "" if plan.sample is None else f" WHERE {in_list(bucket, plan.sample)}"
         q = (
-            f"SELECT MOD({unsigned64_sql('kh')}, {int(plan.buckets)}) AS b, COUNT(*), "
-            f"SUM({unsigned64_sql('rh')}) FROM ({self._hash_query(plan, ascii_rows)}) h GROUP BY b"
+            f"SELECT {bucket} AS b, COUNT(*), SUM({unsigned64_sql('rh')}) "
+            f"FROM ({self._hash_query(plan, ascii_rows)}) h{sample} GROUP BY b"
         )
         out = {int(b): BucketAggregate(int(c), int(t)) for b, c, t in self._query(q)}
         if ascii_rows:
@@ -399,6 +490,7 @@ class MySQLAdapter(Adapter):
 
     def _stream(self, plan: HashPlan, where: str | None = None) -> Iterator[list[Any]]:
         cols = ", ".join(quote(c) for c, _ in plan.columns)
+        where = all_of(where, _excluding(plan.filter))
         q = f"SELECT {cols} FROM {self._ident(plan.table)}" + (f" WHERE {where}" if where else "")
         interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         types = [t for _, t in plan.columns]
@@ -417,9 +509,13 @@ class MySQLAdapter(Adapter):
     ) -> dict[int, BucketAggregate]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = into if into is not None else {}
+        sample = None if plan.sample is None else set(plan.sample)
         for row in self._stream(plan, where):
             rh, kh = hasher.hash_row(row)
-            agg = out.setdefault(_value64(kh) % plan.buckets, BucketAggregate(0, 0))
+            b = _value64(kh) % plan.buckets
+            if sample is not None and b not in sample:
+                continue
+            agg = out.setdefault(b, BucketAggregate(0, 0))
             agg.count += 1
             agg.total += _value64(rh)
         return out
@@ -478,10 +574,12 @@ class MySQLAdapter(Adapter):
             for r in self._query(q, args)
         }
 
-    def float_stats(self, table: TableRef, column: str) -> FloatStats:
+    def float_stats(self, table: TableRef, column: str, where: str | None = None) -> FloatStats:
         c = quote(column)
+        w = f" WHERE {_excluding(where)}" if where else ""
         n, nn, lo, hi, total = self._query(
-            f"SELECT COUNT(*), COUNT({c}), MIN({c}), MAX({c}), SUM({c}) FROM {self._ident(table)}"
+            f"SELECT COUNT(*), COUNT({c}), MIN({c}), MAX({c}), SUM({c}) "
+            f"FROM {self._ident(table)}{w}"
         )[0]
         return FloatStats(
             int(n), int(nn), lo, hi, float(total) if total is not None else None, 0, 0

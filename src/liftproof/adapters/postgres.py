@@ -224,7 +224,19 @@ class PostgresAdapter(Adapter):
             "taken_at": at.isoformat(),
         }
 
-    replication_methods = ("subscription", "slot")
+    replication_methods = ("subscription", "slot", "dms")
+    dms_schema = "public"
+
+    def _rows(self, q: str, args: Sequence[Any]) -> list[tuple[Any, ...]]:
+        with self.conn.cursor() as cur:
+            cur.execute(q.format(*["%s"] * len(args)), list(args))
+            rows = list(cur.fetchall())
+        if not self.conn.autocommit and not self._in_snapshot:
+            self.conn.rollback()
+        return rows
+
+    def shares_snapshot(self, position: dict[str, Any]) -> bool:
+        return bool(position.get("snapshot_id"))
 
     def current_position(self) -> dict[str, Any] | None:
         with self.conn.cursor() as cur:

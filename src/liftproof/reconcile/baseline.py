@@ -254,8 +254,13 @@ def take_baseline(
             )
 
         n = min(workers, len(todo))
-        if n > 1 and not (source.supports_workers and position.get("snapshot_id")):
-            progress(f"parallel workers are not available for {source.engine}; one at a time")
+        # a baseline is one state of the database: workers only when every connection
+        # can read the snapshot this one holds
+        if n > 1 and not (source.supports_workers and source.shares_snapshot(position)):
+            progress(
+                f"{source.engine} cannot share this snapshot between connections; "
+                "tables are baselined one at a time"
+            )
             n = 1
         if n <= 1:
             for ref in todo:

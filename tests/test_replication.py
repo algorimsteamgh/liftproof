@@ -73,9 +73,14 @@ def test_unverified_without_a_method_or_a_position():
 def test_config_rules():
     assert ReplicationConfig.from_dict(None).method == "none"
     with pytest.raises(ConfigError, match="must be one of"):
-        ReplicationConfig.from_dict({"method": "dms"})
+        ReplicationConfig.from_dict({"method": "goldengate"})
     with pytest.raises(ConfigError, match="name is required"):
         ReplicationConfig.from_dict({"method": "slot"})
+    with pytest.raises(ConfigError, match="name is required"):
+        ReplicationConfig.from_dict({"method": "dms"})
+    assert ReplicationConfig.from_dict({"method": "replica"}).name is None  # default channel
+    with pytest.raises(ConfigError, match="plain name"):
+        ReplicationConfig.from_dict({"method": "dms", "name": "T", "control_schema": "a;b"})
 
 
 # --------------------------------------------------------- real replication
