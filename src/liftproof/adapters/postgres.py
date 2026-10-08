@@ -212,6 +212,44 @@ class PostgresAdapter(Adapter):
             "taken_at": at.isoformat(),
         }
 
+    replication_methods = ("subscription", "slot")
+
+    def current_position(self) -> dict[str, Any] | None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text "
+                "ELSE pg_current_wal_lsn()::text END"
+            )
+            (lsn,) = cur.fetchone()
+        return {"type": "lsn", "position": lsn}
+
+    def replication_applied(self, method: str, name: str) -> str | None:
+        """subscription: run on the target, native logical replication from a PostgreSQL
+        source. slot: run on the source, any consumer of a logical slot (AWS DMS included);
+        the slot's confirmed position is what the consumer has applied and acknowledged."""
+        if method == "subscription":
+            q = (
+                "SELECT latest_end_lsn::text FROM pg_stat_subscription "
+                "WHERE subname = %s AND relid IS NULL"
+            )
+        elif method == "slot":
+            q = "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = %s"
+        else:
+            raise NotImplementedError(method)
+        with self.conn.cursor() as cur:
+            cur.execute(q, (name,))
+            row = cur.fetchone()
+        if not self.conn.autocommit and not self._in_snapshot:
+            self.conn.rollback()
+        return row[0] if row and row[0] else None
+
+    @staticmethod
+    def position_key(kind: str, position: str) -> Any:
+        if kind != "lsn":
+            raise NotImplementedError(kind)
+        hi, lo = position.split("/")
+        return (int(hi, 16) << 32) + int(lo, 16)
+
     def end_snapshot(self) -> None:
         if self._in_snapshot:
             self.conn.rollback()

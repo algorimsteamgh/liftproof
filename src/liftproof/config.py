@@ -19,6 +19,7 @@ from liftproof.errors import ConfigError
 from liftproof.files.compare import FileSetConfig, IgnoreFile
 from liftproof.reconcile.engine import ReconcileOptions
 from liftproof.reconcile.plan import IgnoreRule
+from liftproof.reconcile.replication import ReplicationConfig
 from liftproof.schedule import Schedule, parse_schedules
 
 FORBIDDEN_KEYS = re.compile(
@@ -180,6 +181,7 @@ def _options(
         diff_row_limit=int(d.get("diff_row_limit", 100)),
         show_values=bool(d.get("show_values", False)),
     )
+    opts.replication = ReplicationConfig.from_dict(d.get("replication"))
     breaker = d.get("circuit_breaker") or {}
     opts.breaker_bucket_ratio = float(breaker.get("bucket_ratio", opts.breaker_bucket_ratio))
     opts.breaker_table_ratio = float(breaker.get("table_ratio", opts.breaker_table_ratio))
@@ -399,6 +401,11 @@ database:
     # - table: orders
     #   column: last_synced_at
     #   reason: rewritten by ETL
+  # replication:                # has replication applied everything up to the reference point?
+  #   method: slot              # slot (on a PostgreSQL source, e.g. read by AWS DMS),
+  #                             # subscription (PostgreSQL logical replication, on the target)
+  #   name: dms_slot
+  #   wait_seconds: 300         # wait this long for it to catch up; then not_checked
 
 # schedules:                    # run by mvt-scheduler.service; runs never overlap
 #   - name: nightly

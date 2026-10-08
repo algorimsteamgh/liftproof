@@ -25,6 +25,7 @@ from liftproof.canonical import RowHasher, column_digest, reduce_total
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity
 from liftproof.reconcile.baseline import Baseline
 from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table
+from liftproof.reconcile.replication import REASON_BEHIND, ReplicationConfig, check
 
 DB = Comparator.DATABASE
 
@@ -47,6 +48,7 @@ class ReconcileOptions:
     breaker_min_buckets: int = 4
     breaker_table_ratio: float = 0.8
     breaker_min_tables: int = 5
+    replication: ReplicationConfig = field(default_factory=ReplicationConfig)
 
 
 @dataclass
@@ -72,6 +74,7 @@ class TableResult:
 class ReconcileResult:
     tables: list[TableResult] = field(default_factory=list)
     systemic: bool = False
+    replication: dict[str, Any] | None = None  # the position check, for the report
 
     def status_counts(self) -> Counter:
         return Counter(t.status for t in self.tables)
@@ -150,6 +153,8 @@ class Reconciler:
         target_schemas = list(dict.fromkeys(self.o.schema_map.get(x, x) for x in self.o.schemas))
         target_tables = {t.qualified.lower(): t for t in self.target.list_tables(target_schemas)}
         source_tables = self._selected(source_tables)
+        if self._replication_behind(source_tables):
+            return self.result
 
         for t in sorted(set(target_tables) - {self._target_key(s) for s in source_tables}):
             if self.o.tables:
@@ -212,6 +217,40 @@ class Reconciler:
                     detail={"tables_checked": done, "tables_different": mismatched},
                 )
         return self.result
+
+    def _replication_behind(self, tables: Sequence[TableRef]) -> bool:
+        """Spec 9.2: before any difference is reported, replication must have applied
+        through the reference position. Not compared against a target baseline: there
+        the reference is the target itself."""
+        if self.against_target:
+            return False
+        if self.baseline is not None:
+            position = self.baseline.position
+        else:
+            position = self.source.current_position() if self.source else None
+        r = check(self.o.replication, position, source=self.source, target=self.target)
+        self.result.replication = {
+            "status": r.status,
+            "method": r.method,
+            "position": r.position,
+            "applied": r.applied,
+            "detail": r.detail,
+            "waited_seconds": r.waited_seconds,
+        }
+        if not r.behind:
+            return False
+        for table in tables:
+            self.emit(
+                Kind.NOT_CHECKED,
+                Severity.MEDIUM,
+                table.qualified,
+                f"{REASON_BEHIND}: {r.detail}",
+                detail={"reason": REASON_BEHIND, "position": r.position, "applied": r.applied},
+            )
+            self.result.tables.append(
+                TableResult(table.qualified, "not_checked", reason=REASON_BEHIND)
+            )
+        return True
 
     # -------------------------------------------------------------------- table
     def _table(self, table: TableRef, ttable: TableRef) -> TableResult:

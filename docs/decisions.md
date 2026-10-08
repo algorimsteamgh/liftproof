@@ -52,12 +52,13 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 48 | Replay KPI conditions | sample checkout journey, 150 ms server latency, 60 replays, worst first attempt ratio of the whole journey's wall clock (recording: first navigation to last settled step; replay: the same span of the attempt). Step timings in the report are measured the same way on both sides: from the action to the end of the last request it caused | Against a local server with no latency the ratio measures only the fixed waits (DOM quiet period); a real application answers across a network. The first version divided replay time including finding and filling fields by recorded time counting only network, so the tool's own work counted against the target: 2.56 on a CI runner for a journey that replays in about the time it was recorded | Yes |
 | 49 | Source and target hashed at once | the two bucket aggregate queries run concurrently, each on its own connection | Halves the wall time per table; each database's own load is unchanged, which is what spec 9.15 protects | Yes |
 | 50 | Drill-down one bucket at a time | `bucket_rows` yields one bucket's keys and hashes at a time, both sides in step (PostgreSQL in one ordered pass on a server side cursor; other engines one query per bucket by default); only the rows the report can show are kept | Spec 17: nothing loads a table into memory. 13 mismatched buckets of a million row table took 565 MB before, 52 MB after | Yes |
+| 51 | Replication position check | `database.replication`: `slot` (a logical slot on a PostgreSQL source, whoever consumes it, AWS DMS included; read on the source) or `subscription` (PostgreSQL logical replication; read on the target), with `wait_seconds` to wait for it to catch up. The reference is the source baseline's position, or the live source's position at the start of the run. Behind: every table not_checked with "replication behind the baseline point", never a difference. The result is in the report's range block; with no method it says "unverified" | Spec 9.2 and 18. These two cover the PostgreSQL sources; MySQL (GTID), Oracle (SCN) and SQL Server (LSN) checks are added to those adapters after their PRs merge. Not run against a target baseline, whose reference is the target itself | Yes |
 
 ## Not built yet
 
 Web UI, parallel journeys, the target watermark that
 excludes rows a replay created when reconciliation must follow replay (validate already
 reconciles first), extractor transform chains (base64, URL encoding) for correlations,
-replication position assertion on the target,
+replication position checks for MySQL, Oracle and SQL Server sources,
 row predicate ignore rules, sampled mode, multi worker snapshots
 (`pg_export_snapshot` is captured but workers are not used yet).
