@@ -22,7 +22,7 @@ from liftproof.canonical.encoding import (
     row_hash,
     value64,
 )
-from liftproof.canonical.render import render
+from liftproof.canonical.render import Verbatim, render
 from liftproof.canonical.types import CanonicalType
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "NULL_FRAME",
     "CanonicalType",
     "RowHasher",
+    "Verbatim",
     "aggregate",
     "bucket_of",
     "column_digest",

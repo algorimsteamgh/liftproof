@@ -93,3 +93,162 @@ def browser_available():
             launch(p).close()
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"no browser for tests: {str(exc).splitlines()[0]}")
+
+
+# ------------------------------------------------------------------------ MySQL
+MY = {
+    "host": os.environ.get("LIFTPROOF_TEST_MYSQL_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("LIFTPROOF_TEST_MYSQL_PORT", "33306")),
+    "user": os.environ.get("LIFTPROOF_TEST_MYSQL_USER", "root"),
+    "password": os.environ.get("LIFTPROOF_TEST_MYSQL_PASSWORD", "ci-only-local-service"),
+}
+
+
+def _my_connect(database: str | None = None):
+    import pymysql
+
+    return pymysql.connect(
+        host=MY["host"], port=MY["port"], user=MY["user"], password=MY["password"],
+        database=database, charset="utf8mb4", autocommit=True, connect_timeout=3,
+    )
+
+
+@pytest.fixture(scope="session")
+def mysql_available():
+    import pymysql
+
+    try:
+        _my_connect().close()
+    except pymysql.err.MySQLError:
+        pytest.skip("no MySQL server for tests")
+
+
+@pytest.fixture
+def make_mysql_db(mysql_available):
+    """Factory creating throwaway MySQL databases; returns (dbname, raw cursor).
+
+    The raw session runs with an empty sql_mode so tests can store zero dates.
+    """
+    created: list[str] = []
+    conns = []
+
+    def factory(prefix: str = "t"):
+        name = f"liftproof_{prefix}_{uuid.uuid4().hex[:8]}"
+        with _my_connect() as c, c.cursor() as cur:
+            cur.execute(f"CREATE DATABASE `{name}` CHARACTER SET utf8mb4")
+        created.append(name)
+        conn = _my_connect(name)
+        conns.append(conn)
+        cur = conn.cursor()
+        cur.execute("SET SESSION sql_mode = ''")
+        cur.execute("SET SESSION time_zone = '+00:00'")
+        return name, cur
+
+    yield factory
+    for c in conns:
+        c.close()
+    with _my_connect() as c, c.cursor() as cur:
+        for name in created:
+            cur.execute(f"DROP DATABASE IF EXISTS `{name}`")
+
+
+@pytest.fixture
+def mysql_adapter_for():
+    from liftproof.adapters.mysql import MySQLAdapter
+
+    opened: list[MySQLAdapter] = []
+
+    def factory(dbname: str, read_only: bool = True) -> MySQLAdapter:
+        a = MySQLAdapter(
+            host=MY["host"], port=MY["port"], database=dbname, user=MY["user"],
+            password=MY["password"], sslmode="disable", read_only=read_only,
+        )
+        opened.append(a)
+        return a
+
+    yield factory
+    for a in opened:
+        a.close()
+
+
+# Oracle ---------------------------------------------------------------------------------
+ORA = {
+    "host": os.environ.get("LIFTPROOF_TEST_ORACLE_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("LIFTPROOF_TEST_ORACLE_PORT", "1521")),
+    "service": os.environ.get("LIFTPROOF_TEST_ORACLE_SERVICE", "FREEPDB1"),
+    "user": os.environ.get("LIFTPROOF_TEST_ORACLE_USER", "system"),
+    "password": os.environ.get("LIFTPROOF_TEST_ORACLE_PASSWORD", "ci-only-local-service"),
+}
+
+
+def _ora_connect(user: str | None = None, password: str | None = None):
+    import oracledb
+
+    return oracledb.connect(
+        user=user or ORA["user"],
+        password=password or ORA["password"],
+        host=ORA["host"],
+        port=ORA["port"],
+        service_name=ORA["service"],
+        tcp_connect_timeout=3,
+    )
+
+
+@pytest.fixture(scope="session")
+def oracle_available():
+    import oracledb
+
+    try:
+        _ora_connect().close()
+    except oracledb.Error:
+        pytest.skip("no Oracle server for tests")
+
+
+@pytest.fixture
+def make_oracle_db(oracle_available):
+    """Factory creating throwaway Oracle schemas (users); returns (schema, raw cursor).
+
+    The raw session runs in UTC and autocommits, like the other engines' fixtures.
+    """
+    created: list[str] = []
+    conns = []
+
+    def factory(prefix: str = "t"):
+        name = f"LP_{prefix}_{uuid.uuid4().hex[:8]}".upper()
+        with _ora_connect() as c, c.cursor() as cur:
+            cur.execute(f'CREATE USER "{name}" NO AUTHENTICATION QUOTA UNLIMITED ON USERS')
+        created.append(name)
+        conn = _ora_connect()
+        conn.autocommit = True
+        conns.append(conn)
+        cur = conn.cursor()
+        cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{name}"')
+        cur.execute("ALTER SESSION SET TIME_ZONE = '+00:00'")
+        return name, cur
+
+    yield factory
+    for c in conns:
+        c.close()
+    with _ora_connect() as c, c.cursor() as cur:
+        for name in created:
+            cur.execute(f'DROP USER "{name}" CASCADE')
+
+
+@pytest.fixture
+def oracle_adapter_for():
+    from liftproof.adapters.oracle import OracleAdapter
+
+    opened: list[OracleAdapter] = []
+
+    def factory(read_only: bool = True, **kw) -> OracleAdapter:
+        a = OracleAdapter(
+            host=ORA["host"], port=ORA["port"], database=ORA["service"],
+            user=kw.pop("user", ORA["user"]), password=kw.pop("password", ORA["password"]),
+            sslmode="disable", read_only=read_only, **kw,
+        )
+        opened.append(a)
+        return a
+
+    yield factory
+    for a in opened:
+        a.close()
