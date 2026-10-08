@@ -100,6 +100,10 @@ def plan_table(
             if tcol.canonical != ctype:
                 if {ctype, tcol.canonical} <= {CanonicalType.CHAR, CanonicalType.TEXT}:
                     ctype = CanonicalType.TEXT  # strip rule only fires when both are fixed width
+                elif {ctype, tcol.canonical} == {CanonicalType.INTEGER, CanonicalType.DECIMAL}:
+                    # a whole number renders the same either way (Oracle NUMBER to bigint);
+                    # a fraction lost in the move shows up as a changed value
+                    ctype = CanonicalType.DECIMAL
                 else:
                     issues.append(
                         ColumnIssue(
