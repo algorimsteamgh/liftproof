@@ -77,6 +77,11 @@
   <table><tr><th>Object</th><th>Reason</th></tr>
   {% for n in r.coverage.not_covered %}<tr><td>{{ n.object }}</td><td>{{ n.reason }}</td></tr>{% endfor %}
   </table>{% endif %}
+  {% if r.coverage.sampled %}
+  <p><strong>Sampled: only part of these tables was compared</strong></p>
+  <table><tr><th>Table</th><th class="num">Rows compared</th></tr>
+  {% for s in r.coverage.sampled %}<tr><td>{{ s.object }}</td><td class="num">{{ s.percent }}%</td></tr>{% endfor %}
+  </table>{% endif %}
   {% if r.coverage.partially_compared %}
   <p><strong>Compared on a subset of columns</strong></p>
   <table><tr><th>Table</th><th>Columns not compared</th></tr>
@@ -110,7 +115,7 @@
   <div class="scroll"><table>
     <tr><th>Table</th><th>Status</th><th class="num">Source rows</th><th class="num">Target rows</th><th class="num">Missing</th><th class="num">Only in target</th><th class="num">Changed</th><th>Key</th></tr>
     {% for t in r.tables %}
-    <tr><td><code>{{ t.table }}</code>{% if t.partial %} <span class="sub">(partial)</span>{% endif %}</td>
+    <tr><td><code>{{ t.table }}</code>{% if t.partial %} <span class="sub">(partial)</span>{% endif %}{% if t.sampled_percent is not none %} <span class="sub">(sampled, {{ t.sampled_percent }}% of rows)</span>{% endif %}</td>
       <td class="status-{{ t.status }}">{{ t.status|replace("_"," ") }}</td>
       <td class="num">{{ t.source_rows|num }}</td><td class="num">{{ t.target_rows|num }}</td>
       <td class="num">{{ t.missing_rows|num }}</td><td class="num">{{ t.extra_rows|num }}</td>

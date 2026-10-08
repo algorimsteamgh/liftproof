@@ -143,6 +143,7 @@ def _excluding(predicate: str | None) -> sql.Composable:
 class PostgresAdapter(Adapter):
     engine = "postgresql"
     supports_row_filters = True
+    supports_sampling = True
 
     def __init__(
         self,
@@ -341,15 +342,23 @@ class PostgresAdapter(Adapter):
         if not self._pushdown(plan):
             return self._bucket_aggregates_fallback(plan)
         q = sql.SQL(
-            "SELECT mod({kh}, {n})::int AS b, count(*), sum({rh}) FROM ({inner}) h GROUP BY 1"
+            "SELECT mod({kh}, {n})::int AS b, count(*), sum({rh}) FROM ({inner}) h{sample} "
+            "GROUP BY 1"
         ).format(
             kh=unsigned64_sql(sql.SQL("kh")),
             rh=unsigned64_sql(sql.SQL("rh")),
             n=sql.Literal(plan.buckets),
             inner=self._hash_query(plan),
+            # the bucket test is pushed into the scan, so rows outside the sample are
+            # never row hashed: sampling saves the expensive part of the work
+            sample=sql.SQL("")
+            if plan.sample is None
+            else sql.SQL(" WHERE mod({kh}, {n})::int = ANY(%s)").format(
+                kh=unsigned64_sql(sql.SQL("kh")), n=sql.Literal(plan.buckets)
+            ),
         )
         with self.conn.cursor() as cur:
-            cur.execute(q)
+            cur.execute(q, None if plan.sample is None else (list(plan.sample),))
             return {b: BucketAggregate(c, int(t)) for b, c, t in cur.fetchall()}
 
     def _stream(self, plan: HashPlan) -> Iterator[tuple[Any, ...]]:
@@ -372,6 +381,8 @@ class PostgresAdapter(Adapter):
         for row in self._stream(plan):
             rh, kh = hasher.hash_row(row)
             b = value64(kh) % plan.buckets
+            if plan.sample is not None and b not in plan.sample:
+                continue
             agg = out.setdefault(b, BucketAggregate(0, 0))
             agg.count += 1
             agg.total += value64(rh)

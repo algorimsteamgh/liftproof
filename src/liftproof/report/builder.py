@@ -150,6 +150,11 @@ def build_report(
             "files_coverage_pct": _pct(f_attempted, f_total),
             "files_success_pct": _pct(f_matched, f_attempted),
             "not_covered": not_covered,
+            "sampled": [
+                {"object": t.table, "percent": t.sampled_percent}
+                for t in tables
+                if t.sampled_percent is not None
+            ],
             "partially_compared": [
                 {"object": t.table, "excluded_columns": t.excluded_columns}
                 for t in tables

@@ -257,6 +257,7 @@ def _save_results(run_dir: Path, result: ReconcileResult) -> None:
             {
                 "systemic": result.systemic,
                 "replication": result.replication,
+                "sample_seed": result.sample_seed,
                 "tables": [t.__dict__ for t in result.tables],
             },
             indent=2,
@@ -271,7 +272,10 @@ def _load_results(run_dir: Path) -> ReconcileResult:
         return ReconcileResult()
     d = json.loads(p.read_text(encoding="utf-8"))
     return ReconcileResult(
-        [TableResult(**t) for t in d["tables"]], d["systemic"], d.get("replication")
+        [TableResult(**t) for t in d["tables"]],
+        d["systemic"],
+        d.get("replication"),
+        d.get("sample_seed"),
     )
 
 
@@ -715,6 +719,13 @@ def _report(
                 ),
                 "consistency_position": baseline.position if baseline else "live read",
                 "replication": result.replication,
+                "sampling": None
+                if result.sample_seed is None
+                else {
+                    "above_rows": o.sample_above_rows,
+                    "percent": o.sample_percent,
+                    "seed": result.sample_seed,
+                },
             }
         )
         metadata.update(
