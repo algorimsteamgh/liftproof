@@ -104,9 +104,12 @@ def render_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sql
 
 
 def digest_sql(rendered: sql.Composable) -> sql.Composable:
-    return sql.SQL(
-        "CASE WHEN {r} IS NULL THEN {n} ELSE md5(octet_length({r})::text || chr(31) || {r}) END"
-    ).format(r=rendered, n=sql.Literal(NULL_DIGEST))
+    # A NULL rendering makes the concatenation, and so the md5, NULL. Naming the rendering
+    # twice rather than three times (CASE WHEN r IS NULL ...) matters: the planner does not
+    # share repeated expressions, and the rendering is most of the per row cost.
+    return sql.SQL("coalesce(md5(octet_length({r})::text || chr(31) || {r}), {n})").format(
+        r=rendered, n=sql.Literal(NULL_DIGEST)
+    )
 
 
 def combine_sql(digests: Sequence[sql.Composable]) -> sql.Composable:
@@ -123,9 +126,9 @@ def unsigned64_sql(hex_hash: sql.Composable) -> sql.Composable:
     bit(64)::bigint is signed, so negative values are lifted by 2**64.
     """
     signed = sql.SQL("(('x' || substr({}, 1, 16))::bit(64)::bigint)").format(hex_hash)
-    return sql.SQL("({s}::numeric + CASE WHEN {s} < 0 THEN {m} ELSE 0 END)").format(
-        s=signed, m=sql.SQL(TWO_64)
-    )
+    # One reference to the hash: the subquery is flattened, so each reference to rh or kh
+    # recomputes the whole row hash.
+    return sql.SQL("mod({s}::numeric + {m}, {m})").format(s=signed, m=sql.SQL(TWO_64))
 
 
 class PostgresAdapter(Adapter):
@@ -346,6 +349,45 @@ class PostgresAdapter(Adapter):
             cur.execute(q, (sorted(wanted),))
             for row in cur:
                 yield tuple(row[2:]), row[0]
+
+    def bucket_rows(
+        self, plan: HashPlan, buckets: set[int]
+    ) -> Iterator[tuple[int, dict[tuple[Any, ...], str]]]:
+        """One pass over the table, ordered by bucket through a server side cursor, so
+        only one bucket's keys and hashes are held here at a time."""
+        if not self._pushdown(plan):
+            yield from super().bucket_rows(plan, buckets)
+            return
+        wanted = sorted(set(buckets))
+        q = sql.SQL(
+            "SELECT b, rh, {keys} FROM (SELECT mod({kh}, {n})::int AS b, h.* FROM ({inner}) h) x "
+            "WHERE b = ANY(%s) ORDER BY b"
+        ).format(
+            keys=sql.SQL(", ").join(sql.Identifier(f"k{i}") for i in range(len(plan.key_columns))),
+            kh=unsigned64_sql(sql.SQL("kh")),
+            n=sql.Literal(plan.buckets),
+            inner=self._hash_query(plan),
+        )
+        pending = iter(wanted)
+        current: int | None = None
+        rows: dict[tuple[Any, ...], str] = {}
+        with self.conn.transaction(), self.conn.cursor(name="liftproof_buckets") as cur:
+            cur.itersize = 5000
+            cur.execute(q, (wanted,))
+            for b, rh, *key in cur:
+                if b != current:
+                    if current is not None:
+                        yield current, rows
+                    for empty in pending:  # buckets before this one had no rows
+                        if empty == b:
+                            break
+                        yield empty, {}
+                    current, rows = b, {}
+                rows[tuple(key)] = rh
+        if current is not None:
+            yield current, rows
+        for empty in pending:
+            yield empty, {}
 
     def fetch_rows(
         self, plan: HashPlan, keys: Sequence[tuple[Any, ...]]

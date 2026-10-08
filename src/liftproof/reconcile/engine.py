@@ -12,9 +12,11 @@ says what has changed in the target since it was accepted, down to the bucket.
 
 from __future__ import annotations
 
+import heapq
 import math
 from collections import Counter
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -295,7 +297,7 @@ class Reconciler:
         ):
             s_aggs = base_entry.buckets
         elif self.source is not None:
-            s_aggs = self.source.bucket_aggregates(plan)
+            s_aggs = None  # hashed below, at the same time as the target
         else:
             res.status = "not_checked"
             res.reason = (
@@ -307,7 +309,16 @@ class Reconciler:
             return res
 
         tplan = _target_plan(plan, tschema)
-        t_aggs = self.target.bucket_aggregates(tplan)
+        if s_aggs is None:
+            # Two databases, two connections: hashing both at once halves the wall time,
+            # and each database's own load is unchanged (spec 17: the source is the
+            # resource to protect, not the clock).
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                s_job = pool.submit(self.source.bucket_aggregates, plan)
+                t_aggs = self.target.bucket_aggregates(tplan)
+                s_aggs = s_job.result()
+        else:
+            t_aggs = self.target.bucket_aggregates(tplan)
         res.target_rows = sum(a.count for a in t_aggs.values())
 
         # 1. row counts
@@ -367,30 +378,47 @@ class Reconciler:
             and len(bad) / plan.buckets > self.o.breaker_bucket_ratio
         )
         drill = bad[:1] if systemic else bad
-        src_rows = list(self.source.row_hashes(plan, set(drill)))
-        tgt_rows = list(self.target.row_hashes(tplan, set(drill)))
         if plan.key_columns:
-            self._keyed(q, plan, tplan, src_rows, tgt_rows, res, systemic)
+            self._keyed(q, plan, tplan, set(drill), res, systemic)
         else:
-            self._keyless(q, src_rows, tgt_rows, res)
+            self._keyless(q, plan, tplan, set(drill), res)
         return res
 
     # ------------------------------------------------------------------ details
-    def _keyed(self, q, plan, tplan, src_rows, tgt_rows, res, systemic) -> None:
-        s = dict(src_rows)
-        t = dict(tgt_rows)
-        missing = sorted(set(s) - set(t), key=_natural)
-        extra = sorted(set(t) - set(s), key=_natural)
-        changed = sorted((k for k in set(s) & set(t) if s[k] != t[k]), key=_natural)
-        res.missing_rows, res.extra_rows, res.changed_rows = len(missing), len(extra), len(changed)
+    def _keyed(self, q, plan, tplan, buckets, res, systemic) -> None:
+        """Bucket by bucket, both sides in step: one bucket's keys are held at a time, and
+        of each kind of difference only the rows that can be shown are kept."""
         limit = self.o.diff_row_limit
+        keep = 5 if systemic else limit
+        missing: list[tuple] = []
+        extra: list[tuple] = []
+        changed: list[tuple] = []
+        counts = [0, 0, 0]
+        pairs = zip(
+            self.source.bucket_rows(plan, buckets),
+            self.target.bucket_rows(tplan, buckets),
+            strict=True,
+        )
+        for (sb, s), (tb, t) in pairs:
+            if sb != tb:
+                raise RuntimeError(f"adapters yielded buckets {sb} and {tb} out of step")
+            found = (
+                [k for k in s if k not in t],
+                [k for k in t if k not in s],
+                [k for k in s if k in t and s[k] != t[k]],
+            )
+            for i, (kept, new) in enumerate(zip((missing, extra, changed), found, strict=True)):
+                counts[i] += len(new)
+                kept[:] = heapq.nsmallest(keep, kept + new, key=_natural)
+        res.missing_rows, res.extra_rows, res.changed_rows = counts
+        n_missing, n_extra, n_changed = counts
         keyname = ", ".join(plan.key_columns)
 
         def fmt(k: tuple) -> str:
             return f"{keyname} = {', '.join('NULL' if v is None else v for v in k)}"
 
         if systemic:
-            self._systemic(q, plan, tplan, changed[:5], len(changed), res)
+            self._systemic(q, plan, tplan, changed[:5], n_changed, res)
             return
         shown = 0
         for k in missing:
@@ -421,18 +449,18 @@ class Reconciler:
         if changed and remaining:
             self._changed(q, plan, tplan, changed[:remaining], fmt)
             shown += min(len(changed), remaining)
-        total = len(missing) + len(extra) + len(changed)
+        total = n_missing + n_extra + n_changed
         self.emit(
             Kind.DIFFERENCE,
             Severity.HIGH,
             q,
-            f"{total:,} differing rows: {len(missing):,} missing in target, "
-            f"{len(extra):,} only in target, {len(changed):,} changed "
+            f"{total:,} differing rows: {n_missing:,} missing in target, "
+            f"{n_extra:,} only in target, {n_changed:,} changed "
             f"(showing {min(total, limit):,})",
             detail={
-                "missing": len(missing),
-                "extra": len(extra),
-                "changed": len(changed),
+                "missing": n_missing,
+                "extra": n_extra,
+                "changed": n_changed,
                 "shown": min(total, limit),
                 "limit": limit,
             },
@@ -508,13 +536,19 @@ class Reconciler:
             },
         )
 
-    def _keyless(self, q, src_rows, tgt_rows, res) -> None:
-        s = Counter(h for _, h in src_rows)
-        t = Counter(h for _, h in tgt_rows)
-        missing = s - t
-        extra = t - s
-        res.missing_rows = sum(missing.values())
-        res.extra_rows = sum(extra.values())
+    def _keyless(self, q, plan, tplan, buckets, res) -> None:
+        """A multiset of row hashes per bucket (identical rows share a bucket), one bucket
+        at a time; only the first hashes of each kind are kept for the report."""
+        missing: list[str] = []
+        extra: list[str] = []
+        for b in sorted(buckets):
+            s = Counter(h for _, h in self.source.row_hashes(plan, {b}))
+            t = Counter(h for _, h in self.target.row_hashes(tplan, {b}))
+            m, e = s - t, t - s
+            res.missing_rows += sum(m.values())
+            res.extra_rows += sum(e.values())
+            missing += list(m)[: 20 - len(missing)]
+            extra += list(e)[: 20 - len(extra)]
         self.emit(
             Kind.DIFFERENCE,
             Severity.HIGH,
@@ -522,8 +556,8 @@ class Reconciler:
             f"table has no key; compared as a multiset of rows: "
             f"{res.missing_rows:,} rows missing in target, {res.extra_rows:,} only in target",
             detail={
-                "missing_hashes": [_short(h) for h in list(missing)[:20]],
-                "extra_hashes": [_short(h) for h in list(extra)[:20]],
+                "missing_hashes": [_short(h) for h in missing],
+                "extra_hashes": [_short(h) for h in extra],
             },
         )
 

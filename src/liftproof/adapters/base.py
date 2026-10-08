@@ -121,6 +121,17 @@ class Adapter(abc.ABC):
         For a keyless plan the key values are the empty tuple.
         """
 
+    def bucket_rows(
+        self, plan: HashPlan, buckets: set[int]
+    ) -> Iterator[tuple[int, dict[tuple[Any, ...], str]]]:
+        """Yield (bucket, {key values: row hash}) for each wanted bucket in ascending order,
+        including empty ones, one bucket in memory at a time (spec 17: nothing loads a
+        table). For a keyless plan use row_hashes: keys are not unique there.
+
+        This default issues one query per bucket; an adapter can do it in one pass."""
+        for b in sorted(buckets):
+            yield b, dict(self.row_hashes(plan, {b}))
+
     @abc.abstractmethod
     def fetch_rows(
         self, plan: HashPlan, keys: Sequence[tuple[Any, ...]]

@@ -22,6 +22,7 @@ from urllib.parse import urljoin
 
 from liftproof.web import correlate
 from liftproof.web.browser import (
+    POLL_S,
     Captured,
     NetworkLog,
     dom_settled,
@@ -86,10 +87,19 @@ class JourneyRun:
     flakes: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     failure_kind: str | None = None  # ambiguous | not_found | transport | secret | crash
+    wall_ms: float | None = None  # this attempt, first step to last settled step
 
     @property
     def total_ms(self) -> float:
         return sum(s.duration_ms or 0.0 for s in self.steps)
+
+
+def step_duration(acted_ms: float, exchanges: list[Captured]) -> float | None:
+    """From the action to the end of the last request it caused, as the recorder measures
+    a step, so a source to target timing compares the applications and not the tool
+    (finding the element, filling a field). None for a step that made no request."""
+    ends = [c.started + (c.exchange.duration_ms or 0.0) for c in exchanges]
+    return round(max(max(ends) - acted_ms, 0.0), 1) if ends else None
 
 
 def _candidate(page: Any, c: dict[str, str]) -> Any:
@@ -208,6 +218,7 @@ class Replayer:
         page = context.new_page()
         net = NetworkLog(page)
         whole = journey.non_idempotent
+        began = time.perf_counter()
         for step in journey.steps:
             sr = StepRun(step.n, step.action)
             run.steps.append(sr)
@@ -236,6 +247,7 @@ class Replayer:
                         {"step": step.n, "attempt": attempt, "error": sr.error, "unit": "step"}
                     )
         run.status = "completed"
+        run.wall_ms = round((time.perf_counter() - began) * 1000, 1)
         return False
 
     def _step(
@@ -249,10 +261,10 @@ class Replayer:
         secrets: dict[str, str],
     ) -> None:
         net.drain()  # anything left from a failed attempt is not this step's
-        t0 = time.perf_counter()
         timeout = self.step_timeout_ms
         if step.action == "goto":
             url = urljoin(self.target_url, self._substitute(step.url, run, secrets).lstrip("/"))
+            acted = time.time() * 1000
             page.goto(url, wait_until="load", timeout=timeout)
         else:
             target, index = resolve(page, step.locator, timeout)
@@ -261,6 +273,7 @@ class Replayer:
                 sr.degraded_from = step.locator.candidates[0]
             mark_region(target)
             value = self._substitute(step.value, run, secrets)
+            acted = time.time() * 1000  # the element is found: the action happens now
             match step.action:
                 case "click":
                     target.click(timeout=timeout)
@@ -277,7 +290,7 @@ class Replayer:
         sr.exchanges = self._await_requests(page, net, step, run, timeout)
         page.wait_for_load_state("load", timeout=timeout)
         sr.exchanges += net.drain()
-        sr.duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+        sr.duration_ms = step_duration(acted, sr.exchanges)
         dom_settled(page)
         sr.region = region_snapshot(page)
         for token, value in secrets.items():  # a textbox shows its value in the tree
@@ -304,10 +317,14 @@ class Replayer:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return got
+            # Short slices, then look again: a request that finished before this wait
+            # began (a navigation's own document, typically) is delivered to the log
+            # while waiting but never satisfies the waiter, which used to sit out the
+            # whole step timeout.
             try:
-                page.wait_for_event("requestfinished", timeout=remaining * 1000)
-            except Exception:  # noqa: BLE001 - out of time: compare what arrived
-                return got + net.drain()
+                page.wait_for_event("requestfinished", timeout=min(remaining, POLL_S) * 1000)
+            except Exception:  # noqa: BLE001, S110 - a slice ended: drain and check again
+                pass
 
     def _correlate(self, journey: Journey, sr: StepRun, run: JourneyRun) -> None:
         for c in journey.correlations:

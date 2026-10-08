@@ -38,12 +38,13 @@ packages = ["src/liftproof"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not perf'"
 markers = [
   "postgres: needs a PostgreSQL server (LIFTPROOF_TEST_PG_HOST)",
   "browser: needs Chromium for Playwright (or LIFTPROOF_CHROMIUM)",
   "mysql: needs a MySQL server (LIFTPROOF_TEST_MYSQL_HOST)",
   "oracle: needs an Oracle server (LIFTPROOF_TEST_ORACLE_HOST)",
+  "perf: the KPI performance suite (PRD N8, N9); run with -m perf",
 ]
 
 [tool.ruff]
