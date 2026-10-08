@@ -5,7 +5,8 @@ its database behave before a migration, checks the same behaviour afterwards, an
 produces the report a release manager signs at go live.
 
 This repository is being built against the *Migration Validation Tool* PRD and Technical
-Specification (Draft 1). This first increment is the database core: PRD F2 (baseline),
+Specification (Draft 1). Supported databases: PostgreSQL and MySQL (8.0 and later, including Aurora), as source
+or target, in any combination. This first increment is the database core: PRD F2 (baseline),
 F6 (reconcile), F8/F9 (reports), F11 (CLI and exit codes), F14 (credentials) and F15
 (storage).
 
@@ -33,9 +34,11 @@ liftproof reconcile --project acme.yaml --baseline latest
 
 ## Tests
 
-`pytest` runs everything. Database tests need PostgreSQL: set `LIFTPROOF_TEST_PG_HOST`,
-`LIFTPROOF_TEST_PG_PORT` and `LIFTPROOF_TEST_PG_USER` (CI uses a service container); they are
-skipped when no server is reachable. The suite includes the golden vectors that pin the
+`pytest` runs everything. Database tests need PostgreSQL and MySQL: set
+`LIFTPROOF_TEST_PG_HOST`, `_PORT`, `_USER`, `_PASSWORD` and `LIFTPROOF_TEST_MYSQL_HOST`,
+`_PORT`, `_USER`, `_PASSWORD` (CI uses service containers); they are skipped when no
+server is reachable. Cross engine tests load the same data into both and require identical
+hashes. The suite includes the golden vectors that pin the
 canonical wire format, pushdown against fallback parity for every type rule, and the
 PRD F6 acceptance test (a ten row injected difference, reported exactly).
 

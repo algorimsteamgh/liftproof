@@ -16,8 +16,11 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 9 | Values in reports | hidden by default; `--show-values` or `show_values: true` | The report is an egress path (spec 15) | Yes |
 | 10 | AWS keys in the environment | warn, do not refuse | They are part of the default provider chain (AWSAPI-005); database passwords in the environment are refused | Yes |
 | 11 | Credentials when no `secret_arn` is set | connect without a password (for local development and IAM auth later) | Never from a file or environment variable | Yes |
-
 | 12 | Infrastructure | Terraform modules for the customer deployment and the Algorims build account; Packer AMI on Amazon Linux 2023 | The spec names CloudFormation and Terraform; Terraform first, CloudFormation for the Marketplace listing next | Yes |
+| 13 | Second database engine | MySQL 8.0 and later (Aurora MySQL 3), via PyMySQL | The most common lift and shift engine, a pure Python driver, and a real cross engine test against PostgreSQL. Oracle and SQL Server follow | Yes |
+| 14 | MySQL driver version | PyMySQL below 1.2 | PyMySQL 1.2.3 fails the full `caching_sha2_password` login exchange; lift the cap once fixed upstream | Yes |
+| 15 | Schema names across engines | `database.schema_map`, defaulting to the source home schema mapped onto the target's (MySQL `shop` to PostgreSQL `public`) | In MySQL a schema is the database; a migration usually renames it | Yes |
+| 16 | MySQL replication position | GTID set (or binlog file and position) read immediately after the snapshot opens, recorded with `exact: false` | MySQL does not expose the position of a consistent snapshot atomically; the alternative, a global read lock, is not acceptable on a production source | Yes |
 
 ## Not built yet
 
