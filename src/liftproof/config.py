@@ -159,6 +159,9 @@ def _home_schema(conn: Connection | None) -> str:
     return "public"
 
 
+UNSAFE_SQL = re.compile(r";|--|/\*|\*/")
+
+
 def _options(
     d: dict[str, Any], source: Connection | None, target: Connection | None
 ) -> ReconcileOptions:
@@ -169,7 +172,24 @@ def _options(
                 f"database.ignore.{i}: every ignore rule needs a reason; "
                 "the reasons are printed in the report"
             )
-        ignore.append(IgnoreRule(r["table"], r["reason"], r.get("column")))
+        rule = IgnoreRule(
+            r["table"],
+            r["reason"],
+            r.get("column"),
+            r.get("where"),
+            r.get("source_where"),
+            r.get("target_where"),
+        )
+        if rule.rows and rule.column:
+            raise ConfigError(f"database.ignore.{i}: a rule leaves out a column or rows, not both")
+        for key in ("where", "source_where", "target_where"):
+            pred = getattr(rule, key)
+            if pred is not None and (not str(pred).strip() or UNSAFE_SQL.search(str(pred))):
+                raise ConfigError(
+                    f"database.ignore.{i}.{key}: a row predicate is one SQL condition, "
+                    "without ';' or comments"
+                )
+        ignore.append(rule)
     opts = ReconcileOptions(
         schemas=list(d.get("schemas") or [_home_schema(source)]),
         schema_map=_schema_map(d.get("schema_map"), source, target, d.get("schemas")),
@@ -401,6 +421,13 @@ database:
     # - table: orders
     #   column: last_synced_at
     #   reason: rewritten by ETL
+    # - table: orders               # rows left out on both sides: one SQL condition
+    #   where: "status = 'ARCHIVED'"
+    #   reason: archived orders are not migrated
+    # - table: accounts             # or per side, each in its own dialect
+    #   source_where: "tenant = 'test'"
+    #   target_where: "tenant = 'qa'"
+    #   reason: test tenant renamed in the target
   # replication:                # has replication applied everything up to the reference point?
   #   method: slot              # slot (on a PostgreSQL source, e.g. read by AWS DMS),
   #                             # subscription (PostgreSQL logical replication, on the target)

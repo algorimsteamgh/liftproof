@@ -131,8 +131,18 @@ def unsigned64_sql(hex_hash: sql.Composable) -> sql.Composable:
     return sql.SQL("mod({s}::numeric + {m}, {m})").format(s=signed, m=sql.SQL(TWO_64))
 
 
+def _excluding(predicate: str | None) -> sql.Composable:
+    """Keep the rows the predicate does not match; a NULL result keeps the row too. The
+    predicate comes from the project file (config refuses statement separators and
+    comments) and runs in a read only transaction."""
+    if not predicate:
+        return sql.SQL("")
+    return sql.SQL(" WHERE ({}) IS NOT TRUE").format(sql.SQL(predicate))  # noqa: S608
+
+
 class PostgresAdapter(Adapter):
     engine = "postgresql"
+    supports_row_filters = True
 
     def __init__(
         self,
@@ -316,7 +326,7 @@ class PostgresAdapter(Adapter):
         digests = self._digests_sql(plan)
         row = combine_sql(digests)
         key = combine_sql([digests[i] for i in plan.key_positions]) if plan.key_columns else row
-        return sql.SQL("SELECT {row} AS rh, {key} AS kh{keys} FROM {t}").format(
+        return sql.SQL("SELECT {row} AS rh, {key} AS kh{keys} FROM {t}{where}").format(
             row=row,
             key=key,
             keys=sql.SQL("").join(
@@ -324,6 +334,7 @@ class PostgresAdapter(Adapter):
                 for i, e in enumerate(self._key_sql(plan))
             ),
             t=self._ident(plan.table),
+            where=_excluding(plan.filter),
         )
 
     def bucket_aggregates(self, plan: HashPlan) -> dict[int, BucketAggregate]:
@@ -343,7 +354,9 @@ class PostgresAdapter(Adapter):
 
     def _stream(self, plan: HashPlan) -> Iterator[tuple[Any, ...]]:
         cols = sql.SQL(", ").join(sql.Identifier(c) for c, _ in plan.columns)
-        q = sql.SQL("SELECT {} FROM {}").format(cols, self._ident(plan.table))
+        q = sql.SQL("SELECT {} FROM {}{}").format(
+            cols, self._ident(plan.table), _excluding(plan.filter)
+        )
         interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         with self.conn.transaction(), self.conn.cursor(name="liftproof_stream") as cur:
             cur.itersize = 5000
@@ -448,15 +461,15 @@ class PostgresAdapter(Adapter):
             cur.execute(q)
             return {tuple(r[:nk]): list(r[nk:]) for r in cur.fetchall()}
 
-    def float_stats(self, table: TableRef, column: str) -> FloatStats:
+    def float_stats(self, table: TableRef, column: str, where: str | None = None) -> FloatStats:
         c = sql.Identifier(column)
         finite = sql.SQL("{c} NOT IN ('NaN', 'Infinity', '-Infinity')").format(c=c)
         q = sql.SQL(
             "SELECT count(*), count({c}), min({c}) FILTER (WHERE {f}), max({c}) FILTER (WHERE {f}),"
             " sum({c}::numeric) FILTER (WHERE {f}),"
             " count(*) FILTER (WHERE {c} = 'NaN'),"
-            " count(*) FILTER (WHERE {c} IN ('Infinity', '-Infinity')) FROM {t}"
-        ).format(c=c, f=finite, t=self._ident(table))
+            " count(*) FILTER (WHERE {c} IN ('Infinity', '-Infinity')) FROM {t}{w}"
+        ).format(c=c, f=finite, t=self._ident(table), w=_excluding(where))
         with self.conn.cursor() as cur:
             cur.execute(q)
             n, nn, lo, hi, total, nan, inf = cur.fetchone()
