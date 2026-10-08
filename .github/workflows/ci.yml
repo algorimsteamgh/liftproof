@@ -27,6 +27,14 @@ jobs:
         options: >-
           --health-cmd "mysqladmin ping -h 127.0.0.1 -pci-only-local-service"
           --health-interval 5s --health-timeout 5s --health-retries 20
+      oracle:
+        image: gvenzl/oracle-free:23-slim-faststart
+        env:
+          ORACLE_PASSWORD: ci-only-local-service
+        ports: ["1521:1521"]
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s --health-timeout 5s --health-retries 30
     env:
       LIFTPROOF_TEST_PG_HOST: localhost
       LIFTPROOF_TEST_PG_PORT: "5432"
@@ -36,6 +44,11 @@ jobs:
       LIFTPROOF_TEST_MYSQL_PORT: "3306"
       LIFTPROOF_TEST_MYSQL_USER: root
       LIFTPROOF_TEST_MYSQL_PASSWORD: ci-only-local-service
+      LIFTPROOF_TEST_ORACLE_HOST: 127.0.0.1
+      LIFTPROOF_TEST_ORACLE_PORT: "1521"
+      LIFTPROOF_TEST_ORACLE_SERVICE: FREEPDB1
+      LIFTPROOF_TEST_ORACLE_USER: system
+      LIFTPROOF_TEST_ORACLE_PASSWORD: ci-only-local-service
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v7

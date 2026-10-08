@@ -27,6 +27,9 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 20 | Waiting at replay | the requests the step made when recorded, then the page load, then no DOM change for 150 ms; step timeout 15 s; 3 attempts per step, 2 per journey that changes state | Conditions, not sleeps (spec 6). The DOM quiet period stops a snapshot racing the page's own rendering script | Yes |
 | 21 | Journey with an unbound redaction token | not replayed; reported as not run, so coverage drops; `doctor` lists it beforehand | Replaying without the real secret would fail at login and read as a migration defect | Yes |
 | 22 | API calls during recording and replay | fetched through a Playwright route so the body is held before the page sees it | A page that navigates straight after an API call discards that body before it can be read | Yes |
+| 23 | Third database engine | Oracle 19c and later (RDS for Oracle), via python-oracledb in thin mode | The largest legacy source estate; thin mode needs no Oracle client on the image. SQL Server follows | Yes |
+| 24 | Oracle snapshot and position | One `SET TRANSACTION READ ONLY` transaction; the SCN read right after it begins, recorded with `exact: false`, or unknown without `SELECT` on `V$DATABASE` | Oracle answers every query in a read only transaction as of its start; `AS OF SCN` flashback queries need undo retention the source may not have | Yes |
+| 25 | Integer against decimal columns | Planned together as decimal instead of a type change | Oracle `NUMBER` keys move to `bigint`; the renderings agree for whole numbers, so excluding the column would hide real differences | Yes |
 
 ## Not built yet
 

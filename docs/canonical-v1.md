@@ -74,6 +74,40 @@ MySQL has no Unicode normalisation function, so a row whose text and char values
 ASCII is hashed in the database and every other row is hashed application side; the two
 are summed. The cost is proportional to the non-ASCII rows only.
 
+Oracle sessions pin `TIME_ZONE='+00:00'` and `NLS_NUMERIC_CHARACTERS='.,'`; every
+rendering uses an explicit format, so no other NLS setting matters.
+
+### Oracle type mapping and engine specific rules
+
+| Oracle | Canonical | Note |
+|---|---|---|
+| NUMBER(p), NUMBER(p,0), INTEGER, NUMBER(p,-s) | integer | |
+| NUMBER(p,s), NUMBER | decimal | unconstrained NUMBER compares with an integer column (below) |
+| FLOAT, BINARY_FLOAT, BINARY_DOUBLE | float | statistical comparison only; NaN and infinity counted for the binary types |
+| VARCHAR2, NVARCHAR2, CLOB, NCLOB | text | LOB tables are hashed application side |
+| CHAR, NCHAR | char | |
+| DATE | timestamp (naive) | an Oracle DATE has a time of day; a target `date` column is reported as a type change |
+| TIMESTAMP(n) | timestamp (naive) | nanoseconds are truncated to the precision, as everywhere |
+| TIMESTAMP WITH TIME ZONE, WITH LOCAL TIME ZONE | timestamptz | converted to UTC |
+| RAW, BLOB | binary | |
+| JSON (21c and later) | json | always hashed application side |
+| BOOLEAN (23ai) | boolean | |
+| LONG, LONG RAW, INTERVAL, ROWID, XMLTYPE, spatial and the rest | unsupported | reported as not checked |
+
+An integer column on one side and a decimal column on the other (the common Oracle
+`NUMBER` to PostgreSQL `bigint` move) are both rendered as decimal: a whole number renders
+identically under either rule, and a fraction lost in the move is a changed value.
+
+Oracle stores the empty string as NULL. Text that is empty on the other engine and NULL in
+Oracle is reported as a difference: it is one, and an application that tests for `''` or
+`IS NULL` behaves differently after the move.
+
+Oracle has no exact NFC function (`COMPOSE` composes without decomposing first) and SQL
+strings stop at 4000 bytes, so a row is hashed in the database only when its text values
+are plain ASCII of at most 3990 characters, its RAW values are at most 1995 bytes, and its
+decimals print without an exponent. Every other row is hashed application side; the two
+are summed.
+
 ## 3. Framing and hashing
 
 ```
