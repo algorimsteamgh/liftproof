@@ -36,6 +36,7 @@ from liftproof.errors import (
     LiftproofError,
     RunFailed,
 )
+from liftproof.files.compare import FileResult
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity, read_findings
 from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import Reconciler, ReconcileResult, TableResult
@@ -279,9 +280,38 @@ def _reconcile_into(
                 a.close()
 
 
-def _run(args: argparse.Namespace, mode: str, *, database: bool, web: bool) -> int:
-    """One run: database first, then replay (spec 6: the tool creates data and must not
-    then reconcile it), then one report over every finding."""
+def _files_into(args: argparse.Namespace, project: Project, writer: FindingWriter) -> FileResult:
+    from dataclasses import replace
+
+    from liftproof.files.compare import compare_files
+    from liftproof.files.sources import open_source
+
+    sets = project.require_files()
+    wanted = [x.strip() for x in (getattr(args, "sets", None) or "").split(",") if x.strip()]
+    if wanted:
+        unknown = sorted(set(wanted) - {c.name for c in sets})
+        if unknown:
+            raise ConfigError(f"no file set named {', '.join(unknown)} in the project")
+        sets = [c for c in sets if c.name in wanted]
+    if getattr(args, "show_values", False):
+        sets = [replace(c, show_content=True) for c in sets]
+
+    def side(c, which: str):
+        return open_source(
+            getattr(c, which),
+            endpoint_url=getattr(c, f"{which}_endpoint_url"),
+            secret_arn=getattr(c, f"{which}_secret_arn"),
+        )
+
+    return compare_files(sets, writer.write, side)
+
+
+def _run(
+    args: argparse.Namespace, mode: str, *, database: bool, web: bool, files: bool = False
+) -> int:
+    """One run: database first, then files, then replay (spec 6: replay creates data,
+    and must not then be reconciled or compared against), then one report over every
+    finding."""
     project = _project(args)
     workdir = Path(args.workdir) / project.name
     store = _store(project, Path(args.workdir))
@@ -293,8 +323,10 @@ def _run(args: argparse.Namespace, mode: str, *, database: bool, web: bool) -> i
     writer = FindingWriter(run_dir, run_id)
     result: ReconcileResult | None = ReconcileResult() if database else None
     web_result = None
+    files_result: FileResult | None = None
     baseline = None
     failure: str | None = None
+    stage = Comparator.DATABASE
     try:
         if database:
             try:
@@ -303,7 +335,11 @@ def _run(args: argparse.Namespace, mode: str, *, database: bool, web: bool) -> i
                 result = getattr(exc, "partial_result", result)
                 baseline = getattr(exc, "baseline", None)
                 raise
+        if files:
+            stage = Comparator.FILE
+            files_result = _files_into(args, project, writer)
         if web:
+            stage = Comparator.UI
             web_result = _replay_into(args, project, store, workdir, writer)
     except ConfigError:
         raise
@@ -316,7 +352,7 @@ def _run(args: argparse.Namespace, mode: str, *, database: bool, web: bool) -> i
         if failure:
             writer.write(
                 Finding(
-                    Comparator.DATABASE if database and web_result is None else Comparator.UI,
+                    stage,
                     Kind.ERROR,
                     Severity.CRITICAL,
                     "run",
@@ -330,6 +366,10 @@ def _run(args: argparse.Namespace, mode: str, *, database: bool, web: bool) -> i
             (run_dir / "web-results.json").write_text(
                 json.dumps(web_result.to_dict(), indent=2), encoding="utf-8"
             )
+        if files_result is not None:
+            (run_dir / "files-results.json").write_text(
+                json.dumps(files_result.to_dict(), indent=2), encoding="utf-8"
+            )
 
     report = _report(
         project,
@@ -340,6 +380,7 @@ def _run(args: argparse.Namespace, mode: str, *, database: bool, web: bool) -> i
         started,
         baseline,
         web_result=web_result,
+        files_result=files_result,
         failure=failure,
         template=args.template,
     )
@@ -356,6 +397,10 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return _run(args, args.command, database=False, web=True)
 
 
+def cmd_files(args: argparse.Namespace) -> int:
+    return _run(args, "files", database=False, web=False, files=True)
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     project = _project(args)
     return _run(
@@ -363,6 +408,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         "validate",
         database=project.source is not None,
         web=project.web is not None,
+        files=bool(project.files),
     )
 
 
@@ -532,6 +578,7 @@ def _report(
     baseline,
     *,
     web_result=None,
+    files_result=None,
     failure=None,
     template=None,
 ) -> dict[str, Any]:
@@ -570,6 +617,10 @@ def _report(
             }
         )
         metadata["browser"] = web_result.browser
+    if files_result is not None:
+        range_block["file_sets"] = [
+            {"name": s.name, "source": s.source, "target": s.target} for s in files_result.sets
+        ]
     report = build_report(
         run_id=run_id,
         project=project.name,
@@ -577,6 +628,7 @@ def _report(
         findings=findings,
         db=result,
         web=web_result,
+        files=files_result,
         started_at=started,
         finished_at=_now(),
         metadata=metadata,
@@ -602,6 +654,11 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
         lines.append(
             f"journeys: {c['journeys']} ({c['journeys_passed']} passed, "
             f"{c['journeys_different']} different, {c['journeys_failed']} failed)"
+        )
+    if c["files"]:
+        lines.append(
+            f"files: {c['files']} ({c['files_matched']} matched, {c['files_different']} "
+            f"different, {c['files_missing']} missing)"
         )
     lines.append(f"differences: {c['differences']}, not checked: {c['not_checked']}")
     lines.append(f"report: {html}")
@@ -639,6 +696,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     )
     started = prior.get("run", {}).get("started_at", _now())
     web_file = run_dir / "web-results.json"
+    files_file = run_dir / "files-results.json"
     report = _report(
         project,
         args.run,
@@ -650,6 +708,11 @@ def cmd_report(args: argparse.Namespace) -> int:
         web_result=(
             WebResult.from_dict(json.loads(web_file.read_text(encoding="utf-8")))
             if web_file.exists()
+            else None
+        ),
+        files_result=(
+            FileResult.from_dict(json.loads(files_file.read_text(encoding="utf-8")))
+            if files_file.exists()
             else None
         ),
         failure=prior.get("failure"),
@@ -735,6 +798,30 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             return f"chromium {version}"
 
         check("browser starts", _browser, "the AMI ships Chromium; set web.chromium_path")
+    for fs in project.files:
+        for which in ("source", "target"):
+
+            def _listing(c=fs, w=which):
+                from liftproof.files.sources import open_source
+
+                src = open_source(
+                    getattr(c, w),
+                    endpoint_url=getattr(c, f"{w}_endpoint_url"),
+                    secret_arn=getattr(c, f"{w}_secret_arn"),
+                )
+                n = 0
+                for _ in src.entries():
+                    n += 1
+                    if n >= 1000:
+                        break
+                return f"{src.describe()}: {n if n < 1000 else '1000+'} file(s) listed"
+
+            check(
+                f"file set {fs.name} {which} readable",
+                _listing,
+                "mount the share on the instance read only, or grant s3:ListBucket and "
+                "s3:GetObject on the prefix to the instance role",
+            )
     if project.store.s3_bucket:
 
         def _s3():
@@ -860,8 +947,20 @@ def build_parser() -> argparse.ArgumentParser:
     run_flags(s, database=False)
     s.set_defaults(fn=cmd_replay)
 
-    s = with_project("validate", "full run: reconcile, then replay, then one report")
+    s = with_project("files", "compare the files of each file set, source against target")
+    s.add_argument("--sets", help="comma separated file set names; default: all")
+    s.add_argument(
+        "--show-values",
+        action="store_true",
+        help="print differing text in the report (the report becomes an egress path)",
+    )
+    s.add_argument("--run-id")
+    s.add_argument("--template", help="directory holding a custom report.html.j2")
+    s.set_defaults(fn=cmd_files)
+
+    s = with_project("validate", "full run: reconcile, compare files, then replay, then one report")
     run_flags(s, database=True)
+    s.add_argument("--sets", help="comma separated file set names; default: all")
     s.set_defaults(fn=cmd_validate)
 
     s = with_project("report", "regenerate a report from a run's findings")

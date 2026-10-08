@@ -38,6 +38,22 @@ token at a Secrets Manager secret for replay. Values the server generates (order
 CSRF tokens, ASP.NET view state) are detected as correlations, substituted forward at
 replay, and never reported as differences.
 
+## Files
+
+```bash
+liftproof files    --project acme.yaml                  # every file set in the project
+liftproof files    --project acme.yaml --sets invoices
+```
+
+Each file set pairs a source location with a target location: a path on the instance (a
+local disk, or an NFS or SMB share mounted read only) or an `s3://bucket/prefix`. Files
+are paired by relative path and compared by size and SHA-256; both hashes are reported.
+When the bytes differ, PDF, JSON, CSV and plain text files are also compared as text: the
+same text with different bytes (a regenerated PDF, Windows line endings, a new encoding)
+is a low severity difference that says why, and different text is located to the page,
+line, or row and column. What the text says stays out of the report unless the set sets
+`show_content: true`. `validate` compares files after reconciling and before replaying.
+
 ## Exit codes
 
 | Code | Meaning | Pipeline action |
@@ -71,6 +87,7 @@ src/liftproof/canonical   canonical v1.0 encoding and hashing (docs/canonical-v1
 src/liftproof/adapters    one adapter per database engine
 src/liftproof/reconcile   planning, baselines, reconciliation
 src/liftproof/web         recorder, replay engine, UI and API comparison
+src/liftproof/files       file sources (paths, S3), text extraction, file comparison
 src/liftproof/report      JSON and self contained HTML reports
 src/liftproof/cli.py      the product's complete interface
 docs/decisions.md      defaults chosen where the spec leaves a choice open

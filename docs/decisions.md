@@ -30,10 +30,14 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 23 | Third database engine | Oracle 19c and later (RDS for Oracle), via python-oracledb in thin mode | The largest legacy source estate; thin mode needs no Oracle client on the image. SQL Server follows | Yes |
 | 24 | Oracle snapshot and position | One `SET TRANSACTION READ ONLY` transaction; the SCN read right after it begins, recorded with `exact: false`, or unknown without `SELECT` on `V$DATABASE` | Oracle answers every query in a read only transaction as of its start; `AS OF SCN` flashback queries need undo retention the source may not have | Yes |
 | 25 | Integer against decimal columns | Planned together as decimal instead of a type change | Oracle `NUMBER` keys move to `bigint`; the renderings agree for whole numbers, so excluding the column would hide real differences | Yes |
+| 26 | File content hash | SHA-256, streamed; files paired by relative path, with an optional regex path map and case folding | Files never need the cross engine MD5 of canonical v1.0, and SHA-256 works on a FIPS host. Windows shares moving to S3 change case and folders | Yes |
+| 27 | Document types compared as text | PDF (pypdf, no system libraries), JSON (keys sorted), CSV, TSV and pipe delimited (row and column), and plain text types; up to 64 MB per file | Spec 23 leaves the list open and names PDF first. A pure Python reader keeps the AMI free of extra packages | Yes |
+| 28 | Severity of file findings | missing in target: high; different text or unreadable type: high; only in target: medium; same text, different bytes: low; unreadable or symbolic link: not checked | Spec 10: a byte difference with identical text ranks below a real difference. A symbolic link is never followed, because it can leave the tree | Yes |
+| 29 | Order inside `validate` | reconcile, then files, then replay | Replay creates data and generated files on the target; comparing after it would report them | Yes |
 
 ## Not built yet
 
-File comparator, scheduler, web UI, parallel journeys, the target watermark that
+Scheduler, web UI, parallel journeys, the target watermark that
 excludes rows a replay created when reconciliation must follow replay (validate already
 reconciles first), extractor transform chains (base64, URL encoding) for correlations,
 CloudFormation version of the deployment module, replication position assertion on the target,
