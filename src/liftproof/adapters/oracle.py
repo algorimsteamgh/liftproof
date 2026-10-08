@@ -43,6 +43,8 @@ from liftproof.adapters.base import (
     HashPlan,
     TableRef,
     TableSchema,
+    all_of,
+    in_list,
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest
 from liftproof.canonical import value64 as _value64
@@ -207,6 +209,13 @@ def _pushable_sql(columns: Sequence[tuple[str, CanonicalType]]) -> str | None:
     return " AND ".join(parts) if parts else None
 
 
+def _excluding(predicate: str | None) -> str | None:
+    """Keep the rows a row ignore rule's predicate does not match; a NULL (unknown)
+    result keeps the row too. The predicate comes from the project file (config refuses
+    statement separators and comments) and runs in a read only transaction."""
+    return f"CASE WHEN ({predicate}) THEN 1 ELSE 0 END = 0" if predicate else None
+
+
 def _json_value(value: Any) -> Any:
     """oracledb decodes JSON numbers as Decimal; json.loads would give int or float."""
     if isinstance(value, dict):
@@ -262,6 +271,9 @@ def _ssl_args(sslmode: str, sslrootcert: str | None) -> dict[str, Any]:
 class OracleAdapter(Adapter):
     engine = "oracle"
     hash_probe = "SELECT STANDARD_HASH('liftproof', 'MD5') FROM DUAL"
+    supports_row_filters = True
+    supports_sampling = True
+    supports_workers = True
 
     def __init__(
         self,
@@ -278,6 +290,7 @@ class OracleAdapter(Adapter):
         rows_per_second: int = 0,
         connect_timeout: int = 10,
     ) -> None:
+        self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
         params = oracledb.ConnectParams(
             host=host,
             port=port,
@@ -310,6 +323,7 @@ class OracleAdapter(Adapter):
         self._settings["snapshot"] = "SET TRANSACTION READ ONLY"
         self._natives: dict[TableRef, dict[str, str]] = {}
         self._in_snapshot = False
+        self._flashback = False
 
     def close(self) -> None:
         try:
@@ -325,6 +339,9 @@ class OracleAdapter(Adapter):
         with self.conn.cursor() as cur:
             cur.execute(q, args or [])
             return list(cur.fetchall())
+
+    def _rows(self, q: str, args: Sequence[Any]) -> list[tuple[Any, ...]]:
+        return self._query(q.format(*[f":{i + 1}" for i in range(len(args))]), list(args))
 
     # snapshot -----------------------------------------------------------------
     def begin_snapshot(self) -> dict[str, Any]:
@@ -362,9 +379,46 @@ class OracleAdapter(Adapter):
         }
 
     def end_snapshot(self) -> None:
+        if self._flashback:
+            with self.conn.cursor() as cur:
+                cur.execute("BEGIN DBMS_FLASHBACK.DISABLE; END;")
+            self._flashback = False
         if self._in_snapshot:
             self.conn.rollback()
             self._in_snapshot = False
+
+    def _flashback_to(self, scn: str) -> None:
+        """Every query on this session from now on reads the database as of the SCN
+        (session flashback). Needs EXECUTE on DBMS_FLASHBACK, and undo retention that
+        still holds the SCN, as a long READ ONLY transaction does."""
+        with self.conn.cursor() as cur:
+            cur.execute("BEGIN DBMS_FLASHBACK.ENABLE_AT_SYSTEM_CHANGE_NUMBER(:1); END;", [int(scn)])
+        self._flashback = True
+        self._in_snapshot = True
+
+    def shares_snapshot(self, position: dict[str, Any]) -> bool:
+        """With the snapshot's SCN, this session and every fork read the database as of
+        that one SCN, which also makes the recorded position exact. Without the SCN or
+        DBMS_FLASHBACK the READ ONLY transaction stays, and the baseline is taken on one
+        connection."""
+        if position.get("type") != "scn" or not position.get("position"):
+            return False
+        self.conn.rollback()  # flashback is enabled outside a transaction
+        try:
+            self._flashback_to(position["position"])
+        except oracledb.Error:
+            with self.conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+            return False
+        position["exact"] = True
+        self._settings["snapshot"] = "DBMS_FLASHBACK at the recorded SCN"
+        return True
+
+    def fork(self, snapshot: dict[str, Any] | None = None) -> OracleAdapter:
+        other = OracleAdapter(**self._kwargs)
+        if snapshot is not None:
+            other._flashback_to(snapshot["position"])
+        return other
 
     # catalogue ----------------------------------------------------------------
     def list_tables(self, schemas: Sequence[str]) -> list[TableRef]:
@@ -454,6 +508,7 @@ class OracleAdapter(Adapter):
         key = combine_sql([digests[i] for i in plan.key_positions]) if plan.key_columns else row
         keys = "".join(f", {e} AS k{i}" for i, e in enumerate(self._key_sql(plan)))
         q = f"SELECT {row} AS rh, {key} AS kh{keys} FROM {self._ident(plan.table)}"
+        where = all_of(where, _excluding(plan.filter))
         return q + (f" WHERE {where}" if where else "")
 
     def bucket_aggregates(self, plan: HashPlan) -> dict[int, BucketAggregate]:
@@ -461,10 +516,11 @@ class OracleAdapter(Adapter):
             return self._bucket_aggregates_fallback(plan)
         pushable = _pushable_sql(plan.columns)
         n = int(plan.buckets)
+        sample = "" if plan.sample is None else f" WHERE {in_list('b', plan.sample, IN_LIST)}"
         q = (
             f"SELECT TO_CHAR(b), COUNT(*), TO_CHAR(SUM(v)) FROM ("
             f"SELECT MOD({unsigned64_sql('kh')}, {n}) AS b, {unsigned64_sql('rh')} AS v "
-            f"FROM ({self._hash_query(plan, pushable)})) GROUP BY b"
+            f"FROM ({self._hash_query(plan, pushable)})){sample} GROUP BY b"
         )
         out = {int(b): BucketAggregate(int(c), int(t)) for b, c, t in self._query(q)}
         if pushable:
@@ -481,6 +537,7 @@ class OracleAdapter(Adapter):
         return ", ".join(cols)
 
     def _stream(self, plan: HashPlan, where: str | None = None) -> Iterator[list[Any]]:
+        where = all_of(where, _excluding(plan.filter))
         q = f"SELECT {self._select_sql(plan)} FROM {self._ident(plan.table)}" + (
             f" WHERE {where}" if where else ""
         )
@@ -502,9 +559,13 @@ class OracleAdapter(Adapter):
     ) -> dict[int, BucketAggregate]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = into if into is not None else {}
+        sample = None if plan.sample is None else set(plan.sample)
         for row in self._stream(plan, where):
             rh, kh = hasher.hash_row(row)
-            agg = out.setdefault(_value64(kh) % plan.buckets, BucketAggregate(0, 0))
+            b = _value64(kh) % plan.buckets
+            if sample is not None and b not in sample:
+                continue
+            agg = out.setdefault(b, BucketAggregate(0, 0))
             agg.count += 1
             agg.total += _value64(rh)
         return out
@@ -531,10 +592,10 @@ class OracleAdapter(Adapter):
             yield from self._fallback_row_hashes(plan, wanted)
             return
         pushable = _pushable_sql(plan.columns)
-        marks = ", ".join(str(int(b)) for b in sorted(wanted))
+        bucket = f"MOD({unsigned64_sql('kh')}, {int(plan.buckets)})"
         q = (
             f"SELECT * FROM ({self._hash_query(plan, pushable)}) "
-            f"WHERE MOD({unsigned64_sql('kh')}, {int(plan.buckets)}) IN ({marks})"
+            f"WHERE {in_list(bucket, sorted(wanted), IN_LIST)}"
         )
         rows = [(tuple(r[2:]), r[0]) for r in self._query(q)]
         if pushable:
@@ -565,9 +626,9 @@ class OracleAdapter(Adapter):
                 out[tuple(r[:nk])] = [prepare(v, t) for v, t in zip(r[nk:], types, strict=True)]
         return out
 
-    def float_stats(self, table: TableRef, column: str) -> FloatStats:
+    def float_stats(self, table: TableRef, column: str, where: str | None = None) -> FloatStats:
         c = quote(column)
-        t = self._ident(table)
+        t = self._ident(table) + (f" WHERE {_excluding(where)}" if where else "")
         if self._native(table).get(column, "").startswith("BINARY_"):
             finite = f"{c} IS NOT NAN AND {c} IS NOT INFINITE"
             n, nn, lo, hi, total, nan, inf = self._query(

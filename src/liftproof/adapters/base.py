@@ -92,6 +92,25 @@ class FloatStats:
     inf_count: int
 
 
+def all_of(*conditions: str | None) -> str | None:
+    """SQL conditions joined with AND, skipping the absent ones; None when none is left."""
+    present = [c for c in conditions if c]
+    if len(present) <= 1:
+        return present[0] if present else None
+    return " AND ".join(f"({c})" for c in present)
+
+
+def in_list(expr: str, values: Sequence[int], chunk: int | None = None) -> str:
+    """expr IN (values), split into OR'ed lists of at most chunk values (Oracle takes
+    1000 expressions in one list)."""
+    vals = [str(int(v)) for v in values]
+    if not vals:
+        return "1 = 0"
+    size = chunk or len(vals)
+    parts = [f"{expr} IN ({', '.join(vals[i : i + size])})" for i in range(0, len(vals), size)]
+    return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
+
+
 class Adapter(abc.ABC):
     engine: str = "abstract"
     hash_probe: str = "SELECT md5('liftproof')"  # doctor: MD5 is usable on this server
@@ -153,8 +172,11 @@ class Adapter(abc.ABC):
 
     # replication position (spec 9.2) -----------------------------------------------
     # Engines that cannot answer leave these as they are; the check then reports that
-    # it is not available rather than guessing.
-    replication_methods: tuple[str, ...] = ()
+    # it is not available rather than guessing. Every engine can be an AWS DMS target.
+    replication_methods: tuple[str, ...] = ("dms",)
+    # Where AWS DMS puts its control tables on this engine when the task does not set
+    # ControlSchema. None: the login's own schema.
+    dms_schema: str | None = None
 
     # Row ignore rules (spec 9.11). An adapter without them gets not_checked tables rather
     # than silently comparing rows it was told to leave out.
@@ -184,6 +206,43 @@ class Adapter(abc.ABC):
     def position_key(kind: str, position: str) -> Any:
         """A sortable form of a position of the given type."""
         raise NotImplementedError(kind)
+
+    def replication_reached(
+        self, method: str, name: str, kind: str, position: str
+    ) -> tuple[str, bool] | None:
+        """(how far replication has got, whether that is at or past position). None:
+        nothing found under that name. Engines whose positions are not ordered (a GTID
+        set) answer the second part themselves."""
+        applied = self.replication_applied(method, name)
+        if applied is None:
+            return None
+        return applied, self.position_key(kind, applied) >= self.position_key(kind, position)
+
+    def _rows(self, q: str, args: Sequence[Any]) -> list[tuple[Any, ...]]:
+        """Run a query with positional parameters written as {0}, {1}...; for the few
+        statements shared by every engine."""
+        raise NotImplementedError(self.engine)
+
+    def dms_status(self, schema: str | None, task: str) -> dict[str, Any] | None:
+        """The AWS DMS task's row in its awsdms_status control table on this (target)
+        database, with lower case keys. None: no such row."""
+        table = f"{schema}.awsdms_status" if schema else "awsdms_status"
+        rows = self._rows(
+            "SELECT task_status, status_time, pending_changes, source_current_timestamp, "
+            f"source_timestamp_applied FROM {table} WHERE task_name = {{0}}",  # noqa: S608
+            [task],
+        )
+        if not rows:
+            return None
+        keys = ("task_status", "status_time", "pending_changes", "source_current_timestamp",
+                "source_timestamp_applied")  # fmt: skip
+        return dict(zip(keys, rows[0], strict=True))
+
+    def shares_snapshot(self, position: dict[str, Any]) -> bool:
+        """Can fork(position) open connections reading the same state as this one? Called
+        before any table is read; an engine may switch this connection to a form of the
+        snapshot it can share. False: a baseline is taken on one connection."""
+        return False
 
     def __enter__(self) -> Adapter:
         return self

@@ -38,6 +38,8 @@ from liftproof.adapters.base import (
     HashPlan,
     TableRef,
     TableSchema,
+    all_of,
+    in_list,
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest
 from liftproof.canonical import value64 as _value64
@@ -223,6 +225,13 @@ def _pushable_sql(columns: Sequence[tuple[str, CanonicalType]]) -> str | None:
     return " AND ".join(parts) if parts else None
 
 
+def _excluding(predicate: str | None) -> str | None:
+    """Keep the rows a row ignore rule's predicate does not match; a NULL (unknown)
+    result keeps the row too. The predicate comes from the project file (config refuses
+    statement separators and comments); the adapter only ever reads."""
+    return f"CASE WHEN ({predicate}) THEN 1 ELSE 0 END = 0" if predicate else None
+
+
 def prepare(value: Any, ctype: CanonicalType) -> Any:
     """python-tds already returns what the reference renderer expects: Decimal for exact
     numbers, zone aware datetimes for datetimeoffset, UUID, bytes."""
@@ -253,6 +262,12 @@ def _tls_args(host: str, sslmode: str, sslrootcert: str | None) -> dict[str, Any
 class SQLServerAdapter(Adapter):
     engine = "sqlserver"
     hash_probe = "SELECT HASHBYTES('MD5', 'liftproof')"
+    supports_row_filters = True
+    supports_sampling = True
+    # Each connection opens its own snapshot: workers reconcile live tables, a baseline
+    # is taken on one connection (SQL Server cannot share a snapshot).
+    supports_workers = True
+    dms_schema = "dbo"
 
     def __init__(
         self,
@@ -269,6 +284,7 @@ class SQLServerAdapter(Adapter):
         rows_per_second: int = 0,
         connect_timeout: int = 10,
     ) -> None:
+        self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
         try:
             self.conn = pytds.connect(
                 port=port,
@@ -318,6 +334,14 @@ class SQLServerAdapter(Adapter):
             else:
                 cur.execute(q)  # no parameters: % in LIKE patterns is literal
             return list(cur.fetchall())
+
+    def _rows(self, q: str, args: Sequence[Any]) -> list[tuple[Any, ...]]:
+        return self._query(q.format(*["%s"] * len(args)), list(args))
+
+    def fork(self, snapshot: dict[str, Any] | None = None) -> SQLServerAdapter:
+        if snapshot is not None:
+            raise NotImplementedError("SQL Server cannot share a snapshot between connections")
+        return SQLServerAdapter(**self._kwargs)
 
     # snapshot -----------------------------------------------------------------
     def begin_snapshot(self) -> dict[str, Any]:
@@ -439,6 +463,7 @@ class SQLServerAdapter(Adapter):
         key = combine_sql([digests[i] for i in plan.key_positions]) if plan.key_columns else row
         keys = "".join(f", {e} AS k{i}" for i, e in enumerate(self._key_sql(plan)))
         q = f"SELECT {row} AS rh, {key} AS kh{keys} FROM {self._ident(plan.table)}"
+        where = all_of(where, _excluding(plan.filter))
         q += f" WHERE {where}" if where else ""
         n = int(plan.buckets)
         return (
@@ -450,9 +475,10 @@ class SQLServerAdapter(Adapter):
         if not self._pushdown(plan):
             return self._bucket_aggregates_fallback(plan)
         pushable = _pushable_sql(plan.columns)
+        sample = "" if plan.sample is None else f" WHERE {in_list('b', plan.sample)}"
         q = (
             "SELECT CAST(b AS varchar(20)), COUNT_BIG(*), CAST(SUM(v) AS varchar(50)) "
-            f"FROM ({self._hash_query(plan, pushable)}) a GROUP BY b"
+            f"FROM ({self._hash_query(plan, pushable)}) a{sample} GROUP BY b"
         )
         out = {int(b): BucketAggregate(int(c), int(t)) for b, c, t in self._query(q)}
         if pushable:
@@ -461,6 +487,7 @@ class SQLServerAdapter(Adapter):
 
     def _stream(self, plan: HashPlan, where: str | None = None) -> Iterator[list[Any]]:
         cols = ", ".join(quote(n) for n, _ in plan.columns)
+        where = all_of(where, _excluding(plan.filter))
         q = f"SELECT {cols} FROM {self._ident(plan.table)}" + (f" WHERE {where}" if where else "")
         interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         types = [t for _, t in plan.columns]
@@ -479,9 +506,13 @@ class SQLServerAdapter(Adapter):
     ) -> dict[int, BucketAggregate]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = into if into is not None else {}
+        sample = None if plan.sample is None else set(plan.sample)
         for row in self._stream(plan, where):
             rh, kh = hasher.hash_row(row)
-            agg = out.setdefault(_value64(kh) % plan.buckets, BucketAggregate(0, 0))
+            b = _value64(kh) % plan.buckets
+            if sample is not None and b not in sample:
+                continue
+            agg = out.setdefault(b, BucketAggregate(0, 0))
             agg.count += 1
             agg.total += _value64(rh)
         return out
@@ -542,11 +573,12 @@ class SQLServerAdapter(Adapter):
                 out[tuple(r[:nk])] = [prepare(v, t) for v, t in zip(r[nk:], types, strict=True)]
         return out
 
-    def float_stats(self, table: TableRef, column: str) -> FloatStats:
+    def float_stats(self, table: TableRef, column: str, where: str | None = None) -> FloatStats:
         c = quote(column)
+        w = f" WHERE {_excluding(where)}" if where else ""
         n, nn, lo, hi, total = self._query(
             f"SELECT COUNT_BIG(*), COUNT_BIG({c}), MIN({c}), MAX({c}), SUM(CAST({c} AS float)) "
-            f"FROM {self._ident(table)}"
+            f"FROM {self._ident(table)}{w}"
         )[0]
         return FloatStats(  # SQL Server stores no NaN and no infinity
             int(n),

@@ -41,6 +41,7 @@ from liftproof.files.compare import FileResult
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity, read_findings
 from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import Reconciler, ReconcileResult, TableResult
+from liftproof.reconcile.replication import SOURCE_SIDE
 from liftproof.report.builder import build_report, who_ran_it, write_reports
 from liftproof.runlock import RunInProgress
 from liftproof.store import LocalStore, S3Store, Store
@@ -985,19 +986,33 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
     if rep.method != "none" and project.source is not None and project.target is not None:
 
         def _replication():
-            conn = project.target if rep.method == "subscription" else project.source
+            conn = project.source if rep.method in SOURCE_SIDE else project.target
             with connect(conn) as a:
                 if rep.method not in a.replication_methods:
                     raise ConfigError(f"{rep.method} is not available for {a.engine}")
+                if rep.method == "dms":
+                    row = a.dms_status(rep.control_schema or a.dms_schema, rep.name or "")
+                    _assert(row is not None, f"DMS task {rep.name!r} not in awsdms_status")
+                    return (
+                        f"dms task {rep.name}: {str(row['task_status']).strip().lower()}, "
+                        f"{row['pending_changes']} changes pending"
+                    )
                 applied = a.replication_applied(rep.method, rep.name or "")
-                _assert(applied is not None, f"{rep.method} {rep.name!r} not found")
-                return f"{rep.method} {rep.name} has applied {applied}"
+                _assert(applied is not None, f"{rep.method} {rep.name or ''!r} not found")
+                return f"{rep.method} {rep.name or ''} has applied {applied}".replace("  ", " ")
 
         check(
             f"replication {rep.method} readable",
             _replication,
-            "check the name; reading pg_stat_subscription or pg_replication_slots needs "
-            "the pg_monitor role (or pg_read_all_stats)",
+            {
+                "dms": "turn on StatusTableEnabled in the task settings, set control_schema "
+                "if the task sets ControlSchema, and grant SELECT on awsdms_status",
+                "replica": "SHOW REPLICA STATUS needs the REPLICATION CLIENT privilege",
+            }.get(
+                rep.method,
+                "check the name; reading pg_stat_subscription or pg_replication_slots needs "
+                "the pg_monitor role (or pg_read_all_stats)",
+            ),
         )
     if project.web is not None:
         workdir = Path(args.workdir) / project.name
