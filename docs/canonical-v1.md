@@ -40,6 +40,39 @@ requires a new `CANONICAL_VERSION`.
 Every connection pins its session settings (PostgreSQL: `TimeZone=UTC`,
 `DateStyle=ISO, YMD`, `extra_float_digits=3`, UTF-8 client encoding) and the manifest
 records them.
+MySQL sessions pin `time_zone='+00:00'`, `sql_mode='NO_ENGINE_SUBSTITUTION'` (so no
+`ANSI_QUOTES`, `PIPES_AS_CONCAT` or `PAD_CHAR_TO_FULL_LENGTH`) and `utf8mb4`.
+
+### MySQL type mapping and engine specific rules
+
+| MySQL | Canonical | Note |
+|---|---|---|
+| tinyint(1) | boolean | MySQL's `BOOLEAN`; any non zero value is `1` |
+| tinyint, smallint, mediumint, int, bigint (signed or unsigned), year | integer | |
+| decimal | decimal | |
+| float, double | float | statistical comparison only |
+| varchar, text types, enum, set | text | enum and set as their label text |
+| char | char | |
+| date | date | |
+| time | time | |
+| datetime | timestamp (naive) | |
+| timestamp | timestamptz | stored as UTC and read in a UTC session |
+| binary, varbinary, blob types | binary | `binary(n)` keeps its zero padding, which is the stored value |
+| json | json | always hashed application side |
+| bit, geometry and the rest | unsupported | reported as not checked |
+
+Values MySQL can store that no other engine can, rendered as MySQL prints them so that
+they always show up as a difference against another engine rather than matching by
+accident:
+
+- zero and partial dates: `0000-00-00`, `2026-00-15`, and as timestamps
+  `0000-00-00T00:00:00[.f]`;
+- a `TIME` outside one day: `-01:02:03.5` renders `-01:02:03.500000` at precision 6,
+  `125:00:00` renders `125:00:00`.
+
+MySQL has no Unicode normalisation function, so a row whose text and char values are all
+ASCII is hashed in the database and every other row is hashed application side; the two
+are summed. The cost is proportional to the non-ASCII rows only.
 
 ## 3. Framing and hashing
 
@@ -87,5 +120,5 @@ bucket       = v(key_hash) mod N;  key_hash = the same pipeline over the key col
 
 - SHA-256 as an alternative for FIPS hosts (MD5 is a hard error there). The pipeline is
   unchanged except the digest function; `v` still takes the first 8 bytes.
-- Engine specific rules still to be written with their adapters: MySQL zero date,
-  SQL Server `datetime` rounding, Oracle empty string, negative zero in floats.
+- Engine specific rules still to be written with their adapters: SQL Server `datetime`
+  rounding, Oracle empty string, negative zero in floats.
