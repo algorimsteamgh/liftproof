@@ -20,6 +20,15 @@ class RenderError(ValueError):
     """A value cannot be rendered under its canonical type."""
 
 
+class Verbatim(str):
+    """A value the adapter rendered itself, used as is.
+
+    Only for engine values that have no canonical type value at all, such as MySQL zero
+    dates or a MySQL TIME outside one day. The adapter's pushdown must render the same
+    text; see docs/canonical-v1.md.
+    """
+
+
 def _decimal(value: Any) -> str:
     d = value if isinstance(value, Decimal) else Decimal(str(value))
     if d.is_nan():
@@ -56,6 +65,8 @@ def render(value: Any, ctype: CanonicalType, *, precision: int = 6) -> str | Non
     """Render one value. Returns None for SQL NULL; framing handles NULL separately."""
     if value is None:
         return None
+    if isinstance(value, Verbatim):
+        return str(value)
     match ctype:
         case CanonicalType.INTEGER:
             if isinstance(value, bool):
