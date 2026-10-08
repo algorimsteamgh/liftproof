@@ -72,6 +72,9 @@ class WebConfig:
     ignore_text: list[str] = field(default_factory=list)
     step_timeout_ms: int = 15_000
     chromium_path: str | None = None
+    # journeys replayed at once (spec 6). 1, the default, is sequential; more is an opt in
+    # for journeys the customer confirms do not interfere, and the report records it
+    parallel_journeys: int = 1
 
 
 @dataclass
@@ -241,7 +244,23 @@ def _web(d: Any) -> WebConfig | None:
         ignore_text=strings("ignore_text"),
         step_timeout_ms=int(d.get("step_timeout_ms", 15_000)),
         chromium_path=d.get("chromium_path"),
+        parallel_journeys=_parallel(d.get("parallel_journeys", 1)),
     )
+
+
+MAX_PARALLEL_JOURNEYS = 8  # each runs its own browser on the instance
+
+
+def _parallel(v: Any) -> int:
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        n = 0
+    if not 1 <= n <= MAX_PARALLEL_JOURNEYS:
+        raise ConfigError(
+            f"web.parallel_journeys is 1 (in sequence, the default) to {MAX_PARALLEL_JOURNEYS}"
+        )
+    return n
 
 
 def _side(d: Any, where: str) -> tuple[str, str | None, str | None]:
@@ -403,6 +422,7 @@ web:                            # record and replay; omit for database only proj
   ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag"
   ignore_text: []               # regular expressions masked in page content
   step_timeout_ms: 15000
+  parallel_journeys: 1          # 1 = in sequence; more only for journeys that do not interfere
 
 files:                          # compare files the application generates or stores
   - name: invoices
