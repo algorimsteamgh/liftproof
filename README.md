@@ -6,9 +6,10 @@ produces the report a release manager signs at go live.
 
 This repository is being built against the *Migration Validation Tool* PRD and Technical
 Specification (Draft 1). Supported databases: PostgreSQL and MySQL (8.0 and later, including Aurora), as source
-or target, in any combination. This first increment is the database core: PRD F2 (baseline),
-F6 (reconcile), F8/F9 (reports), F11 (CLI and exit codes), F14 (credentials) and F15
-(storage).
+or target, in any combination. Built so far: the database core, PRD F2 (baseline), F6 (reconcile), F8/F9 (reports),
+F11 (CLI and exit codes), F14 (credentials) and F15 (storage); and record and replay,
+F1 (record), F3 (replay), F4 (user interface comparison), F5 (API comparison) and F16
+(response times).
 
 ## Quick start (development)
 
@@ -19,6 +20,23 @@ liftproof doctor --project acme.yaml  # connections, read only source, TLS, S3 a
 liftproof baseline --project acme.yaml
 liftproof reconcile --project acme.yaml --baseline latest
 ```
+
+## Record and replay
+
+```bash
+liftproof record   --project acme.yaml --journey checkout --start /login --story ORD-14
+liftproof bind     --project acme.yaml --journey checkout --token @@REDACTED_1a2b3c4d \
+                   --secret-arn arn:aws:secretsmanager:REGION:ACCOUNT:secret:app-login --key password
+liftproof replay   --project acme.yaml                  # every journey, against web.target_url
+liftproof smoke    --project acme.yaml --journeys checkout
+liftproof validate --project acme.yaml                  # reconcile, then replay, one report
+```
+
+`record` opens a Chromium window on `web.source_url`; carry out the journey and close the
+window. Passwords become random tokens before anything is written; `bind` points each
+token at a Secrets Manager secret for replay. Values the server generates (order ids,
+CSRF tokens, ASP.NET view state) are detected as correlations, substituted forward at
+replay, and never reported as differences.
 
 ## Exit codes
 
@@ -34,7 +52,10 @@ liftproof reconcile --project acme.yaml --baseline latest
 
 ## Tests
 
-`pytest` runs everything. Database tests need PostgreSQL and MySQL: set
+`pytest` runs everything. Record and replay tests need Chromium
+(`python -m playwright install chromium`, or point `LIFTPROOF_CHROMIUM` at a binary) and run
+against a small shop application in `tests/webapp.py` that is served twice, once changed.
+Database tests need PostgreSQL and MySQL: set
 `LIFTPROOF_TEST_PG_HOST`, `_PORT`, `_USER`, `_PASSWORD` and `LIFTPROOF_TEST_MYSQL_HOST`,
 `_PORT`, `_USER`, `_PASSWORD` (CI uses service containers); they are skipped when no
 server is reachable. Cross engine tests load the same data into both and require identical
@@ -48,6 +69,7 @@ PRD F6 acceptance test (a ten row injected difference, reported exactly).
 src/liftproof/canonical   canonical v1.0 encoding and hashing (docs/canonical-v1.md)
 src/liftproof/adapters    one adapter per database engine
 src/liftproof/reconcile   planning, baselines, reconciliation
+src/liftproof/web         recorder, replay engine, UI and API comparison
 src/liftproof/report      JSON and self contained HTML reports
 src/liftproof/cli.py      the product's complete interface
 docs/decisions.md      defaults chosen where the spec leaves a choice open

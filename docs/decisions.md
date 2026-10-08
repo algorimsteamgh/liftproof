@@ -22,9 +22,18 @@ Each can be revisited; the ones marked *reversible* cost little to change.
 | 15 | Schema names across engines | `database.schema_map`, defaulting to the source home schema mapped onto the target's (MySQL `shop` to PostgreSQL `public`) | In MySQL a schema is the database; a migration usually renames it | Yes |
 | 16 | MySQL replication position | GTID set (or binlog file and position) read immediately after the snapshot opens, recorded with `exact: false` | MySQL does not expose the position of a consistent snapshot atomically; the alternative, a global read lock, is not acceptable on a production source | Yes |
 
+| 17 | Response bodies at record time | default deny: kept only for `web.capture_bodies` URL patterns; every other body is a SHA-256 and a JSON shape | Spec 5: production bodies in the bucket indefinitely is the sentence that loses the deal. Shape comparison still catches added and missing fields | Yes |
+| 18 | Which fields are sensitive | password inputs, any element with `data-liftproof-sensitive`, and names matching pass, secret, token, otp or pin | Errs towards redacting; the value is swapped for a random token in the recorder process and scrubbed from URLs, request bodies and page snapshots | Yes |
+| 19 | "The region the step touched" | the nearest form, dialog, table, section, article or main around the element, else the page; compared as accessible tree text | Spec 7 asks for the region but does not define it; these are the elements that bound what a step can change | Yes |
+| 20 | Waiting at replay | the requests the step made when recorded, then the page load, then no DOM change for 150 ms; step timeout 15 s; 3 attempts per step, 2 per journey that changes state | Conditions, not sleeps (spec 6). The DOM quiet period stops a snapshot racing the page's own rendering script | Yes |
+| 21 | Journey with an unbound redaction token | not replayed; reported as not run, so coverage drops; `doctor` lists it beforehand | Replaying without the real secret would fail at login and read as a migration defect | Yes |
+| 22 | API calls during recording and replay | fetched through a Playwright route so the body is held before the page sees it | A page that navigates straight after an API call discards that body before it can be read | Yes |
+
 ## Not built yet
 
-Recorder, replay, UI/API/file comparators, scheduler, web UI,
+File comparator, scheduler, web UI, parallel journeys, the target watermark that
+excludes rows a replay created when reconciliation must follow replay (validate already
+reconciles first), extractor transform chains (base64, URL encoding) for correlations,
 CloudFormation version of the deployment module, replication position assertion on the target,
 row predicate ignore rules, sampled mode, multi worker snapshots
 (`pg_export_snapshot` is captured but workers are not used yet).
