@@ -22,7 +22,7 @@ report.
 | Parameter | Default | Values |
 |---|---|---|
 | `project` | | the project file name under `/var/lib/mvt/projects`, without `.yaml` |
-| `mode` | `reconcile` | `validate`, `reconcile`, `files`, `replay`, `smoke`, `baseline`, `rebaseline`, `doctor` |
+| `mode` | `reconcile` | `validate`, `reconcile`, `files`, `replay`, `smoke`, `baseline`, `rebaseline`, `doctor`, `support-bundle` |
 | `baseline` | `latest` | baseline id, `latest` (newest source baseline) or `latest-target` (newest rebaseline); used by `reconcile` and `validate` |
 | `journeys` | all | comma separated journey ids; `replay`, `smoke`, `validate` |
 | `sets` | all | comma separated file set names; `files`, `validate` |

@@ -22,6 +22,8 @@ liftproof reconcile --project acme.yaml --baseline latest
 # after cutover: the target becomes the reference for scheduled regression
 liftproof rebaseline --project acme.yaml
 liftproof reconcile --project acme.yaml --baseline latest-target
+# something wrong? one file for the support ticket, values redacted
+liftproof support-bundle --project acme.yaml --doctor
 ```
 
 ## Record and replay

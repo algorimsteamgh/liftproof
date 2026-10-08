@@ -19,7 +19,7 @@ from typing import Any
 
 import yaml
 
-from liftproof import __version__, aws, logs
+from liftproof import __version__, aws, logs, support
 from liftproof.adapters.base import Adapter
 from liftproof.adapters.mysql import MySQLAdapter
 from liftproof.adapters.oracle import OracleAdapter
@@ -895,7 +895,18 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    project = _project(args)
+    checks = _doctor_checks(args, _project(args))
+    failed = [c for c in checks if c["result"] == "fail"]
+    text = "\n".join(
+        f"[{'PASS' if c['result'] == 'pass' else 'FAIL'}] {c['check']}: "
+        f"{c['detail']}" + (f"\n       fix: {c['remedy']}" if c.get("remedy") else "")
+        for c in checks
+    )
+    _out(args, {"checks": checks, "ok": not failed}, text)
+    return EXIT_CONFIG if failed else EXIT_OK
+
+
+def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str, str]]:
     checks: list[dict[str, str]] = []
 
     def check(name: str, fn, remedy: str) -> None:
@@ -1012,14 +1023,40 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "grant s3:PutObject on the bucket and kms:GenerateDataKey on the key; for a "
             "customer managed key the key policy must also allow the instance role",
         )
-    failed = [c for c in checks if c["result"] == "fail"]
-    text = "\n".join(
-        f"[{'PASS' if c['result'] == 'pass' else 'FAIL'}] {c['check']}: "
-        f"{c['detail']}" + (f"\n       fix: {c['remedy']}" if c.get("remedy") else "")
-        for c in checks
+    return checks
+
+
+def cmd_support_bundle(args: argparse.Namespace) -> int:
+    """One file for a support ticket (spec 13), values redacted. See liftproof.support."""
+    project = _project(args)
+    workdir = Path(args.workdir) / project.name
+    run_id = args.run or support.latest_run(workdir / "runs")
+    if args.run and not (workdir / "runs" / args.run).exists():
+        raise ConfigError(f"run {args.run} not found under {workdir / 'runs'}")
+    name = f"support-{project.name}-{_new_id('s')[2:]}.zip"
+    out = Path(args.out) if args.out else workdir / "support" / name
+    log_file = Path(os.environ.get("LIFTPROOF_LOG_DIR", "/var/log/mvt")) / "liftproof.log"
+    manifest = support.build(
+        out,
+        project=project,
+        workdir=workdir,
+        run_id=run_id,
+        log_file=log_file,
+        instance_config=_instance_config(),
+        doctor=_doctor_checks(args, project) if args.doctor else None,
     )
-    _out(args, {"checks": checks, "ok": not failed}, text)
-    return EXIT_CONFIG if failed else EXIT_OK
+    store = _store(project, Path(args.workdir))
+    key = f"support/{out.name}"
+    store.put_file(key, out)
+    payload = {"bundle": str(out), "stored": store.location(key), **manifest}
+    _out(
+        args,
+        payload,
+        f"support bundle: {out}\nalso stored at: {store.location(key)}\n"
+        f"run: {run_id or 'none'}; {len(manifest['contents'])} files, values redacted\n"
+        "attach the file to your support ticket",
+    )
+    return EXIT_OK
 
 
 def _assert(cond: bool, message: str) -> None:
@@ -1161,6 +1198,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--once", action="store_true", help="fire what is due now, then exit")
     s.add_argument("--interval", type=float, default=30.0, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_scheduler)
+
+    s = with_project("support-bundle", "package logs and findings, values redacted, for support")
+    s.add_argument("--run", help="run id; default: the latest run")
+    s.add_argument("--doctor", action="store_true", help="also run doctor and include it")
+    s.add_argument("--out", help="bundle path; default: under the work directory")
+    s.set_defaults(fn=cmd_support_bundle)
 
     s = with_project("report", "regenerate a report from a run's findings")
     s.add_argument("--run", required=True)

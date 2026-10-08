@@ -220,6 +220,62 @@ def test_latest_and_latest_target_are_separate(tmp_path, dbs, capsys):
     assert (b.baseline_id, b.side) == ("t1", "target")
 
 
+@pytest.mark.postgres
+def test_support_bundle_carries_the_run_without_values(tmp_path, dbs, capsys, monkeypatch):
+    import zipfile
+
+    s, t, tc = dbs
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setenv("LIFTPROOF_LOG_DIR", str(log_dir))
+    tc.execute("UPDATE orders SET status = 'SECRET-VALUE-42' WHERE id = 7")
+    p = _project(tmp_path, s, t, show_values=True)
+    assert run(tmp_path, "reconcile", "--project", str(p), "--run-id", "r1") == EXIT_DIFFERENCES
+    html = (tmp_path / "work/acme/runs/r1/report.html").read_text()
+    assert "SECRET-VALUE-42" in html  # the run itself was asked to show values
+    capsys.readouterr()
+
+    assert run(tmp_path, "support-bundle", "--project", str(p)) == EXIT_OK
+    out = json.loads(capsys.readouterr().out)
+    assert out["run_id"] == "r1"  # the latest run by default
+    with zipfile.ZipFile(out["bundle"]) as z:
+        names = set(z.namelist())
+        assert {"MANIFEST.json", "environment.json", "project.json", "run/report.json",
+                "run/findings.jsonl", "run/db-results.json", "run.log"} <= names
+        assert not [n for n in names if n.endswith(".html")]
+        everything = "".join(z.read(n).decode() for n in names)
+    assert "SECRET-VALUE-42" not in everything
+    assert "id = 7" not in everything  # database locators name key values
+    bundle = zipfile.ZipFile(out["bundle"])
+    findings = [json.loads(x) for x in bundle.read("run/findings.jsonl").decode().splitlines()]
+    changed = [f for f in findings if f["column"] == "status" and f["expected"]]
+    assert changed and changed[0]["expected"] == "[redacted]"
+    env = json.loads(bundle.read("environment.json"))
+    assert env["canonical_version"] and env["packages"]["psycopg"]
+    # also in the store, for an operator who has no shell on the instance
+    assert (tmp_path / "work/acme/support" / out["bundle"].rsplit("/", 1)[1]).exists()
+
+
+def test_support_bundle_unknown_run_is_a_configuration_error(tmp_path, capsys):
+    p = _project(tmp_path, "s", "t")
+    assert run(tmp_path, "support-bundle", "--project", str(p), "--run", "nope") == EXIT_CONFIG
+
+
+def test_redaction_rules():
+    from liftproof.support import REDACTED, redact_finding
+
+    f = redact_finding({
+        "comparator": "database", "locator": "id = 7", "expected": "a", "actual": "b",
+        "detail": {"key": ["7"], "column": "status", "nested": {"source": {"max": 9.5}},
+                   "buckets": [3]},
+    })  # fmt: skip
+    assert f["locator"] == f["expected"] == f["actual"] == REDACTED
+    assert f["detail"] == {"key": REDACTED, "column": "status",
+                           "nested": {"source": REDACTED}, "buckets": [3]}  # fmt: skip
+    ui = redact_finding({"comparator": "ui", "locator": "#total", "expected": None})
+    assert ui["locator"] == "#total" and ui["expected"] is None
+
+
 def test_mysql_to_postgresql_project_defaults(tmp_path):
     from liftproof.config import load_project
 
