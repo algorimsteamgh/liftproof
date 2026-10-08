@@ -94,6 +94,7 @@ class FloatStats:
 
 class Adapter(abc.ABC):
     engine: str = "abstract"
+    hash_probe: str = "SELECT md5('liftproof')"  # doctor: MD5 is usable on this server
 
     @abc.abstractmethod
     def close(self) -> None: ...

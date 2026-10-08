@@ -252,3 +252,79 @@ def oracle_adapter_for():
     yield factory
     for a in opened:
         a.close()
+
+
+# SQL Server -----------------------------------------------------------------------------
+MSSQL = {
+    "host": os.environ.get("LIFTPROOF_TEST_MSSQL_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("LIFTPROOF_TEST_MSSQL_PORT", "1433")),
+    "user": os.environ.get("LIFTPROOF_TEST_MSSQL_USER", "sa"),
+    "password": os.environ.get("LIFTPROOF_TEST_MSSQL_PASSWORD", "Ci-only-local-service1"),
+}
+
+
+def _ms_connect(database: str = "master", user: str | None = None, password: str | None = None):
+    import pytds
+
+    return pytds.connect(
+        dsn=MSSQL["host"], port=MSSQL["port"], database=database,
+        user=user or MSSQL["user"], password=password or MSSQL["password"],
+        login_timeout=3, autocommit=True, disable_connect_retry=True,
+    )  # fmt: skip
+
+
+@pytest.fixture(scope="session")
+def sqlserver_available():
+    import pytds
+
+    try:
+        _ms_connect().close()
+    except (pytds.Error, OSError):
+        pytest.skip("no SQL Server for tests")
+
+
+@pytest.fixture
+def make_sqlserver_db(sqlserver_available):
+    """Factory creating throwaway SQL Server databases (snapshot isolation on, unless
+    snapshot=False); returns (database, raw cursor). Tables go in dbo."""
+    created: list[str] = []
+    conns = []
+
+    def factory(prefix: str = "t", snapshot: bool = True):
+        name = f"lp_{prefix}_{uuid.uuid4().hex[:8]}"
+        with _ms_connect() as c, c.cursor() as cur:
+            cur.execute(f"CREATE DATABASE [{name}]")
+            if snapshot:
+                cur.execute(f"ALTER DATABASE [{name}] SET ALLOW_SNAPSHOT_ISOLATION ON")
+        created.append(name)
+        conn = _ms_connect(name)
+        conns.append(conn)
+        return name, conn.cursor()
+
+    yield factory
+    for c in conns:
+        c.close()
+    with _ms_connect() as c, c.cursor() as cur:
+        for name in created:
+            cur.execute(f"ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
+            cur.execute(f"DROP DATABASE [{name}]")
+
+
+@pytest.fixture
+def sqlserver_adapter_for():
+    from liftproof.adapters.sqlserver import SQLServerAdapter
+
+    opened: list[SQLServerAdapter] = []
+
+    def factory(database: str, **kw) -> SQLServerAdapter:
+        a = SQLServerAdapter(
+            host=MSSQL["host"], port=MSSQL["port"], database=database,
+            user=kw.pop("user", MSSQL["user"]), password=kw.pop("password", MSSQL["password"]),
+            sslmode="disable", **kw,
+        )  # fmt: skip
+        opened.append(a)
+        return a
+
+    yield factory
+    for a in opened:
+        a.close()

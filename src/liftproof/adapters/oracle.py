@@ -261,6 +261,7 @@ def _ssl_args(sslmode: str, sslrootcert: str | None) -> dict[str, Any]:
 
 class OracleAdapter(Adapter):
     engine = "oracle"
+    hash_probe = "SELECT STANDARD_HASH('liftproof', 'MD5') FROM DUAL"
 
     def __init__(
         self,

@@ -35,6 +35,16 @@ jobs:
         options: >-
           --health-cmd healthcheck.sh
           --health-interval 10s --health-timeout 5s --health-retries 30
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: Ci-only-local-service1
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P Ci-only-local-service1 -Q 'SELECT 1'"
+          --health-interval 10s --health-timeout 5s --health-retries 30
     env:
       LIFTPROOF_TEST_PG_HOST: localhost
       LIFTPROOF_TEST_PG_PORT: "5432"
@@ -49,6 +59,10 @@ jobs:
       LIFTPROOF_TEST_ORACLE_SERVICE: FREEPDB1
       LIFTPROOF_TEST_ORACLE_USER: system
       LIFTPROOF_TEST_ORACLE_PASSWORD: ci-only-local-service
+      LIFTPROOF_TEST_MSSQL_HOST: 127.0.0.1
+      LIFTPROOF_TEST_MSSQL_PORT: "1433"
+      LIFTPROOF_TEST_MSSQL_USER: sa
+      LIFTPROOF_TEST_MSSQL_PASSWORD: Ci-only-local-service1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v7

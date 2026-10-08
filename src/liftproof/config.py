@@ -25,7 +25,7 @@ from liftproof.schedule import Schedule, parse_schedules
 FORBIDDEN_KEYS = re.compile(
     r"(password|passwd|secret_access_key|access_key_id|session_token)", re.I
 )
-DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306, "oracle": 1521}
+DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306, "oracle": 1521, "sqlserver": 1433}
 ENGINES = set(DEFAULT_PORTS)
 VERIFYING_TLS = {"verify-full", "verify-ca"}
 
@@ -147,11 +147,14 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
 
 def _home_schema(conn: Connection | None) -> str:
     """Where tables live by default: PostgreSQL's public schema, the MySQL database, or
-    the Oracle login's own schema (upper case, as Oracle stores unquoted names)."""
+    the Oracle login's own schema (upper case, as Oracle stores unquoted names), or
+    SQL Server's dbo."""
     if conn is None:
         return "public"
     if conn.engine == "mysql":
         return conn.database
+    if conn.engine == "sqlserver":
+        return "dbo"
     if conn.engine == "oracle":
         if not conn.user:
             raise ConfigError(
@@ -409,12 +412,13 @@ source:
   secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/source   # username, password
   sslmode: verify-full          # full certificate verification; lowering it is reported
                                 # Oracle: TLS is TCPS, usually on port 2484
+                                # SQL Server: verify-ca or verify-full (needs sslrootcert)
   # sslrootcert: /opt/liftproof/certs/private-ca.pem
   statement_timeout_ms: 600000
   rows_per_second: 0            # application side hashing only; 0 = unlimited
 
 target:
-  engine: postgresql            # postgresql, mysql or oracle; source and target may differ
+  engine: postgresql            # postgresql, mysql, oracle or sqlserver; may differ
   host: target.cluster-xyz.REGION.rds.amazonaws.com
   port: 5432
   database: app
@@ -446,7 +450,7 @@ files:                          # compare files the application generates or sto
     #     reason: scratch files, not migrated
 
 database:
-  schemas: [public]             # MySQL: the database name; Oracle: the owner, upper case
+  schemas: [public]             # MySQL: the database; Oracle: the owner; SQL Server: dbo
   # schema_map: {{shop: public}}  # source schema -> target schema, when renamed
   # tables: [orders, customers]   # default: every table in the schemas
   rows_per_bucket: 50000
