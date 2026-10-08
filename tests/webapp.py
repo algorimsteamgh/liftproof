@@ -1,0 +1,146 @@
+"""A small order application, served twice: once as the source and once as the target.
+
+The target variant can be changed deliberately (Technical Spec 18: replay tests against
+a sample application deliberately changed between source and target). Generated ids,
+CSRF tokens and timestamps differ between the two on every run, as they would in life.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import secrets
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+PASSWORD = "s3cret-pass"  # noqa: S105 - the sample application's test login
+
+LOGIN = """<!doctype html><html><head><title>Shop</title>
+<meta name="csrf-token" content="{csrf}"></head><body><main>
+<h1>Sign in</h1>
+<form method="post" action="/login">
+<input type="hidden" name="csrf" value="{csrf}">
+<label for="u">Username</label> <input id="u" name="username">
+<label for="p">Password</label> <input id="p" name="password" type="password">
+<button type="submit">Sign in</button>
+</form></main></body></html>"""
+
+ORDERS = """<!doctype html><html><head><title>Shop</title></head><body><main>
+<h1>Orders</h1>
+<form id="new">
+<label for="item">Item</label> <input id="item" name="item">
+<button type="submit" {testid}>{button}</button>
+</form>
+<script>
+document.getElementById('new').addEventListener('submit', async (e) => {{
+  e.preventDefault();
+  const r = await fetch('/api/orders', {{method: 'POST', headers: {{'Content-Type':
+    'application/json'}}, body: JSON.stringify({{item: document.getElementById('item').value}})}});
+  const o = await r.json();
+  location.href = '/orders/' + o.id;
+}});
+</script></main></body></html>"""
+
+ORDER = """<!doctype html><html><head><title>Shop</title></head><body><main>
+<h1>Order <span id="oid"></span></h1><dl id="d"></dl>
+<a href="/orders">Back to orders</a>
+<script>
+fetch('/api/orders/{oid}').then(r => r.json()).then(o => {{
+  document.getElementById('oid').textContent = o.id;
+  document.getElementById('d').innerHTML = '<dt>Item</dt><dd>' + o.item + '</dd>' +
+    '<dt>Status</dt><dd>' + o.status + '</dd><dt>Total</dt><dd>' + o.total + '</dd>' +
+    '<dt>Placed</dt><dd>' + o.placed_at + '</dd>';
+}});
+</script></main></body></html>"""
+
+
+class ShopApp:
+    """variant: same | changed. changed renames a status, adds an API field, drops the
+    order button's test id (so replay falls back to a weaker locator) and returns 500 for
+    a missing order instead of 404."""
+
+    def __init__(self, variant: str = "same") -> None:
+        self.variant = variant
+        self.orders: dict[str, dict] = {}
+        self.sessions: set[str] = set()
+        self.csrf: set[str] = set()
+        app = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # quiet
+                pass
+
+            def _send(self, status, body, ctype="text/html", headers=None):
+                data = body.encode() if isinstance(body, str) else body
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _authed(self):
+                cookie = self.headers.get("Cookie", "")
+                return any(c.strip() == f"sid={s}" for s in app.sessions for c in cookie.split(";"))
+
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                if path in ("/", "/login"):
+                    token = secrets.token_hex(16)
+                    app.csrf.add(token)
+                    return self._send(200, LOGIN.format(csrf=token))
+                if not self._authed():
+                    return self._send(302, "", headers={"Location": "/login"})
+                if path == "/orders":
+                    same = app.variant == "same"
+                    return self._send(200, ORDERS.format(
+                        testid='data-testid="place-order"' if same else "",
+                        button="Place order"))
+                if path.startswith("/orders/"):
+                    return self._send(200, ORDER.format(oid=path.rsplit("/", 1)[1]))
+                if path.startswith("/api/orders/"):
+                    o = app.orders.get(path.rsplit("/", 1)[1])
+                    if o is None:
+                        return self._send(500 if app.variant == "changed" else 404, "{}",
+                                          "application/json")
+                    return self._send(200, o, "application/json")
+                return self._send(404, "not found")
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length).decode()
+                if self.path == "/login":
+                    form = {k: v[0] for k, v in parse_qs(raw).items()}
+                    if form.get("csrf") not in app.csrf or form.get("password") != PASSWORD:
+                        return self._send(401, "<main><h1>Sign in failed</h1></main>")
+                    sid = secrets.token_hex(16)
+                    app.sessions.add(sid)
+                    return self._send(302, "", headers={"Location": "/orders",
+                                                        "Set-Cookie": f"sid={sid}; Path=/"})
+                if self.path == "/api/orders" and self._authed():
+                    item = json.loads(raw or "{}").get("item", "")
+                    oid = str(secrets.randbelow(900000) + 100000)
+                    placed = dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
+                    if app.variant == "changed":
+                        body = (f'{{"id": {oid}, "item": "{item}", "status": "PENDING", '
+                                f'"total": 10.5, "currency": "EUR", "placed_at": "{placed}"}}')
+                    else:
+                        body = (f'{{"id": {oid}, "item": "{item}", "status": "OPEN", '
+                                f'"total": 10.50, "placed_at": "{placed}"}}')
+                    app.orders[oid] = body
+                    return self._send(201, body, "application/json")
+                return self._send(403, "{}", "application/json")
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self) -> ShopApp:
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.server.shutdown()
+        self.server.server_close()

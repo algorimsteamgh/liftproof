@@ -22,7 +22,8 @@ from liftproof.reconcile.plan import IgnoreRule
 FORBIDDEN_KEYS = re.compile(
     r"(password|passwd|secret_access_key|access_key_id|session_token)", re.I
 )
-ENGINES = {"postgresql"}
+DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306}
+ENGINES = set(DEFAULT_PORTS)
 VERIFYING_TLS = {"verify-full", "verify-ca"}
 
 
@@ -55,13 +56,40 @@ class StoreConfig:
 
 
 @dataclass
+class WebConfig:
+    """Record and replay settings (spec 5 to 8). Bodies are kept only for capture_bodies
+    URL patterns; everything else is reduced to a hash and a shape."""
+
+    source_url: str
+    target_url: str | None = None
+    journeys: list[str] | None = None  # default: every recorded journey
+    capture_bodies: list[str] = field(default_factory=list)
+    compare_headers: list[str] = field(default_factory=list)
+    ignore_json_paths: list[str] = field(default_factory=list)
+    ignore_text: list[str] = field(default_factory=list)
+    step_timeout_ms: int = 15_000
+    chromium_path: str | None = None
+
+
+@dataclass
 class Project:
     name: str
-    source: Connection
-    target: Connection
+    source: Connection | None  # None: the project validates web journeys only
+    target: Connection | None
     store: StoreConfig = field(default_factory=StoreConfig)
     database: ReconcileOptions = field(default_factory=ReconcileOptions)
     path: Path | None = None
+    web: WebConfig | None = None
+
+    def require_database(self) -> tuple[Connection, Connection]:
+        if self.source is None or self.target is None:
+            raise ConfigError("this project has no source and target database configured")
+        return self.source, self.target
+
+    def require_web(self) -> WebConfig:
+        if self.web is None:
+            raise ConfigError("this project has no web section (source_url, target_url)")
+        return self.web
 
 
 def _scan_for_credentials(node: Any, where: str = "") -> None:
@@ -92,7 +120,7 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
             engine=engine,
             host=str(d["host"]),
             database=str(d["database"]),
-            port=int(d.get("port", 5432)),
+            port=int(d.get("port", DEFAULT_PORTS[engine])),
             user=d.get("user"),
             secret_arn=d.get("secret_arn"),
             sslmode=d.get("sslmode", "verify-full"),
@@ -104,7 +132,14 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
         raise ConfigError(f"{role}.{exc.args[0]} is required") from None
 
 
-def _options(d: dict[str, Any]) -> ReconcileOptions:
+def _home_schema(conn: Connection | None) -> str:
+    """Where tables live by default: PostgreSQL's public schema, or the MySQL database."""
+    return conn.database if conn is not None and conn.engine == "mysql" else "public"
+
+
+def _options(
+    d: dict[str, Any], source: Connection | None, target: Connection | None
+) -> ReconcileOptions:
     ignore = []
     for i, r in enumerate(d.get("ignore", []) or []):
         if not r.get("reason"):
@@ -114,7 +149,8 @@ def _options(d: dict[str, Any]) -> ReconcileOptions:
             )
         ignore.append(IgnoreRule(r["table"], r["reason"], r.get("column")))
     opts = ReconcileOptions(
-        schemas=list(d.get("schemas", ["public"])),
+        schemas=list(d.get("schemas") or [_home_schema(source)]),
+        schema_map=_schema_map(d.get("schema_map"), source, target),
         tables=list(d["tables"]) if d.get("tables") else None,
         ignore=ignore,
         business_keys={k: list(v) for k, v in (d.get("business_keys") or {}).items()},
@@ -129,6 +165,44 @@ def _options(d: dict[str, Any]) -> ReconcileOptions:
     return opts
 
 
+def _web(d: Any) -> WebConfig | None:
+    if not d:
+        return None
+    if not isinstance(d, dict) or not d.get("source_url"):
+        raise ConfigError("web.source_url is required when a web section is present")
+
+    def strings(key: str) -> list[str]:
+        v = d.get(key) or []
+        if not isinstance(v, list):
+            raise ConfigError(f"web.{key} must be a list")
+        return [str(x) for x in v]
+
+    return WebConfig(
+        source_url=str(d["source_url"]),
+        target_url=d.get("target_url"),
+        journeys=strings("journeys") or None,
+        capture_bodies=strings("capture_bodies"),
+        compare_headers=strings("compare_headers"),
+        ignore_json_paths=strings("ignore_json_paths"),
+        ignore_text=strings("ignore_text"),
+        step_timeout_ms=int(d.get("step_timeout_ms", 15_000)),
+        chromium_path=d.get("chromium_path"),
+    )
+
+
+def _schema_map(given: Any, source: Connection | None, target: Connection | None) -> dict[str, str]:
+    """Explicit schema_map, else map the source home schema onto the target's when they
+    differ (MySQL 'shop' to PostgreSQL 'public', or between two MySQL database names)."""
+    if given is not None:
+        if not isinstance(given, dict):
+            raise ConfigError("database.schema_map must map source schema to target schema")
+        return {str(k): str(v) for k, v in given.items()}
+    if source is None or target is None:
+        return {}
+    s, t = _home_schema(source), _home_schema(target)
+    return {s: t} if s != t else {}
+
+
 def load_project(path: Path) -> Project:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -140,14 +214,21 @@ def load_project(path: Path) -> Project:
     if "project" not in raw:
         raise ConfigError(f"{path}: 'project' (the project name) is required")
     store = raw.get("store") or {}
+    web = _web(raw.get("web"))
+    has_db = raw.get("source") is not None or raw.get("target") is not None
+    if not has_db and web is None:
+        raise ConfigError(f"{path}: configure source and target databases, a web section, or both")
+    source = _connection(raw.get("source"), "source") if has_db else None
+    target = _connection(raw.get("target"), "target") if has_db else None
     return Project(
         name=str(raw["project"]),
-        source=_connection(raw.get("source"), "source"),
-        target=_connection(raw.get("target"), "target"),
+        source=source,
+        target=target,
+        web=web,
         store=StoreConfig(
             store.get("s3_bucket"), store.get("s3_prefix", raw["project"]), store.get("kms_key_id")
         ),
-        database=_options(raw.get("database") or {}),
+        database=_options(raw.get("database") or {}, source, target),
         path=path,
     )
 
@@ -173,7 +254,7 @@ source:
   rows_per_second: 0            # application side hashing only; 0 = unlimited
 
 target:
-  engine: postgresql
+  engine: postgresql            # postgresql or mysql; source and target may differ
   host: target.cluster-xyz.REGION.rds.amazonaws.com
   port: 5432
   database: app
@@ -181,8 +262,18 @@ target:
   sslmode: verify-full
   sslrootcert: /opt/liftproof/certs/rds-global-bundle.pem
 
+web:                            # record and replay; omit for database only projects
+  source_url: https://app.example.internal
+  target_url: https://app.example.com
+  capture_bodies: ["/api/*"]    # bodies kept for value comparison; others: hash and shape
+  compare_headers: []           # only these response headers are compared
+  ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag"
+  ignore_text: []               # regular expressions masked in page content
+  step_timeout_ms: 15000
+
 database:
-  schemas: [public]
+  schemas: [public]             # MySQL: the database name (the default)
+  # schema_map: {{shop: public}}  # source schema -> target schema, when renamed
   # tables: [orders, customers]   # default: every table in the schemas
   rows_per_bucket: 50000
   timestamp_precision: 6

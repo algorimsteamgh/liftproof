@@ -78,3 +78,94 @@ def adapter_for():
     yield factory
     for a in opened:
         a.close()
+
+
+# ---------------------------------------------------------------------- browser
+@pytest.fixture(scope="session")
+def browser_available():
+    """Playwright's Chromium, or the binary named by LIFTPROOF_CHROMIUM."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        from liftproof.web.browser import launch
+
+        with sync_playwright() as p:
+            launch(p).close()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"no browser for tests: {str(exc).splitlines()[0]}")
+
+
+# ------------------------------------------------------------------------ MySQL
+MY = {
+    "host": os.environ.get("LIFTPROOF_TEST_MYSQL_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("LIFTPROOF_TEST_MYSQL_PORT", "33306")),
+    "user": os.environ.get("LIFTPROOF_TEST_MYSQL_USER", "root"),
+    "password": os.environ.get("LIFTPROOF_TEST_MYSQL_PASSWORD", "ci-only-local-service"),
+}
+
+
+def _my_connect(database: str | None = None):
+    import pymysql
+
+    return pymysql.connect(
+        host=MY["host"], port=MY["port"], user=MY["user"], password=MY["password"],
+        database=database, charset="utf8mb4", autocommit=True, connect_timeout=3,
+    )
+
+
+@pytest.fixture(scope="session")
+def mysql_available():
+    import pymysql
+
+    try:
+        _my_connect().close()
+    except pymysql.err.MySQLError:
+        pytest.skip("no MySQL server for tests")
+
+
+@pytest.fixture
+def make_mysql_db(mysql_available):
+    """Factory creating throwaway MySQL databases; returns (dbname, raw cursor).
+
+    The raw session runs with an empty sql_mode so tests can store zero dates.
+    """
+    created: list[str] = []
+    conns = []
+
+    def factory(prefix: str = "t"):
+        name = f"liftproof_{prefix}_{uuid.uuid4().hex[:8]}"
+        with _my_connect() as c, c.cursor() as cur:
+            cur.execute(f"CREATE DATABASE `{name}` CHARACTER SET utf8mb4")
+        created.append(name)
+        conn = _my_connect(name)
+        conns.append(conn)
+        cur = conn.cursor()
+        cur.execute("SET SESSION sql_mode = ''")
+        cur.execute("SET SESSION time_zone = '+00:00'")
+        return name, cur
+
+    yield factory
+    for c in conns:
+        c.close()
+    with _my_connect() as c, c.cursor() as cur:
+        for name in created:
+            cur.execute(f"DROP DATABASE IF EXISTS `{name}`")
+
+
+@pytest.fixture
+def mysql_adapter_for():
+    from liftproof.adapters.mysql import MySQLAdapter
+
+    opened: list[MySQLAdapter] = []
+
+    def factory(dbname: str, read_only: bool = True) -> MySQLAdapter:
+        a = MySQLAdapter(
+            host=MY["host"], port=MY["port"], database=dbname, user=MY["user"],
+            password=MY["password"], sslmode="disable", read_only=read_only,
+        )
+        opened.append(a)
+        return a
+
+    yield factory
+    for a in opened:
+        a.close()
