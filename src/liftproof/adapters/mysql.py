@@ -242,6 +242,9 @@ class MySQLAdapter(Adapter):
     replication_methods = ("replica", "dms")
     dms_schema = "awsdms_control"
 
+    def quote_name(self, name: str) -> str:
+        return quote(name)
+
     def __init__(
         self,
         *,

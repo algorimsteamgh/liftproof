@@ -269,6 +269,15 @@ class SQLServerAdapter(Adapter):
     supports_workers = True
     dms_schema = "dbo"
 
+    def quote_name(self, name: str) -> str:
+        return quote(name)
+
+    def literal(self, value: Any) -> str:
+        text = super().literal(value)
+        if text.startswith("TIMESTAMP "):  # no ANSI timestamp literal in T-SQL
+            return f"CAST({text.removeprefix('TIMESTAMP ')} AS datetime2(7))"
+        return text
+
     def __init__(
         self,
         *,

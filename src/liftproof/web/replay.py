@@ -393,6 +393,11 @@ class Replayer:
                     body=cap.body,
                     headers=cap.exchange.response_headers,
                 )
+                new = correlate.apply(c.transforms, new)
                 if new:
-                    run.values[c.recorded_value] = new
+                    for recorded_form, encoding in correlate.forms(c, c.recorded_value).items():
+                        if encoding != "source":  # what the server sent is not reused
+                            run.values[recorded_form] = (
+                                correlate.encode(encoding, new) if encoding else new
+                            )
                     break

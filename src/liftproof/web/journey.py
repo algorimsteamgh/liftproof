@@ -78,6 +78,12 @@ class Correlation:
     recorded_value: str
     used_in: list[str] = field(default_factory=list)
     confirmed: bool = True  # False: below the length or entropy threshold, needs a human
+    # Decoding applied to the extracted value, in order (url_decode, base64_decode,
+    # base64url_decode): the server sends it encoded, later steps use it decoded.
+    transforms: list[str] = field(default_factory=list)
+    # Other forms the value is used in later (url, url_plus, base64, base64url): each is
+    # replaced as well, so an id sent base64 or URL encoded still carries over.
+    encodings: list[str] = field(default_factory=list)
 
 
 @dataclass

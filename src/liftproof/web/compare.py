@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from liftproof.findings import Comparator, Finding, Kind, Severity
+from liftproof.web import correlate
 from liftproof.web.browser import Captured, normalise_path
 from liftproof.web.journey import Exchange, Journey, shape
 from liftproof.web.replay import JourneyRun
@@ -83,12 +84,13 @@ class Comparison:
         self.differences = 0
         # correlated values on both sides -> {name}
         self.masks: dict[str, str] = {}
-        by_value = {c.recorded_value: c.name for c in journey.correlations}
-        for recorded, name in by_value.items():
-            self.masks[recorded] = name
-            new = run.values.get(recorded)
+        for c in journey.correlations:
+            for form in correlate.forms(c, c.recorded_value):
+                self.masks[form] = c.name
+            new = run.values.get(c.recorded_value)
             if new:
-                self.masks[new] = name
+                for form in correlate.forms(c, new):
+                    self.masks[form] = c.name
         self.ignored_at_source = {
             (c.source, c.expression) for c in journey.correlations if c.extractor == "json_path"
         }
