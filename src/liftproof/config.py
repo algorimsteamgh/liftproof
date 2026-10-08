@@ -25,7 +25,8 @@ from liftproof.schedule import Schedule, parse_schedules
 FORBIDDEN_KEYS = re.compile(
     r"(password|passwd|secret_access_key|access_key_id|session_token)", re.I
 )
-ENGINES = {"postgresql"}
+DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306, "oracle": 1521}
+ENGINES = set(DEFAULT_PORTS)
 VERIFYING_TLS = {"verify-full", "verify-ca"}
 
 
@@ -129,7 +130,7 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
             engine=engine,
             host=str(d["host"]),
             database=str(d["database"]),
-            port=int(d.get("port", 5432)),
+            port=int(d.get("port", DEFAULT_PORTS[engine])),
             user=d.get("user"),
             secret_arn=d.get("secret_arn"),
             sslmode=d.get("sslmode", "verify-full"),
@@ -141,10 +142,29 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
         raise ConfigError(f"{role}.{exc.args[0]} is required") from None
 
 
+def _home_schema(conn: Connection | None) -> str:
+    """Where tables live by default: PostgreSQL's public schema, the MySQL database, or
+    the Oracle login's own schema (upper case, as Oracle stores unquoted names)."""
+    if conn is None:
+        return "public"
+    if conn.engine == "mysql":
+        return conn.database
+    if conn.engine == "oracle":
+        if not conn.user:
+            raise ConfigError(
+                "Oracle has no default schema without a user name: set database.schemas "
+                "(and database.schema_map), or source.user / target.user"
+            )
+        return conn.user.upper()
+    return "public"
+
+
 UNSAFE_SQL = re.compile(r";|--|/\*|\*/")
 
 
-def _options(d: dict[str, Any]) -> ReconcileOptions:
+def _options(
+    d: dict[str, Any], source: Connection | None, target: Connection | None
+) -> ReconcileOptions:
     ignore = []
     for i, r in enumerate(d.get("ignore", []) or []):
         if not r.get("reason"):
@@ -171,7 +191,8 @@ def _options(d: dict[str, Any]) -> ReconcileOptions:
                 )
         ignore.append(rule)
     opts = ReconcileOptions(
-        schemas=list(d.get("schemas", ["public"])),
+        schemas=list(d.get("schemas") or [_home_schema(source)]),
+        schema_map=_schema_map(d.get("schema_map"), source, target, d.get("schemas")),
         tables=list(d["tables"]) if d.get("tables") else None,
         ignore=ignore,
         business_keys={k: list(v) for k, v in (d.get("business_keys") or {}).items()},
@@ -290,6 +311,24 @@ def _files(d: Any) -> list[FileSetConfig]:
     return sets
 
 
+def _schema_map(
+    given: Any, source: Connection | None, target: Connection | None, schemas: Any = None
+) -> dict[str, str]:
+    """Explicit schema_map, else map the source home schema onto the target's when they
+    differ (MySQL 'shop' to PostgreSQL 'public', Oracle 'APP' to 'public')."""
+    if given is not None:
+        if not isinstance(given, dict):
+            raise ConfigError("database.schema_map must map source schema to target schema")
+        return {str(k): str(v) for k, v in given.items()}
+    if source is None or target is None:
+        return {}
+    known = all(c.engine != "oracle" or c.user for c in (source, target))
+    if schemas and not known:
+        return {}  # an Oracle login named only in its secret: schema_map must be given
+    s, t = _home_schema(source), _home_schema(target)
+    return {s: t} if s != t else {}
+
+
 def load_project(path: Path) -> Project:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -309,17 +348,19 @@ def load_project(path: Path) -> Project:
             f"{path}: configure source and target databases, a web section, file sets, "
             "or any combination"
         )
+    source = _connection(raw.get("source"), "source") if has_db else None
+    target = _connection(raw.get("target"), "target") if has_db else None
     return Project(
         name=str(raw["project"]),
-        source=_connection(raw.get("source"), "source") if has_db else None,
-        target=_connection(raw.get("target"), "target") if has_db else None,
+        source=source,
+        target=target,
         web=web,
         files=files,
         schedules=parse_schedules(raw.get("schedules")),
         store=StoreConfig(
             store.get("s3_bucket"), store.get("s3_prefix", raw["project"]), store.get("kms_key_id")
         ),
-        database=_options(raw.get("database") or {}),
+        database=_options(raw.get("database") or {}, source, target),
         path=path,
     )
 
@@ -340,12 +381,13 @@ source:
   database: app
   secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/source   # username, password
   sslmode: verify-full          # full certificate verification; lowering it is reported
+                                # Oracle: TLS is TCPS, usually on port 2484
   # sslrootcert: /opt/liftproof/certs/private-ca.pem
   statement_timeout_ms: 600000
   rows_per_second: 0            # application side hashing only; 0 = unlimited
 
 target:
-  engine: postgresql
+  engine: postgresql            # postgresql, mysql or oracle; source and target may differ
   host: target.cluster-xyz.REGION.rds.amazonaws.com
   port: 5432
   database: app
@@ -376,7 +418,8 @@ files:                          # compare files the application generates or sto
     #     reason: scratch files, not migrated
 
 database:
-  schemas: [public]
+  schemas: [public]             # MySQL: the database name; Oracle: the owner, upper case
+  # schema_map: {{shop: public}}  # source schema -> target schema, when renamed
   # tables: [orders, customers]   # default: every table in the schemas
   rows_per_bucket: 50000
   timestamp_precision: 6

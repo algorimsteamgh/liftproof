@@ -35,6 +35,9 @@ DB = Comparator.DATABASE
 @dataclass
 class ReconcileOptions:
     schemas: list[str] = field(default_factory=lambda: ["public"])
+    # source schema -> target schema, for migrations that rename the schema (a MySQL
+    # database 'shop' becoming the PostgreSQL schema 'public'); unmapped names match as is
+    schema_map: dict[str, str] = field(default_factory=dict)
     tables: list[str] | None = None  # explicit selection, schema.table or table
     ignore: list[IgnoreRule] = field(default_factory=list)
     business_keys: dict[str, list[str]] = field(default_factory=dict)
@@ -151,18 +154,22 @@ class Reconciler:
                 return r
         return None
 
+    def _target_key(self, table: TableRef) -> str:
+        return f"{self.o.schema_map.get(table.schema, table.schema)}.{table.name}".lower()
+
     # ---------------------------------------------------------------------- run
     def run(self) -> ReconcileResult:
         if self.baseline is not None:
             source_tables = [TableRef(*q.split(".", 1)) for q in self.baseline.tables]
         else:
             source_tables = self.source.list_tables(self.o.schemas)
-        target_tables = {t.qualified.lower(): t for t in self.target.list_tables(self.o.schemas)}
+        target_schemas = list(dict.fromkeys(self.o.schema_map.get(x, x) for x in self.o.schemas))
+        target_tables = {t.qualified.lower(): t for t in self.target.list_tables(target_schemas)}
         source_tables = self._selected(source_tables)
         if self._replication_behind(source_tables):
             return self.result
 
-        for t in sorted(set(target_tables) - {s.qualified.lower() for s in source_tables}):
+        for t in sorted(set(target_tables) - {self._target_key(s) for s in source_tables}):
             if self.o.tables:
                 break
             self.emit(
@@ -189,7 +196,7 @@ class Reconciler:
                     TableResult(table.qualified, "excluded", reason=rule.reason)
                 )
                 continue
-            ttable = target_tables.get(table.qualified.lower())
+            ttable = target_tables.get(self._target_key(table))
             if ttable is None:
                 self.emit(
                     Kind.DIFFERENCE, Severity.HIGH, table.qualified, "table missing in target"
@@ -434,7 +441,7 @@ class Reconciler:
         # 2. table aggregate
         s_total = reduce_total(sum(a.total for a in s_aggs.values()))
         t_total = reduce_total(sum(a.total for a in t_aggs.values()))
-        self._floats(table, ttable, tp, res, plan.filter, tfilter)
+        self._floats(table, ttable, tp, res, tschema, plan.filter, tfilter)
         if s_total == t_total and res.target_rows == source_rows:
             return res
         res.status = "different"
@@ -689,6 +696,7 @@ class Reconciler:
         ttable: TableRef,
         tp: TablePlan,
         res: TableResult,
+        tschema: TableSchema,
         sfilter: str | None = None,
         tfilter: str | None = None,
     ) -> None:
@@ -706,7 +714,10 @@ class Reconciler:
         tol = self.o.float_rel_tolerance
         for col in tp.float_columns:
             a = self.source.float_stats(table, col, **({"where": sfilter} if sfilter else {}))
-            b = self.target.float_stats(ttable, col, **({"where": tfilter} if tfilter else {}))
+            tcol = tschema.column(col)  # the target's own spelling (Oracle: upper case)
+            b = self.target.float_stats(
+                ttable, tcol.name if tcol else col, **({"where": tfilter} if tfilter else {})
+            )
             problems = []
             for name in ("non_null", "nan_count", "inf_count"):
                 if getattr(a, name) != getattr(b, name):
