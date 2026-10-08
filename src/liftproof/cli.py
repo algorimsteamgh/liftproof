@@ -20,6 +20,8 @@ from typing import Any
 import yaml
 
 from liftproof import __version__, aws, logs
+from liftproof.adapters.base import Adapter
+from liftproof.adapters.mysql import MySQLAdapter
 from liftproof.adapters.postgres import PostgresAdapter
 from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
 from liftproof.config import TEMPLATE, Connection, Project, load_project
@@ -78,9 +80,10 @@ def _refuse_env_credentials() -> None:
         )
 
 
-def connect(conn: Connection) -> PostgresAdapter:
+def connect(conn: Connection) -> Adapter:
     creds = from_secrets_manager(conn.secret_arn) if conn.secret_arn else None
-    return PostgresAdapter(
+    cls = MySQLAdapter if conn.engine == "mysql" else PostgresAdapter
+    return cls(
         host=conn.host,
         port=conn.port,
         database=conn.database,

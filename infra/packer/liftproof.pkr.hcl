@@ -4,6 +4,10 @@
 # Marketplace AMIs cannot carry encrypted snapshots, so the image itself is
 # unencrypted; customers' volumes are encrypted with their own KMS key at launch
 # (see infra/modules/liftproof). The image holds no credentials and no customer data.
+#
+# The base is Ubuntu 24.04 LTS because the recorder and replay engine drive Chromium
+# through Playwright, which supports Ubuntu and installs Chromium with its libraries in
+# one step (docs/decisions.md 12).
 
 packer {
   required_version = ">= 1.11"
@@ -54,16 +58,16 @@ locals {
 source "amazon-ebs" "liftproof" {
   region          = var.region
   instance_type   = var.instance_type
-  ami_name        = "liftproof-${var.version}-al2023-${local.timestamp}"
+  ami_name        = "liftproof-${var.version}-ubuntu2404-${local.timestamp}"
   ami_description = "Liftproof ${var.version}: migration validation for workloads moving to AWS"
 
   source_ami_filter {
     filters = {
-      name                = "al2023-ami-2023.*-kernel-*-x86_64"
+      name                = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
       virtualization-type = "hvm"
       root-device-type    = "ebs"
     }
-    owners      = ["amazon"]
+    owners      = ["099720109477"] # Canonical
     most_recent = true
   }
 
@@ -73,7 +77,7 @@ source "amazon-ebs" "liftproof" {
   associate_public_ip_address = false
 
   communicator  = "ssh"
-  ssh_username  = "ec2-user"
+  ssh_username  = "ubuntu"
   ssh_interface = "session_manager"
 
   # IMDSv2 only, on the builder and baked into the image (AWSAPI-004)
@@ -89,7 +93,7 @@ source "amazon-ebs" "liftproof" {
   encrypt_boot  = false
 
   launch_block_device_mappings {
-    device_name           = "/dev/xvda"
+    device_name           = "/dev/sda1"
     volume_size           = 20
     volume_type           = "gp3"
     delete_on_termination = true
