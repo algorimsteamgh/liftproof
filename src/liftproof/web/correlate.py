@@ -5,17 +5,25 @@ candidate is a value found in a response (a JSON leaf, a hidden form field or CS
 tag, a Location header) that reappears in a later request or step. Short or low entropy
 candidates are recorded unconfirmed: the engineer confirms them, they are never applied
 silently.
+
+Transform chains: a value can be sent encoded and used decoded (a base64 reference that
+carries an order id, a URL encoded token), or sent plain and used encoded (an id that a
+later URL carries base64 or URL encoded). The first is a correlation's transforms, the
+decoding applied after extraction; the second its encodings, the other forms replaced
+when the value is substituted and masked when responses are compared.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import math
 import re
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, unquote
 
 from liftproof.web.journey import Correlation
 
@@ -35,6 +43,104 @@ def confident(value: str) -> bool:
     return (len(value) >= 5 and has_digit) or (
         len(value) >= 12 and entropy_bits(value) >= CONFIRM_BITS
     )
+
+
+# --------------------------------------------------------------- transform chains
+_B64 = re.compile(r"[A-Za-z0-9+/]{8,}={0,2}")
+_B64URL = re.compile(r"[A-Za-z0-9_-]{8,}={0,2}")
+
+
+def _text(raw: bytes) -> str | None:
+    """Decoded bytes as text, when they are text a person or a program would reuse."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return text if text and text.isprintable() else None
+
+
+def decode(name: str, value: str) -> str | None:
+    """One decoding step; None when the value is not in that form."""
+    match name:
+        case "url_decode":
+            return unquote(value, errors="strict") if "%" in value else None
+        case "base64_decode" | "base64url_decode":
+            pattern = _B64 if name == "base64_decode" else _B64URL
+            if not pattern.fullmatch(value):
+                return None
+            padded = value + "=" * (-len(value) % 4)
+            try:
+                raw = (
+                    base64.b64decode(padded, validate=True)
+                    if name == "base64_decode"
+                    else base64.urlsafe_b64decode(padded)
+                )
+            except (binascii.Error, ValueError):
+                return None
+            return _text(raw)
+    raise ValueError(f"unknown transform {name!r}")
+
+
+def encode(name: str, value: str) -> str:
+    match name:
+        case "url":
+            return quote(value, safe="")
+        case "url_plus":
+            return quote_plus(value)
+        case "base64":
+            return base64.b64encode(value.encode()).decode()
+        case "base64url":
+            return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+    raise ValueError(f"unknown encoding {name!r}")
+
+
+TRANSFORMS = ("url_decode", "base64_decode", "base64url_decode")
+ENCODINGS = ("url", "url_plus", "base64", "base64url")
+_INVERSE = {"url_decode": "url", "base64_decode": "base64", "base64url_decode": "base64url"}
+
+
+def check_chain(transforms: Sequence[str], encodings: Sequence[str]) -> None:
+    for t in transforms:
+        if t not in TRANSFORMS:
+            raise ValueError(f"unknown transform {t!r}; use one of {', '.join(TRANSFORMS)}")
+    for e in encodings:
+        if e not in ENCODINGS:
+            raise ValueError(f"unknown encoding {e!r}; use one of {', '.join(ENCODINGS)}")
+
+
+def apply(transforms: Sequence[str], value: str | None) -> str | None:
+    """The extracted value through its decoding chain; None if a step does not apply."""
+    for t in transforms:
+        if value is None:
+            return None
+        value = decode(t, value)
+    return value
+
+
+def forms(c: Correlation, value: str) -> dict[str, str]:
+    """Every form a correlated value takes, value included: the encodings later steps
+    use, and the encoded form the server sent before the transforms decoded it."""
+    out = {encode(e, value): e for e in c.encodings}
+    raw = value
+    for t in reversed(c.transforms):
+        raw = encode(_INVERSE[t], raw)
+    out.setdefault(raw, "source")  # a later step may reuse it as sent: then it is replaced
+    out[value] = ""
+    return out
+
+
+def _decoded(value: str) -> Iterator[tuple[list[str], str]]:
+    """The value's decoded forms with the chain that produced them, one or two steps
+    deep (base64 inside a URL encoded parameter)."""
+    for first in TRANSFORMS:
+        d = decode(first, value)
+        if d is None or d == value:
+            continue
+        yield [first], d
+        for second in TRANSFORMS:
+            d2 = decode(second, d)
+            if d2 is not None and d2 != d:
+                yield [first, second], d2
 
 
 def json_leaves(value: Any, path: str = "$") -> Iterator[tuple[str, str]]:
@@ -111,8 +217,13 @@ def extract(
     return None
 
 
-def _forms(value: str) -> set[str]:
-    return {value, quote(value, safe=""), quote_plus(value)}
+def _used_forms(value: str) -> dict[str, str]:
+    """form -> encoding name ('' for the value as it is)."""
+    out: dict[str, str] = {}
+    for e in reversed(ENCODINGS):
+        out[encode(e, value)] = e
+    out[value] = ""
+    return out
 
 
 def _name(path_or_field: str, endpoint: str, taken: set[str]) -> str:
@@ -154,21 +265,26 @@ def detect(
                     for k, seg in enumerate(segs)
                     if re.fullmatch(r"[0-9]+|[0-9a-fA-F-]{8,}", seg)
                 ]
-            for extractor, expression, value in sources:
-                if len(value) < MIN_LENGTH or value in seen_values:
+            later_requests = traffic[j + 1 :] + [x for t in steps_traffic[i + 1 :] for x in t]
+            for extractor, expression, sent in sources:
+                if len(sent) < MIN_LENGTH or sent in seen_values:
                     continue
-                forms = _forms(value)
-                used = []
-                later_requests = traffic[j + 1 :] + [x for t in steps_traffic[i + 1 :] for x in t]
-                for x in later_requests:
-                    if any(f in (x.get("request_text") or "") for f in forms):
-                        used.append(x["endpoint"])
-                for n, texts in enumerate(later_text[i + 1 :], start=i + 2):
-                    if any(f in t for t in texts for f in forms):
-                        used.append(f"step {n}")
-                if not used:
+                # the value as sent first; its decoded forms only when it is not reused
+                # as it is
+                hit = next(
+                    (
+                        (transforms, value, *uses)
+                        for transforms, value in [([], sent), *_decoded(sent)]
+                        if len(value) >= MIN_LENGTH
+                        for uses in [_uses(value, later_requests, later_text, i)]
+                        if uses[0]
+                    ),
+                    None,
+                )
+                if hit is None:
                     continue
-                seen_values.add(value)
+                transforms, value, used, encodings = hit
+                seen_values.add(sent)
                 found.append(
                     Correlation(
                         name=_name(
@@ -182,6 +298,34 @@ def detect(
                         recorded_value=value,
                         used_in=sorted(set(used)),
                         confirmed=confident(value),
+                        transforms=transforms,
+                        encodings=encodings,
                     )
                 )
     return found
+
+
+def _uses(
+    value: str, later_requests: list[dict[str, Any]], later_text: list[list[str]], i: int
+) -> tuple[list[str], list[str]]:
+    """Where the value reappears after step i (endpoints and steps), and the encodings
+    it reappears in besides its plain form."""
+    candidates = _used_forms(value)
+    used: list[str] = []
+    seen: set[str] = set()
+    for x in later_requests:
+        text = x.get("request_text") or ""
+        hit = [e for f, e in candidates.items() if f in text]
+        if hit:
+            used.append(x["endpoint"])
+            seen.update(hit)
+    for n, texts in enumerate(later_text[i + 1 :], start=i + 2):
+        hit = [e for f, e in candidates.items() if any(f in t for t in texts)]
+        if hit:
+            used.append(f"step {n}")
+            seen.update(hit)
+    if {"base64", "base64url"} <= seen and encode("base64url", value) == encode(
+        "base64", value
+    ).rstrip("="):
+        seen.discard("base64url")  # the same characters: base64url only lacks the padding
+    return used, [e for e in ENCODINGS if e in seen]

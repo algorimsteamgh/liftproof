@@ -62,6 +62,9 @@ class ReconcileOptions:
     # tables reconciled at once, each worker on its own connections (spec 9.15: worker
     # concurrency multiplies source load, so this is a ceiling to be measured)
     workers: int = 1
+    # table -> a column that only grows (identity key, creation time), to tell rows a
+    # replay created apart; default: a single column primary key
+    replay_watermarks: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

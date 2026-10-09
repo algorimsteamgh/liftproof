@@ -39,12 +39,14 @@ from liftproof.errors import (
 )
 from liftproof.files.compare import FileResult
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity, read_findings
+from liftproof.reconcile import watermark
 from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import Reconciler, ReconcileResult, TableResult
 from liftproof.reconcile.replication import SOURCE_SIDE
 from liftproof.report.builder import build_report, who_ran_it, write_reports
 from liftproof.runlock import RunInProgress
 from liftproof.store import LocalStore, S3Store, Store
+from liftproof.web import correlate
 from liftproof.web.journey import Journey
 from liftproof.web.run import WebResult
 
@@ -320,6 +322,8 @@ def _reconcile_into(
                         detail={"sslmode": conn.sslmode},
                     )
                 )
+        if not getattr(args, "include_replay_rows", False):
+            o = _without_replay_rows(o, store, workdir, target, baseline)
         rec = Reconciler(
             target, writer, o, source=source, baseline=baseline, progress=lambda m: log.info(m)
         )
@@ -332,6 +336,50 @@ def _reconcile_into(
         for a in (source, target):
             if a is not None:
                 a.close()
+
+
+def _without_replay_rows(o, store: Store, workdir: Path, target: Adapter, baseline):
+    """The options with the rows earlier replays created left out on the target."""
+    from dataclasses import replace
+
+    local = workdir / watermark.STORE_KEY
+    store.get_file(watermark.STORE_KEY, local)
+    since = baseline.taken_at if baseline is not None and baseline.side == "target" else None
+    extra = watermark.rules(watermark.load(local), target, since)
+    return replace(o, ignore=[*o.ignore, *extra]) if extra else o
+
+
+def _replay_watermarks(project: Project, journeys: list[Journey], writer: FindingWriter):
+    """Open the target database and read the watermark of every table the journeys
+    write, before the replay. None when there is nothing to read; trouble is reported,
+    never fatal to the replay."""
+    wanted = [t for j in journeys for t in j.writes_tables]
+    if not wanted or project.target is None:
+        return None
+    o = project.database
+    try:
+        target = connect(project.target)
+    except Exception as exc:  # noqa: BLE001 - the replay goes ahead without marks
+        _replay_mark_notice(writer, exc)
+        return None
+    try:
+        schemas = list(dict.fromkeys(o.schema_map.get(x, x) for x in o.schemas))
+        tables, problems = watermark.resolve(target, schemas, wanted, o.replay_watermarks)
+        for p in problems:
+            _replay_mark_notice(writer, p)
+        return target, tables, watermark.read(target, tables)
+    except Exception as exc:  # noqa: BLE001 - as above
+        target.close()
+        _replay_mark_notice(writer, exc)
+        return None
+
+
+def _replay_mark_notice(writer: FindingWriter, problem: object) -> None:
+    writer.write(Finding(Comparator.DATABASE, Kind.NOTICE, Severity.LOW, "replay",
+                         f"replay rows cannot be marked: {problem}"))  # fmt: skip
+
+
+REPLAY_ROWS_HELP = "compare the rows earlier replays created on the target too (default: left out)"
 
 
 def _files_into(args: argparse.Namespace, project: Project, writer: FindingWriter) -> FileResult:
@@ -549,6 +597,11 @@ def _load_journey(store: Store, workdir: Path, journey_id: str) -> Journey:
     if not path.exists() and not store.get_file(f"journeys/{journey_id}.json", path):
         raise ConfigError(f"journey {journey_id} not found; record it with liftproof record")
     journey = Journey.load(path)
+    for c in journey.correlations:
+        try:
+            correlate.check_chain(c.transforms, c.encodings)
+        except ValueError as exc:
+            raise ConfigError(f"journey {journey_id}, correlation {c.name}: {exc}") from None
     assets = _journey_dir(workdir) / journey_id / "assets"
     for step in journey.steps:
         for ex in step.exchanges:
@@ -601,17 +654,40 @@ def _replay_into(
         ignore_text=web.ignore_text,
         show_values=bool(args.show_values or project.database.show_values),
     )
-    return run_journeys(
-        journeys,
-        target_url=web.target_url,
-        options=options,
-        emit=writer.write,
-        assets_dir=lambda j: _journey_dir(workdir) / j.journey_id / "assets",
-        secret_values=_journey_secrets,
-        step_timeout_ms=web.step_timeout_ms,
-        executable_path=web.chromium_path,
-        workers=web.parallel_journeys,
-    )
+    marks = _replay_watermarks(project, journeys, writer)
+    try:
+        return run_journeys(
+            journeys,
+            target_url=web.target_url,
+            options=options,
+            emit=writer.write,
+            assets_dir=lambda j: _journey_dir(workdir) / j.journey_id / "assets",
+            secret_values=_journey_secrets,
+            step_timeout_ms=web.step_timeout_ms,
+            executable_path=web.chromium_path,
+            workers=web.parallel_journeys,
+        )
+    finally:
+        if marks is not None:
+            _record_replay_windows(marks, store, workdir, writer)
+
+
+def _record_replay_windows(marks, store: Store, workdir: Path, writer: FindingWriter) -> None:
+    """Read the watermarks again and keep the windows with the project, for the
+    reconciliations that follow. Trouble is a notice, never the replay's failure."""
+    target, tables, before = marks
+    try:
+        after = watermark.read(target, tables)
+        new = watermark.windows(tables, before, after, writer.run_id)
+        if new:
+            local = workdir / watermark.STORE_KEY
+            store.get_file(watermark.STORE_KEY, local)
+            watermark.save(local, [*watermark.load(local), *new])
+            store.put_file(watermark.STORE_KEY, local)
+    except Exception as exc:  # noqa: BLE001 - the replay's own results still stand
+        _replay_mark_notice(writer, exc)
+    finally:
+        target.close()
 
 
 def cmd_record(args: argparse.Namespace) -> int:
@@ -1192,6 +1268,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--run-id")
     s.add_argument("--template", help="directory holding a custom report.html.j2")
     s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
+    s.add_argument("--include-replay-rows", action="store_true", help=REPLAY_ROWS_HELP)
     s.set_defaults(fn=cmd_reconcile)
 
     def run_flags(s, database: bool) -> None:
@@ -1208,6 +1285,7 @@ def build_parser() -> argparse.ArgumentParser:
             s.add_argument("--baseline", help="baseline id, 'latest' or 'latest-target'")
             s.add_argument("--no-source", action="store_true")
             s.add_argument("--tables", help="comma separated subset")
+            s.add_argument("--include-replay-rows", action="store_true", help=REPLAY_ROWS_HELP)
 
     s = with_project("record", "record a user journey on the source application")
     s.add_argument("--journey", required=True, help="journey id, e.g. checkout-flow")

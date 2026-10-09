@@ -180,8 +180,6 @@ def test_cli_bind_and_replay(recorded, tmp_path, monkeypatch, capsys, variant, e
 def test_parallel_journeys_opt_in(recorded):
     """Independent journeys at once: each keeps its own steps in order, results keep the
     journeys' order, and the result records that the run was parallel (spec 6)."""
-    import time
-
     journey, assets = recorded
     journeys = []
     for i in range(4):
@@ -191,7 +189,6 @@ def test_parallel_journeys_opt_in(recorded):
 
     def run(workers):
         with ShopApp(latency_ms=100) as target:
-            t0 = time.perf_counter()
             result = run_journeys(
                 journeys,
                 target_url=target.url,
@@ -201,15 +198,17 @@ def test_parallel_journeys_opt_in(recorded):
                 secret_values=lambda j: {t: PASSWORD for t in j.secrets},
                 workers=workers,
             )
-            return result, time.perf_counter() - t0
+            return result, target.peak_sessions
 
-    seq, seq_s = run(1)
-    par, par_s = run(4)
+    # whether the journeys overlapped, not how much faster they were: wall clock on a
+    # small CI runner is mostly four browsers starting
+    seq, seq_peak = run(1)
+    par, par_peak = run(4)
     assert (seq.parallel, seq.workers) == (False, 1)
     assert (par.parallel, par.workers) == (True, 4)
     assert [j.journey for j in par.journeys] == [j.journey_id for j in journeys]
     assert {j.status for j in par.journeys} == {"passed"}
-    assert par_s < 0.75 * seq_s, (par_s, seq_s)
+    assert (seq_peak, par_peak >= 2) == (1, True), (seq_peak, par_peak)
 
 
 @pytest.mark.parametrize("value", [0, 9, "many"])

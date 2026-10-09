@@ -219,6 +219,10 @@ def _options(
             "each worker is another connection reading the source"
         )
     opts.workers = workers
+    marks = d.get("replay_watermarks") or {}
+    if not isinstance(marks, dict):
+        raise ConfigError("database.replay_watermarks maps a table to its growing column")
+    opts.replay_watermarks = {str(k): str(v) for k, v in marks.items()}
     sampling = d.get("sampling")
     if sampling:
         if not isinstance(sampling, dict) or "above_rows" not in sampling:
@@ -475,6 +479,9 @@ database:
     #   source_where: "tenant = 'test'"
     #   target_where: "tenant = 'qa'"
     #   reason: test tenant renamed in the target
+  # replay_watermarks:          # rows a replay creates are left out of later reconciliations,
+  #   orders: id                # told apart by a column that only grows; default: a single
+  #   events: created_at        # column primary key (journeys name tables: record --writes)
   # replication:                # has replication applied everything up to the reference point?
   #   method: slot              # slot (on a PostgreSQL source, e.g. read by AWS DMS),
   #                             # subscription (PostgreSQL logical replication, on the target),

@@ -7,6 +7,8 @@ engine fixtures. Nothing outside the adapter changes.
 from __future__ import annotations
 
 import abc
+import datetime as dt
+import decimal
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -237,6 +239,27 @@ class Adapter(abc.ABC):
         keys = ("task_status", "status_time", "pending_changes", "source_current_timestamp",
                 "source_timestamp_applied")  # fmt: skip
         return dict(zip(keys, rows[0], strict=True))
+
+    # names and values in this engine's SQL (watermark predicates) ----------------
+    def quote_name(self, name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    def qualified_name(self, table: TableRef) -> str:
+        return f"{self.quote_name(table.schema)}.{self.quote_name(table.name)}"
+
+    def literal(self, value: Any) -> str:
+        """An integer, exact number or timestamp as a SQL literal."""
+        if isinstance(value, dt.datetime):
+            if value.tzinfo is not None:  # sessions are pinned to UTC
+                value = value.astimezone(dt.UTC).replace(tzinfo=None)
+            return f"TIMESTAMP '{value.isoformat(sep=' ', timespec='microseconds')}'"
+        if isinstance(value, (int, decimal.Decimal)) and not isinstance(value, bool):
+            return str(value)
+        raise ValueError(f"no literal for {type(value).__name__}")
+
+    def column_max(self, table: TableRef, column: str) -> Any:
+        q = f"SELECT MAX({self.quote_name(column)}) FROM {self.qualified_name(table)}"  # noqa: S608
+        return self._rows(q, [])[0][0]
 
     def shares_snapshot(self, position: dict[str, Any]) -> bool:
         """Can fork(position) open connections reading the same state as this one? Called
