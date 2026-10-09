@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Projects</h1>
+<p class="sub">The project files on this instance. Runs started here run the CLI, the same as a pipeline or a schedule.</p>
+{% if not projects %}
+<p>No project files yet. Put one in the projects directory (<code>liftproof init</code> writes one).</p>
+{% else %}
+<div class="scroll"><table>
+  <tr><th>Project</th><th>File</th><th>Last run</th><th>Verdict</th></tr>
+  {% for x in projects %}
+  <tr>
+    <td>{% if x.problem %}{{ x.name }}{% else %}<a href="/p/{{ x.name }}">{{ x.name }}</a>{% endif %}</td>
+    <td><code>{{ x.file }}</code></td>
+    {% if x.problem %}
+    <td colspan="2" class="failed">Cannot be read: {{ x.problem }}</td>
+    {% elif x.last %}
+    <td>{{ x.last.started_at | when }}</td>
+    <td class="{{ x.last.verdict }}">{{ (x.last.verdict or '').replace('_', ' ') }}</td>
+    {% else %}
+    <td class="muted" colspan="2">No runs yet</td>
+    {% endif %}
+  </tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+{% endblock %}

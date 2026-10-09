@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{% block head %}{% endblock %}
+<title>{% block title %}Liftproof{% endblock %}</title>
+<style>
+  :root { --fg:#1b1d22; --muted:#5d6470; --bg:#fff; --panel:#f5f6f8; --line:#e2e5ea;
+          --ok:#1d7a46; --warn:#9a6300; --bad:#b3261e; --accent:#5b3cc4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e7e9ee; --muted:#a0a7b4; --bg:#15171b; --panel:#1f2228; --line:#30343c;
+            --ok:#5cc58a; --warn:#e0a53a; --bad:#f07067; --accent:#a48bff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         color:var(--fg); background:var(--bg); }
+  header { border-bottom:1px solid var(--line); }
+  header .in, main { max-width: 1080px; margin: 0 auto; padding: 14px 20px; }
+  header .in { display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  header a.brand { font-weight:700; letter-spacing:.04em; color:var(--fg); text-decoration:none; }
+  header form { margin-left:auto; display:flex; gap:6px; align-items:center; white-space:nowrap; }
+  main { padding-bottom: 64px; }
+  a { color: var(--accent); }
+  h1 { font-size: 22px; margin: 18px 0 4px; }
+  h2 { font-size: 16px; margin: 32px 0 10px; }
+  .sub, .muted { color: var(--muted); }
+  table { width:100%; border-collapse: collapse; font-size:13px; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align: top; }
+  th { color:var(--muted); font-weight:600; font-size:12px; }
+  .scroll { overflow-x:auto; }
+  .passed, .clean { color: var(--ok); } .passed_with_differences, .differences { color: var(--warn); }
+  .failed, .run.failed, .configuration.error { color: var(--bad); }
+  .panel { background:var(--panel); border-radius:10px; padding:14px 16px; }
+  form.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr)); gap:10px 16px;
+              align-items:end; }
+  label { display:block; font-size:12px; color:var(--muted); }
+  input[type=text], select { width:100%; padding:6px 8px; border:1px solid var(--line); border-radius:6px;
+                             background:var(--bg); color:var(--fg); font:inherit; }
+  label.check { display:flex; gap:6px; align-items:center; color:var(--fg); font-size:13px; }
+  button { padding:7px 14px; border-radius:6px; border:1px solid var(--accent); background:var(--accent);
+           color:#fff; font:inherit; cursor:pointer; }
+  button.quiet { background:transparent; color:var(--accent); }
+  pre { background:var(--panel); padding:12px; border-radius:8px; overflow:auto; font-size:12px;
+        max-height:70vh; white-space:pre-wrap; word-break:break-word; }
+  code { font-size:12px; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:99px; border:1px solid var(--line);
+         font-size:12px; }
+</style>
+</head>
+<body>
+<header><div class="in">
+  <a class="brand" href="/">LIFTPROOF</a>
+  {% block crumbs %}{% endblock %}
+  <form method="post" action="/name">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="back" value="{% block back %}/{% endblock %}">
+    <label for="who">You are</label>
+    <input id="who" type="text" name="name" value="{{ person or '' }}" placeholder="your name" size="14">
+    <button class="quiet" type="submit">Save</button>
+  </form>
+</div></header>
+<main>
+{% block body %}{% endblock %}
+</main>
+</body>
+</html>

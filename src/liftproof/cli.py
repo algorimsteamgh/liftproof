@@ -897,7 +897,18 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
 def cmd_runs(args: argparse.Namespace) -> int:
     """Run history from the reports on this instance (spec 14)."""
     project = _project(args)
-    runs_dir = Path(args.workdir) / project.name / "runs"
+    rows = run_history(Path(args.workdir) / project.name / "runs")[: args.limit]
+    text = "\n".join(
+        f"{x['started_at']}  {x['run_id']:<34} {x['mode'] or '':<10} {x['verdict'] or '':<16} "
+        f"{x['schedule'] or 'by hand'}"
+        for x in rows
+    )
+    _out(args, {"runs": rows}, text or "no runs yet")
+    return EXIT_OK
+
+
+def run_history(runs_dir: Path) -> list[dict[str, Any]]:
+    """The runs whose reports are on this instance, newest first."""
     rows = []
     for d in runs_dir.iterdir() if runs_dir.exists() else []:
         try:
@@ -912,17 +923,11 @@ def cmd_runs(args: argparse.Namespace) -> int:
                 "verdict": r.get("verdict"),
                 "differences": r.get("counts", {}).get("differences"),
                 "schedule": r.get("run", {}).get("schedule"),
+                "invoked_by": r.get("run", {}).get("invoked_by"),
             }
         )
     rows.sort(key=lambda x: x["started_at"] or "", reverse=True)
-    rows = rows[: args.limit]
-    text = "\n".join(
-        f"{x['started_at']}  {x['run_id']:<34} {x['mode'] or '':<10} {x['verdict'] or '':<16} "
-        f"{x['schedule'] or 'by hand'}"
-        for x in rows
-    )
-    _out(args, {"runs": rows}, text or "no runs yet")
-    return EXIT_OK
+    return rows
 
 
 def cmd_schedule(args: argparse.Namespace) -> int:
@@ -952,6 +957,41 @@ def cmd_scheduler(args: argparse.Namespace) -> int:
         )
         return EXIT_OK
     sched.serve(args.interval)
+    return EXIT_OK
+
+
+UI_PORT = 8080  # the port the deployment templates forward
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    """The local web UI (spec 4): 127.0.0.1 only, reached through SSM port forwarding."""
+    from liftproof.ui.server import UI, make_server, new_login
+
+    workdir = Path(args.workdir)
+    server = make_server(UI(Path(args.projects_dir), workdir), args.host, args.port)
+    print(f"Liftproof UI on http://127.0.0.1:{server.server_address[1]}", file=sys.stderr)
+    if sys.stderr.isatty():  # a login link goes to a terminal, never to a service's log
+        print(f"sign in: {_login_url(server.server_address[1], new_login(workdir))}",
+              file=sys.stderr)  # fmt: skip
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return EXIT_OK
+
+
+def _login_url(port: int, code: str) -> str:
+    return f"http://127.0.0.1:{port}/login?code={code}"
+
+
+def cmd_ui_login(args: argparse.Namespace) -> int:
+    """A one time login link for the UI: ten minutes, one use."""
+    from liftproof.ui.server import LOGIN_SECONDS, new_login
+
+    url = _login_url(args.port, new_login(Path(args.workdir)))
+    minutes = LOGIN_SECONDS // 60
+    text = f"{url}\n(one use, within {minutes} minutes, through the port forwarding session)"
+    _out(args, {"login_url": url, "valid_minutes": minutes, "uses": 1}, text)
     return EXIT_OK
 
 
@@ -1353,6 +1393,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--once", action="store_true", help="fire what is due now, then exit")
     s.add_argument("--interval", type=float, default=30.0, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_scheduler)
+
+    s = sub.add_parser("ui", parents=[common], help="the local web UI (127.0.0.1 only)")
+    s.add_argument("--projects-dir", default=str(DEFAULT_WORKDIR))
+    s.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
+    s.add_argument("--port", type=int, default=UI_PORT)
+    s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("ui-login", parents=[common], help="a one time login link for the UI")
+    s.add_argument("--port", type=int, default=UI_PORT, help="the UI's port, for the link")
+    s.set_defaults(fn=cmd_ui_login)
 
     s = with_project("support-bundle", "package logs and findings, values redacted, for support")
     s.add_argument("--run", help="run id; default: the latest run")

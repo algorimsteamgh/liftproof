@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Liftproof · {{ p.name }}{% endblock %}
+{% block crumbs %}<span class="muted">/</span> <span>{{ p.name }}</span>{% endblock %}
+{% block back %}/p/{{ p.name }}{% endblock %}
+{% block body %}
+<h1>{{ p.name }}</h1>
+<p class="sub"><code>{{ file }}</code>{% if p.target %} · target {{ p.target.describe() }}{% endif %}</p>
+
+<h2>Start a run</h2>
+<div class="panel">
+<form class="grid" method="post" action="/p/{{ p.name }}/start">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <div><label for="command">Command</label>
+    <select id="command" name="command">
+      {% for c in commands %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+    </select></div>
+  <div><label for="baseline">Baseline (validate, reconcile)</label>
+    <input id="baseline" type="text" name="baseline" placeholder="latest, latest-target or an id"></div>
+  <div><label for="tables">Tables</label>
+    <input id="tables" type="text" name="tables" placeholder="all; or a,b,c"></div>
+  <div><label for="journeys">Journeys (validate, replay, smoke)</label>
+    <input id="journeys" type="text" name="journeys" placeholder="all; or a,b"></div>
+  <div><label for="sets">File sets (validate, files)</label>
+    <input id="sets" type="text" name="sets" placeholder="all; or a,b"></div>
+  <div>
+    <label class="check"><input type="checkbox" name="no_source" value="1"> Do not connect to the source</label>
+    <label class="check"><input type="checkbox" name="include_replay_rows" value="1"> Compare rows replays created</label>
+    <label class="check"><input type="checkbox" name="resume" value="1"> Resume an interrupted baseline</label>
+  </div>
+  <div><button type="submit">Start</button></div>
+</form>
+<p class="sub">Each command takes the options that apply to it and ignores the rest. Runs never overlap: a run started while another is going is refused and says so.</p>
+</div>
+
+{% if jobs %}
+<h2>Started here</h2>
+<div class="scroll"><table>
+  <tr><th>Started</th><th>Command</th><th>By</th><th>Status</th><th></th></tr>
+  {% for j in jobs %}
+  <tr><td>{{ j.started_at | when }}</td><td>{{ j.command }}</td><td>{{ j.invoked_by }}</td>
+      <td class="{{ j.status }}">{{ j.status }}</td><td><a href="/p/{{ p.name }}/jobs/{{ j.job_id }}">Output</a></td></tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+
+<h2>Runs</h2>
+{% if runs %}
+<div class="scroll"><table>
+  <tr><th>Started</th><th>Run</th><th>Mode</th><th>Verdict</th><th>Differences</th><th>By</th><th>Report</th></tr>
+  {% for r in runs %}
+  <tr>
+    <td>{{ r.started_at | when }}</td><td><code>{{ r.run_id }}</code></td><td>{{ r.mode or '' }}</td>
+    <td class="{{ r.verdict }}">{{ (r.verdict or '').replace('_', ' ') }}</td>
+    <td>{{ r.differences if r.differences is not none else '' }}</td>
+    <td>{{ r.invoked_by or (r.schedule and 'schedule ' ~ r.schedule) or '' }}</td>
+    <td><a href="/p/{{ p.name }}/runs/{{ r.run_id }}/report.html">HTML</a> · <a href="/p/{{ p.name }}/runs/{{ r.run_id }}/report.json">JSON</a></td>
+  </tr>
+  {% endfor %}
+</table></div>
+{% else %}
+<p class="muted">No runs on this instance yet.</p>
+{% endif %}
+
+{% if schedules %}
+<h2>Schedules</h2>
+<div class="scroll"><table>
+  <tr><th>Name</th><th>When</th><th>Time zone</th><th>Next (UTC)</th><th>Command</th></tr>
+  {% for s in schedules %}
+  <tr><td>{{ s.name }}</td><td><code>{{ s.cron }}</code></td><td>{{ s.timezone }}</td>
+      <td>{{ s.next_run_utc | when }}</td><td>{{ s.command }}</td></tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+
+{% if p.web %}
+<h2>Journeys</h2>
+{% if journeys %}
+<ul>{% for j in journeys %}<li><a href="/p/{{ p.name }}/journeys/{{ j }}">{{ j }}</a></li>{% endfor %}</ul>
+{% else %}
+<p class="muted">None recorded yet.</p>
+{% endif %}
+<p class="sub">Recording needs a browser window, so it runs on a machine with a display that can reach the source application and this project's store:
+<code>liftproof record --project {{ file }} --journey checkout-flow</code>. The journey then appears here.</p>
+{% endif %}
+{% endblock %}
