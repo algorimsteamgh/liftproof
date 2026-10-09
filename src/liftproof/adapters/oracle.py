@@ -343,6 +343,23 @@ class OracleAdapter(Adapter):
     def _rows(self, q: str, args: Sequence[Any]) -> list[tuple[Any, ...]]:
         return self._query(q.format(*[f":{i + 1}" for i in range(len(args))]), list(args))
 
+    def current_position(self) -> dict[str, Any] | None:
+        (at,) = self._query("SELECT SYS_EXTRACT_UTC(SYSTIMESTAMP) FROM DUAL")[0]
+        return {**self._scn(), "taken_at": at.replace(tzinfo=dt.UTC).isoformat()}
+
+    def _scn(self) -> dict[str, Any]:
+        """The SCN now; it needs SELECT on V$DATABASE or EXECUTE on DBMS_FLASHBACK, and is
+        recorded as unknown without either."""
+        for q in (
+            "SELECT TO_CHAR(CURRENT_SCN) FROM V$DATABASE",
+            "SELECT TO_CHAR(DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER) FROM DUAL",
+        ):
+            try:
+                return {"type": "scn", "position": self._query(q)[0][0]}
+            except oracledb.Error:
+                continue
+        return {"type": "none", "position": None}
+
     # snapshot -----------------------------------------------------------------
     def begin_snapshot(self) -> dict[str, Any]:
         """One read only transaction: Oracle answers every query in it as of the moment
@@ -354,18 +371,8 @@ class OracleAdapter(Adapter):
             (at,) = cur.fetchone()
         self._in_snapshot = True
         # The SCN is read just after the transaction began, so it can trail the snapshot
-        # by the changes committed in between; it needs SELECT on V$DATABASE or EXECUTE
-        # on DBMS_FLASHBACK, and is recorded as unknown without either.
-        position: dict[str, Any] = {"type": "none", "position": None}
-        for q in (
-            "SELECT TO_CHAR(CURRENT_SCN) FROM V$DATABASE",
-            "SELECT TO_CHAR(DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER) FROM DUAL",
-        ):
-            try:
-                position = {"type": "scn", "position": self._query(q)[0][0]}
-                break
-            except oracledb.Error:
-                continue
+        # by the changes committed in between.
+        position = self._scn()
         replica = False
         try:
             replica = self._query("SELECT DATABASE_ROLE FROM V$DATABASE")[0][0] != "PRIMARY"

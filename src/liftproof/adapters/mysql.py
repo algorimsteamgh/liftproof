@@ -239,7 +239,7 @@ class MySQLAdapter(Adapter):
     # Each connection opens its own snapshot: workers reconcile live tables, a baseline
     # is taken on one connection (see shares_snapshot).
     supports_workers = True
-    replication_methods = ("replica", "dms")
+    replication_methods = ("replica", "dms", "goldengate")
     dms_schema = "awsdms_control"
 
     def quote_name(self, name: str) -> str:
@@ -397,6 +397,12 @@ class MySQLAdapter(Adapter):
             "replica": bool(ro),
             "taken_at": at.replace(tzinfo=dt.UTC).isoformat(),
         }
+
+    def current_position(self) -> dict[str, Any] | None:
+        at, gtid = self._query("SELECT UTC_TIMESTAMP(6), @@GLOBAL.gtid_executed")[0]
+        gtid = gtid.replace("\n", "") if gtid else gtid
+        position = {"type": "gtid", "position": gtid} if gtid else self._binlog_position()
+        return {**position, "taken_at": at.replace(tzinfo=dt.UTC).isoformat()}
 
     def _binlog_position(self) -> dict[str, Any]:
         for stmt in ("SHOW BINARY LOG STATUS", "SHOW MASTER STATUS"):

@@ -17,6 +17,16 @@ Methods (project file, database.replication):
   DMS reports times, not positions, so the reference is the time the snapshot was taken,
   on the source's clock: replication has caught up when the task has applied a commit
   made at or after it, or has read past it with nothing pending.
+- goldengate: an Oracle GoldenGate Replicat, from any source engine to any target engine;
+  read on the target. Its checkpoint table (CHECKPOINTTABLE) says up to which source CSN
+  every transaction is applied, which for an Oracle source is the SCN the snapshot was
+  taken at. Its heartbeat table (ADD HEARTBEATTABLE) carries a source timestamp through
+  the Replicat about once a minute, so it also answers for other source engines and for
+  an idle source, whose CSN stops moving: caught up when either says so.
+- availability_group: a SQL Server Always On availability group (a distributed one
+  included) with the target as a secondary replica; read on the source (the primary),
+  where every replica's last redone commit LSN is visible. The reference is the
+  primary's last commit LSN when the snapshot was taken.
 - none: no check. The report says the position was not verified.
 """
 
@@ -32,11 +42,12 @@ from typing import Any
 from liftproof.adapters.base import Adapter
 from liftproof.errors import ConfigError
 
-METHODS = ("none", "subscription", "slot", "replica", "dms")
+METHODS = ("none", "subscription", "slot", "replica", "dms", "goldengate", "availability_group")
 # which side each method is read on
-SOURCE_SIDE = ("slot",)
+SOURCE_SIDE = ("slot", "availability_group")
 NAME_OPTIONAL = ("replica",)  # MySQL's default replication channel has no name
 REASON_BEHIND = "replication behind the baseline point"
+PLAIN = r"[A-Za-z_][A-Za-z0-9_$#]*"
 
 
 @dataclass
@@ -46,6 +57,8 @@ class ReplicationConfig:
     wait_seconds: int = 0  # how long to wait for it to catch up before giving up
     poll_seconds: int = 5
     control_schema: str | None = None  # dms: the task's ControlSchema, when it sets one
+    checkpoint_table: str | None = None  # goldengate: the Replicat's CHECKPOINTTABLE
+    heartbeat_table: str | None = None  # goldengate: GG_HEARTBEAT, schema qualified
 
     @classmethod
     def from_dict(cls, d: Any) -> ReplicationConfig:
@@ -60,13 +73,25 @@ class ReplicationConfig:
         if method not in ("none", *NAME_OPTIONAL) and not name:
             raise ConfigError(f"database.replication.name is required for method {method}")
         schema = d.get("control_schema")
-        if schema is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", str(schema)):
+        if schema is not None and not re.fullmatch(PLAIN, str(schema)):
             raise ConfigError("database.replication.control_schema must be a plain name")
+        tables = {}
+        for key in ("checkpoint_table", "heartbeat_table"):
+            v = d.get(key)
+            if v is not None and not re.fullmatch(rf"({PLAIN}\.)?{PLAIN}", str(v)):
+                raise ConfigError(f"database.replication.{key} must be table or schema.table")
+            tables[key] = str(v) if v else None
+        if method == "goldengate" and not any(tables.values()):
+            raise ConfigError(
+                "database.replication needs checkpoint_table, heartbeat_table or both for "
+                "method goldengate"
+            )
         return cls(
             method,
             str(name) if name else None,
             int(d.get("wait_seconds", 0)),
             control_schema=str(schema) if schema else None,
+            **tables,
         )
 
 
@@ -104,6 +129,24 @@ def check(
             return ReplicationResult("unverified", None, None, "dms",
                                      "the reference has no snapshot time")  # fmt: skip
         pos, kind = str(taken), "time"
+    elif cfg.method == "goldengate":
+        if not (position or {}).get("taken_at") and kind != "scn":
+            return ReplicationResult("unverified", None, None, "goldengate",
+                                     "the reference has neither an SCN nor a snapshot "
+                                     "time")  # fmt: skip
+        if kind != "scn" and not cfg.heartbeat_table:
+            return ReplicationResult("unverified", None, None, "goldengate",
+                                     "the checkpoint table holds source CSNs, which only an "
+                                     "Oracle source's SCN can be compared with; set "
+                                     "heartbeat_table for other sources")  # fmt: skip
+        pos = pos if kind == "scn" else str(position["taken_at"])
+    elif cfg.method == "availability_group":
+        pos, kind = (position or {}).get("commit_lsn"), "commit_lsn"
+        if not pos:
+            return ReplicationResult("unverified", None, None, cfg.method,
+                                     "the reference has no availability group commit LSN: "
+                                     "the source database is not in an availability group, "
+                                     "or the login lacks VIEW SERVER STATE")  # fmt: skip
     elif not pos or not kind:
         return ReplicationResult("unverified", None, None, cfg.method,
                                  "the reference has no consistency position")  # fmt: skip
@@ -122,6 +165,8 @@ def check(
     while True:
         if cfg.method == "dms":
             got = _dms_reached(side, cfg, pos)
+        elif cfg.method == "goldengate":
+            got = _gg_reached(side, cfg, position or {})
         else:
             got = side.replication_reached(cfg.method, cfg.name or "", kind, pos)
         if got is None:
@@ -164,3 +209,22 @@ def _dms_reached(target: Adapter, cfg: ReplicationConfig, taken_at: str) -> tupl
         f"(task {str(row['task_status']).strip().lower()}, {pending} changes pending)"
     )
     return text, reached
+
+
+def _gg_reached(
+    target: Adapter, cfg: ReplicationConfig, position: dict[str, Any]
+) -> tuple[str, bool] | None:
+    st = target.goldengate_status(cfg.checkpoint_table, cfg.heartbeat_table, cfg.name or "")
+    if st is None:
+        return None
+    scn = position.get("position") if position.get("type") == "scn" else None
+    taken = _utc(position.get("taken_at"))
+    csn, beat = st["csn"], _utc(st["heartbeat"])
+    by_csn = scn is not None and csn is not None and csn >= int(scn)
+    by_beat = taken is not None and beat is not None and beat >= taken
+    parts = []
+    if cfg.checkpoint_table:
+        parts.append(f"source CSN {csn if csn is not None else 'none'}")
+    if cfg.heartbeat_table:
+        parts.append(f"heartbeat from {beat.isoformat() if beat else 'none'}")
+    return ", ".join(parts), by_csn or by_beat
