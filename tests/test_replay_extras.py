@@ -304,3 +304,45 @@ def correlate_type():
     from liftproof.canonical import CanonicalType
 
     return CanonicalType.INTEGER
+
+
+
+def test_since_compares_times_not_text():
+    # stored times differ in precision and offset: a baseline taken half a second after
+    # the r1 window, written in +05:30, still comes after it
+    w = [watermark.Window("public.orders", "id", "1", "5", "number", "r1",
+                          "2026-10-09T04:00:00+00:00"),
+         watermark.Window("public.orders", "id", "5", "9", "number", "r2",
+                          "2026-10-09T04:00:01+00:00")]  # fmt: skip
+    pg = SimpleNamespace(quote_name=lambda n: f'"{n}"', literal=lambda v: str(v))
+    [rule] = watermark.rules(w, pg, since="2026-10-09T09:30:00.500000+05:30")
+    assert "(r2)" in rule.reason
+
+
+def test_a_target_outage_does_not_fail_the_replay(tmp_path, monkeypatch):
+    conn = {"engine": "postgresql", "host": "db.invalid", "user": "u", "database": "d"}
+    project = tmp_path / "acme.yaml"
+    project.write_text(yaml.safe_dump({
+        "project": "acme", "source": conn, "target": conn,
+        "web": {"source_url": "http://src.invalid", "target_url": "http://tgt.invalid"},
+    }))  # fmt: skip
+    work = tmp_path / "work"
+    jdir = work / "acme" / "journeys"
+    jdir.mkdir(parents=True)
+    Journey("checkout", "http://src.invalid", writes_tables=["orders"]).save(jdir / "checkout.json")
+
+    def down(c):
+        raise OSError("connection refused")
+
+    def fake_replay(journeys, **kw):
+        from liftproof.web.run import WebResult
+
+        return WebResult(target_url=kw["target_url"])
+
+    monkeypatch.setattr(cli, "connect", down)
+    monkeypatch.setattr("liftproof.web.run.run_journeys", fake_replay)
+    argv = ["--project", str(project), "--workdir", str(work), "--format", "json"]
+    assert cli.main(["replay", *argv, "--run-id", "rp1"]) == EXIT_OK
+    run_dir = work / "acme" / "runs" / "rp1"
+    text = "".join(f.read_text() for f in run_dir.glob("findings-*"))
+    assert "replay rows cannot be marked: connection refused" in text

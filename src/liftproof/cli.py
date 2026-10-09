@@ -359,20 +359,24 @@ def _replay_watermarks(project: Project, journeys: list[Journey], writer: Findin
     o = project.database
     try:
         target = connect(project.target)
-    except ConfigError as exc:
-        writer.write(Finding(Comparator.DATABASE, Kind.NOTICE, Severity.LOW, "replay",
-                             f"replay rows cannot be marked: {exc}"))  # fmt: skip
+    except Exception as exc:  # noqa: BLE001 - the replay goes ahead without marks
+        _replay_mark_notice(writer, exc)
         return None
     try:
         schemas = list(dict.fromkeys(o.schema_map.get(x, x) for x in o.schemas))
         tables, problems = watermark.resolve(target, schemas, wanted, o.replay_watermarks)
         for p in problems:
-            writer.write(Finding(Comparator.DATABASE, Kind.NOTICE, Severity.LOW, "replay",
-                                 f"replay rows cannot be marked: {p}"))  # fmt: skip
+            _replay_mark_notice(writer, p)
         return target, tables, watermark.read(target, tables)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - as above
         target.close()
-        raise
+        _replay_mark_notice(writer, exc)
+        return None
+
+
+def _replay_mark_notice(writer: FindingWriter, problem: object) -> None:
+    writer.write(Finding(Comparator.DATABASE, Kind.NOTICE, Severity.LOW, "replay",
+                         f"replay rows cannot be marked: {problem}"))  # fmt: skip
 
 
 REPLAY_ROWS_HELP = "compare the rows earlier replays created on the target too (default: left out)"
@@ -665,17 +669,25 @@ def _replay_into(
         )
     finally:
         if marks is not None:
-            target, tables, before = marks
-            try:
-                after = watermark.read(target, tables)
-            finally:
-                target.close()
-            new = watermark.windows(tables, before, after, writer.run_id)
-            if new:  # kept with the project, for the reconciliations that follow
-                local = workdir / watermark.STORE_KEY
-                store.get_file(watermark.STORE_KEY, local)
-                watermark.save(local, [*watermark.load(local), *new])
-                store.put_file(watermark.STORE_KEY, local)
+            _record_replay_windows(marks, store, workdir, writer)
+
+
+def _record_replay_windows(marks, store: Store, workdir: Path, writer: FindingWriter) -> None:
+    """Read the watermarks again and keep the windows with the project, for the
+    reconciliations that follow. Trouble is a notice, never the replay's failure."""
+    target, tables, before = marks
+    try:
+        after = watermark.read(target, tables)
+        new = watermark.windows(tables, before, after, writer.run_id)
+        if new:
+            local = workdir / watermark.STORE_KEY
+            store.get_file(watermark.STORE_KEY, local)
+            watermark.save(local, [*watermark.load(local), *new])
+            store.put_file(watermark.STORE_KEY, local)
+    except Exception as exc:  # noqa: BLE001 - the replay's own results still stand
+        _replay_mark_notice(writer, exc)
+    finally:
+        target.close()
 
 
 def cmd_record(args: argparse.Namespace) -> int:

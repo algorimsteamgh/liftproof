@@ -63,6 +63,13 @@ def _text(value: Any) -> tuple[str, str]:
     return str(value), "number"
 
 
+def _utc(text: str) -> dt.datetime:
+    """A stored time as an aware UTC datetime (texts differ in precision and offset, so
+    they are not compared as strings); a time without an offset is UTC."""
+    at = dt.datetime.fromisoformat(text)
+    return at.replace(tzinfo=dt.UTC) if at.tzinfo is None else at.astimezone(dt.UTC)
+
+
 def resolve(
     target: Adapter, schemas: Sequence[str], wanted: Sequence[str], columns: dict[str, str]
 ) -> tuple[dict[TableRef, str], list[str]]:
@@ -137,9 +144,10 @@ def save(path: Path, items: list[Window]) -> None:
 def rules(items: Sequence[Window], target: Adapter, since: str | None = None) -> list[IgnoreRule]:
     """Target side row rules for the windows. since: only windows recorded after it (a
     target baseline already holds the rows of replays before it was taken)."""
+    cutoff = None if since is None else _utc(since)
     by_table: dict[str, list[Window]] = {}
     for w in items:
-        if since is None or w.recorded_at > since:
+        if cutoff is None or _utc(w.recorded_at) > cutoff:
             by_table.setdefault(w.table, []).append(w)
     out = []
     for table, ws in by_table.items():
