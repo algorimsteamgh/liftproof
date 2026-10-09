@@ -68,6 +68,10 @@ class ShopApp:
         self.orders: dict[str, dict] = {}
         self.sessions: set[str] = set()
         self.csrf: set[str] = set()
+        # signed-in sessions with a request in flight, and the most there were at once
+        self.busy: dict[str, int] = {}
+        self.peak_sessions = 0
+        self._lock = threading.Lock()
         app = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -75,6 +79,22 @@ class ShopApp:
                 pass
 
             def _send(self, status, body, ctype="text/html", headers=None):
+                sid = next((c.strip()[4:] for c in self.headers.get("Cookie", "").split(";")
+                            if c.strip().startswith("sid=")), None)  # fmt: skip
+                if sid:
+                    with app._lock:
+                        app.busy[sid] = app.busy.get(sid, 0) + 1
+                        app.peak_sessions = max(app.peak_sessions, len(app.busy))
+                try:
+                    self._respond(status, body, ctype, headers)
+                finally:
+                    if sid:
+                        with app._lock:
+                            app.busy[sid] -= 1
+                            if not app.busy[sid]:
+                                del app.busy[sid]
+
+            def _respond(self, status, body, ctype, headers):
                 if app.latency_ms:
                     time.sleep(app.latency_ms / 1000)
                 data = body.encode() if isinstance(body, str) else body
