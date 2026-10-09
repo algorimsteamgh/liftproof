@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from liftproof.adapters.base import TableRef
+from liftproof.errors import ConfigError
 from liftproof.findings import FindingWriter, Kind, read_findings
 from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import ReconcileOptions, Reconciler
@@ -285,6 +286,104 @@ def test_dms_status_table_on_the_target(engine):
     assert status(ref - second, ref - second, 0).status == "behind"
     with pytest.raises(Exception, match="not found"):
         check(replace(cfg, name="OTHER"), position, source=None, target=a)
+
+
+GG_DDL = {
+    "mysql": ("CREATE TABLE ggs_checkpoint (group_name varchar(8), group_key bigint, "
+              "log_cmplt_csn varchar(129))",
+              "CREATE TABLE gg_heartbeat (incoming_replicat varchar(8), "
+              "incoming_heartbeat_ts datetime(6))"),
+    "oracle": ("CREATE TABLE ggs_checkpoint (group_name VARCHAR2(8), group_key NUMBER(19), "
+               "log_cmplt_csn VARCHAR2(129))",
+               "CREATE TABLE gg_heartbeat (incoming_replicat VARCHAR2(8), "
+               "incoming_heartbeat_ts TIMESTAMP(6))"),
+    "sqlserver": ("CREATE TABLE dbo.ggs_checkpoint (group_name varchar(8), group_key bigint, "
+                  "log_cmplt_csn varchar(129))",
+                  "CREATE TABLE dbo.gg_heartbeat (incoming_replicat varchar(8), "
+                  "incoming_heartbeat_ts datetime2(6))"),
+}  # fmt: skip
+
+
+def test_goldengate_tables_on_the_target(engine):
+    tgt, tc = engine.make("tgt")
+    for ddl in GG_DDL[engine.name]:
+        _exec(engine, tc, ddl)
+    m = ", ".join(engine.mark(i) for i in range(3))
+    tc.executemany(f"INSERT INTO ggs_checkpoint VALUES ({m})",
+                   [("REP1    ", 1, "1000"), ("RPAR001", 2, "900"), ("RPAR002", 3, "1100"),
+                    ("REP10", 4, "1")])  # fmt: skip
+    beat = dt.datetime(2026, 10, 9, 5, 0, 0)
+    m2 = ", ".join(engine.mark(i) for i in range(2))
+    tc.executemany(f"INSERT INTO gg_heartbeat VALUES ({m2})",
+                   [("REP1", beat - dt.timedelta(minutes=1)), ("REP1", beat)])  # fmt: skip
+    if engine.name == "oracle":
+        tc.connection.commit()
+    a = engine.adapter(tgt)
+    schema = engine.schema_of(tgt)
+    cfg = ReplicationConfig.from_dict({"method": "goldengate", "name": "REP1",
+                                       "checkpoint_table": f"{schema}.ggs_checkpoint",
+                                       "heartbeat_table": f"{schema}.gg_heartbeat"})  # fmt: skip
+    ref = (beat + dt.timedelta(seconds=30)).replace(tzinfo=dt.UTC).isoformat()
+
+    def at(scn, name="REP1", taken_at=ref, kind="scn"):
+        pos = {"type": kind, "position": scn, "taken_at": taken_at}
+        return check(replace(cfg, name=name), pos, source=None, target=a)
+
+    assert a.goldengate_status(cfg.checkpoint_table, None, "rep1")["csn"] == 1000  # not REP10
+    assert at("1000").status == "caught_up"
+    behind = at("1001")
+    assert behind.status == "behind" and "source CSN 1000" in behind.applied
+    assert at("1000", name="RPAR").status == "behind"  # the slowest thread counts
+    assert at("950", name="RPAR", taken_at=None).status == "behind"
+    # no SCN (a source other than Oracle), or an idle Oracle source: the heartbeat answers
+    early = (beat - dt.timedelta(seconds=1)).replace(tzinfo=dt.UTC).isoformat()
+    assert at("0/1", kind="lsn", taken_at=early).status == "caught_up"
+    assert at("0/1", kind="lsn").status == "behind"
+    assert at("1", kind="lsn", taken_at=None).status == "unverified"
+    with pytest.raises(ConfigError, match="not found"):
+        at("1000", name="OTHER")
+
+
+def test_live_source_position(engine):
+    db, _ = engine.make("src")
+    a = engine.adapter(db)
+    pos = a.current_position()
+    kinds = {"mysql": ("gtid", "binlog", "none"), "oracle": ("scn",), "sqlserver": ("dbts",)}
+    assert pos["type"] in kinds[engine.name]
+    taken = dt.datetime.fromisoformat(pos["taken_at"])
+    assert abs((dt.datetime.now(dt.UTC) - taken).total_seconds()) < 120
+
+
+@pytest.mark.sqlserver
+def test_sqlserver_availability_group(make_sqlserver_db, sqlserver_adapter_for):
+    from liftproof.adapters.sqlserver import SQLServerAdapter
+
+    db, _ = make_sqlserver_db("ag")
+    a = sqlserver_adapter_for(db)
+    # the test server is not in an availability group
+    snap = a.begin_snapshot()
+    a.end_snapshot()
+    assert "commit_lsn" not in snap and a._replicas() == {}
+    cfg = ReplicationConfig("availability_group", "EC2AMAZ-TARGET")
+    assert check(cfg, snap, source=a, target=a).status == "unverified"
+    with pytest.raises(ConfigError, match="not found"):
+        check(cfg, {**snap, "commit_lsn": "45000000042000001"}, source=a, target=a)
+
+    class Primary(SQLServerAdapter):
+        def __init__(self, replicas):  # noqa: D107 - no connection
+            self.replicas = replicas
+
+        def _replicas(self):
+            return self.replicas
+
+    ref = {"type": "dbts", "position": "0x07D1", "commit_lsn": "45000000042000001"}
+    synced = Primary({"EC2AMAZ-TARGET": ("45000000042000001", "synchronized")})
+    r = check(cfg, ref, source=synced, target=a)
+    assert r.status == "caught_up" and "synchronized" in r.applied
+    lag = Primary({"EC2AMAZ-TARGET": ("45000000041999999", "synchronizing")})
+    assert check(cfg, ref, source=lag, target=a).status == "behind"
+    assert check(cfg, ref, source=Primary({"EC2AMAZ-TARGET": (None, "not synchronizing")}),
+                 target=a).status == "behind"  # fmt: skip
 
 
 @pytest.mark.mysql

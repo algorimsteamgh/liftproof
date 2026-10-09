@@ -9,6 +9,7 @@ identical output by the parity tests.
 
 from __future__ import annotations
 
+import datetime as dt
 import time
 from collections.abc import Iterator, Sequence
 from typing import Any
@@ -224,7 +225,7 @@ class PostgresAdapter(Adapter):
             "taken_at": at.isoformat(),
         }
 
-    replication_methods = ("subscription", "slot", "dms")
+    replication_methods = ("subscription", "slot", "dms", "goldengate")
     dms_schema = "public"
 
     def _rows(self, q: str, args: Sequence[Any]) -> list[tuple[Any, ...]]:
@@ -242,10 +243,10 @@ class PostgresAdapter(Adapter):
         with self.conn.cursor() as cur:
             cur.execute(
                 "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text "
-                "ELSE pg_current_wal_lsn()::text END"
+                "ELSE pg_current_wal_lsn()::text END, clock_timestamp()"
             )
-            (lsn,) = cur.fetchone()
-        return {"type": "lsn", "position": lsn}
+            lsn, at = cur.fetchone()
+        return {"type": "lsn", "position": lsn, "taken_at": at.astimezone(dt.UTC).isoformat()}
 
     def replication_applied(self, method: str, name: str) -> str | None:
         """subscription: run on the target, native logical replication from a PostgreSQL

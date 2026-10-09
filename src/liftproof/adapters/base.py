@@ -174,8 +174,9 @@ class Adapter(abc.ABC):
 
     # replication position (spec 9.2) -----------------------------------------------
     # Engines that cannot answer leave these as they are; the check then reports that
-    # it is not available rather than guessing. Every engine can be an AWS DMS target.
-    replication_methods: tuple[str, ...] = ("dms",)
+    # it is not available rather than guessing. Every engine can be an AWS DMS or an Oracle
+    # GoldenGate target.
+    replication_methods: tuple[str, ...] = ("dms", "goldengate")
     # Where AWS DMS puts its control tables on this engine when the task does not set
     # ControlSchema. None: the login's own schema.
     dms_schema: str | None = None
@@ -239,6 +240,37 @@ class Adapter(abc.ABC):
         keys = ("task_status", "status_time", "pending_changes", "source_current_timestamp",
                 "source_timestamp_applied")  # fmt: skip
         return dict(zip(keys, rows[0], strict=True))
+
+    def goldengate_status(
+        self, checkpoint_table: str | None, heartbeat_table: str | None, group: str
+    ) -> dict[str, Any] | None:
+        """How far an Oracle GoldenGate Replicat writing to this (target) database has got:
+        csn, the lowest source CSN up to which its checkpoint table says every transaction
+        is applied (the threads of a coordinated or parallel Replicat checkpoint as the
+        group name plus three digits, and the slowest one counts); heartbeat, the newest
+        source time of a heartbeat it has applied. None: the group is in neither table."""
+        name = group.strip().upper()
+
+        def ours(g: Any) -> bool:
+            g = str(g or "").strip().upper()
+            return g == name or (g[: len(name)] == name and len(g) == len(name) + 3
+                                 and g[len(name):].isdigit())  # fmt: skip
+
+        found, csn, beat = False, None, None
+        if checkpoint_table:
+            q = f"SELECT group_name, log_cmplt_csn FROM {checkpoint_table}"  # noqa: S608
+            csns = [r[1] for r in self._rows(q, []) if ours(r[0])]
+            found = bool(csns)
+            if csns and all(c is not None and str(c).strip().isdigit() for c in csns):
+                csn = min(int(str(c).strip()) for c in csns)
+        if heartbeat_table:
+            q = f"SELECT incoming_replicat, incoming_heartbeat_ts FROM {heartbeat_table}"  # noqa: S608
+            beats = [r[1] for r in self._rows(q, []) if ours(r[0])]
+            found = found or bool(beats)
+            beat = max((b for b in beats if b is not None), default=None)
+        if not found:
+            return None
+        return {"csn": csn, "heartbeat": beat}
 
     # names and values in this engine's SQL (watermark predicates) ----------------
     def quote_name(self, name: str) -> str:

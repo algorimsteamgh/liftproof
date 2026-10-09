@@ -268,6 +268,7 @@ class SQLServerAdapter(Adapter):
     # is taken on one connection (SQL Server cannot share a snapshot).
     supports_workers = True
     dms_schema = "dbo"
+    replication_methods = ("availability_group", "dms", "goldengate")
 
     def quote_name(self, name: str) -> str:
         return quote(name)
@@ -381,9 +382,60 @@ class SQLServerAdapter(Adapter):
             cur.execute("BEGIN TRANSACTION")
         self._in_snapshot = True
         self._settings["snapshot"] = "SNAPSHOT isolation"
-        # @@DBTS (the database's last rowversion) is read just before the transaction's
-        # first data read, so it can trail the snapshot by the changes in between.
-        return {**position, "type": "dbts", "position": dbts}
+        # @@DBTS (the database's last rowversion) and the availability group commit LSN
+        # are read just before the transaction's first data read, so they can trail the
+        # snapshot by the changes in between.
+        return {**position, "type": "dbts", "position": dbts, **self._commit_lsn()}
+
+    def current_position(self) -> dict[str, Any] | None:
+        at, dbts = self._query("SELECT SYSUTCDATETIME(), CONVERT(varchar(18), @@DBTS, 1)")[0]
+        taken_at = at.replace(tzinfo=dt.UTC).isoformat()
+        return {"type": "dbts", "position": dbts, "taken_at": taken_at, **self._commit_lsn()}
+
+    def _commit_lsn(self) -> dict[str, str]:
+        """The last commit LSN of this database as an availability group replica sees it,
+        when it is in one and the login holds VIEW SERVER STATE."""
+        try:
+            rows = self._query(
+                "SELECT CONVERT(varchar(30), last_commit_lsn) FROM "
+                "sys.dm_hadr_database_replica_states WHERE database_id = DB_ID() AND is_local = 1"
+            )
+        except pytds.Error:
+            return {}
+        return {"commit_lsn": rows[0][0]} if rows and rows[0][0] else {}
+
+    # replication (spec 9.2) ---------------------------------------------------
+    def _replicas(self) -> dict[str, tuple[str | None, str]]:
+        """Replica name -> (last commit LSN redone there, synchronization state), for the
+        other replicas of this database's availability group. Read on the primary."""
+        rows = self._query(
+            "SELECT ar.replica_server_name, CONVERT(varchar(30), drs.last_commit_lsn), "
+            "drs.synchronization_state_desc FROM sys.dm_hadr_database_replica_states drs "
+            "JOIN sys.availability_replicas ar ON ar.replica_id = drs.replica_id "
+            "WHERE drs.database_id = DB_ID() AND drs.is_local = 0"
+        )
+        return {str(r[0]).upper(): (r[1], str(r[2]).lower()) for r in rows}
+
+    def replication_applied(self, method: str, name: str) -> str | None:
+        """availability_group: run on the primary (the source); name is the target's
+        replica, or for a distributed availability group the target's group. Needs VIEW
+        SERVER STATE."""
+        if method != "availability_group":
+            raise NotImplementedError(method)
+        got = self._replicas().get(name.upper())
+        return None if got is None else f"commit LSN {got[0] or 'none'} ({got[1]})"
+
+    def replication_reached(
+        self, method: str, name: str, kind: str, position: str
+    ) -> tuple[str, bool] | None:
+        if method != "availability_group" or kind != "commit_lsn":
+            raise NotImplementedError(f"{method} {kind}")
+        got = self._replicas().get(name.upper())
+        if got is None:
+            return None
+        lsn, state = got
+        reached = lsn is not None and int(lsn) >= int(position)
+        return f"commit LSN {lsn or 'none'} ({state})", reached
 
     def end_snapshot(self) -> None:
         if self._in_snapshot:

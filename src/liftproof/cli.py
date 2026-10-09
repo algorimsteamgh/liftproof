@@ -1073,6 +1073,14 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                         f"dms task {rep.name}: {str(row['task_status']).strip().lower()}, "
                         f"{row['pending_changes']} changes pending"
                     )
+                if rep.method == "goldengate":
+                    st = a.goldengate_status(rep.checkpoint_table, rep.heartbeat_table,
+                                             rep.name or "")  # fmt: skip
+                    _assert(st is not None, f"Replicat {rep.name!r} not in the GoldenGate tables")
+                    return (
+                        f"goldengate {rep.name}: source CSN {st['csn']}, "
+                        f"heartbeat from {st['heartbeat']}"
+                    )
                 applied = a.replication_applied(rep.method, rep.name or "")
                 _assert(applied is not None, f"{rep.method} {rep.name or ''!r} not found")
                 return f"{rep.method} {rep.name or ''} has applied {applied}".replace("  ", " ")
@@ -1084,6 +1092,11 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                 "dms": "turn on StatusTableEnabled in the task settings, set control_schema "
                 "if the task sets ControlSchema, and grant SELECT on awsdms_status",
                 "replica": "SHOW REPLICA STATUS needs the REPLICATION CLIENT privilege",
+                "goldengate": "check the Replicat name and the CHECKPOINTTABLE and heartbeat "
+                "table names, and grant SELECT on them",
+                "availability_group": "name the target's replica (or, for a distributed "
+                "availability group, the target's group) and grant VIEW SERVER STATE on the "
+                "source",
             }.get(
                 rep.method,
                 "check the name; reading pg_stat_subscription or pg_replication_slots needs "
