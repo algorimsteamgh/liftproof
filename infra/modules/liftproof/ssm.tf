@@ -22,7 +22,7 @@ resource "aws_ssm_document" "run" {
       mode = {
         type          = "String"
         default       = "reconcile"
-        allowedValues = ["validate", "reconcile", "files", "replay", "smoke", "baseline", "rebaseline", "doctor", "support-bundle"]
+        allowedValues = ["validate", "reconcile", "files", "replay", "smoke", "baseline", "rebaseline", "doctor", "support-bundle", "ui-login"]
       }
       journeys = {
         type           = "String"
@@ -64,6 +64,7 @@ resource "aws_ssm_document" "run" {
           "case '{{ mode }}' in reconcile|validate) args+=(--baseline {{ baseline }});; esac",
           "case '{{ mode }}' in replay|smoke|validate) [ -z '{{ journeys }}' ] || args+=(--journeys '{{ journeys }}');; esac",
           "case '{{ mode }}' in files|validate) [ -z '{{ sets }}' ] || args+=(--sets '{{ sets }}');; esac",
+          "case '{{ mode }}' in ui-login) args=(--workdir /var/lib/mvt/projects --format json);; esac",
           "systemd-run --unit=liftproof-{{ project }}-$(date +%s) --wait --pipe --collect --quiet -p User=mvt -E LIFTPROOF_INVOKED_BY=ssm-run-command /opt/mvt/bin/liftproof {{ mode }} \"$${args[@]}\"",
         ]
       }

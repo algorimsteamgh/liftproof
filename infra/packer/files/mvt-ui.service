@@ -1,0 +1,22 @@
+[Unit]
+Description=Liftproof web UI (127.0.0.1 only; reach it through SSM port forwarding)
+After=network-online.target cloud-final.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mvt
+Group=mvt
+ExecStart=/opt/mvt/bin/liftproof ui --projects-dir /var/lib/mvt/projects --workdir /var/lib/mvt/projects --port 8080
+Restart=on-failure
+RestartSec=10
+# runs started from the UI finish even if the UI stops
+KillMode=process
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/mvt /var/log/mvt
+
+[Install]
+WantedBy=multi-user.target

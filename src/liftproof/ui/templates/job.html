@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block head %}{% if job.status == 'running' %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block title %}Liftproof · {{ job.command }}{% endblock %}
+{% block crumbs %}<span class="muted">/</span> <a href="/p/{{ p.name }}">{{ p.name }}</a> <span class="muted">/</span> <span>{{ job.command }}</span>{% endblock %}
+{% block back %}/p/{{ p.name }}{% endblock %}
+{% block body %}
+<h1>{{ job.command }} <span class="{{ job.status }}">{{ job.status }}</span></h1>
+<p class="sub">Started {{ job.started_at | when }} UTC by {{ job.invoked_by }}{% if job.status == 'running' %} · this page refreshes until it finishes{% endif %}</p>
+{% if job.run_id and job.status != 'running' %}
+<p><a href="/p/{{ p.name }}/runs/{{ job.run_id }}/report.html">Open the report</a> · <a href="/p/{{ p.name }}/runs/{{ job.run_id }}/report.json">JSON</a></p>
+{% endif %}
+<pre>{{ output or 'No output yet.' }}</pre>
+{% endblock %}

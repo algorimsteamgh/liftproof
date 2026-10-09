@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Liftproof · {{ journey_id }}{% endblock %}
+{% block crumbs %}<span class="muted">/</span> <a href="/p/{{ p.name }}">{{ p.name }}</a> <span class="muted">/</span> <span>{{ journey_id }}</span>{% endblock %}
+{% block back %}/p/{{ p.name }}/journeys/{{ journey_id }}{% endblock %}
+{% block body %}
+<h1>{{ journey_id }}</h1>
+{% if problem %}
+<p class="failed">{{ problem }}</p>
+{% else %}
+<p class="sub">{{ j.steps | length }} steps{% if j.story %} · story {{ j.story }}{% endif %}{% if j.recorded_at %} · recorded {{ j.recorded_at | when }}{% endif %}{% if j.writes_tables %} · writes {{ j.writes_tables | join(', ') }}{% endif %}</p>
+
+<h2>Secrets</h2>
+{% if j.secrets %}
+<div class="scroll"><table>
+  <tr><th>Token</th><th>Field</th><th>Bound to</th></tr>
+  {% for t, b in j.secrets.items() %}
+  <tr><td><code>{{ t }}</code></td><td>{{ b.field }}</td>
+    <td>{% if b.arn %}<code>{{ b.arn }}</code> key <code>{{ b.key }}</code>{% else %}<span class="failed">not bound: replay will refuse this journey</span>{% endif %}</td></tr>
+  {% endfor %}
+</table></div>
+<div class="panel">
+<form class="grid" method="post" action="/p/{{ p.name }}/journeys/{{ journey_id }}/bind">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <div><label for="token">Token</label>
+    <select id="token" name="token">{% for t in j.secrets %}<option>{{ t }}</option>{% endfor %}</select></div>
+  <div><label for="arn">Secrets Manager secret ARN</label>
+    <input id="arn" type="text" name="secret_arn" placeholder="arn:aws:secretsmanager:ap-south-1:..."></div>
+  <div><label for="key">Key in the secret</label><input id="key" type="text" name="key" value="password"></div>
+  <div><button type="submit">Bind</button></div>
+</form>
+<p class="sub">Only the ARN and key are stored in the journey; the value is read from Secrets Manager at replay.</p>
+</div>
+{% else %}
+<p class="muted">Nothing was redacted in this journey.</p>
+{% endif %}
+
+<h2>Correlations</h2>
+{% if j.correlations %}
+<div class="scroll"><table>
+  <tr><th>Name</th><th>From</th><th>Used in</th><th>Status</th></tr>
+  {% for c in j.correlations %}
+  <tr><td>{{ c.name }}</td><td>{{ c.extractor }} <code>{{ c.expression }}</code> in {{ c.source }}</td>
+    <td>{{ c.used_in | join(', ') }}</td>
+    <td>{% if c.confirmed %}confirmed{% else %}
+      <form method="post" action="/p/{{ p.name }}/journeys/{{ journey_id }}/bind">
+        <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirm" value="{{ c.name }}">
+        <button class="quiet" type="submit">Confirm</button></form>{% endif %}</td></tr>
+  {% endfor %}
+</table></div>
+{% else %}
+<p class="muted">No correlated values.</p>
+{% endif %}
+
+<h2>Steps</h2>
+<div class="scroll"><table>
+  <tr><th>#</th><th>Action</th><th>Target</th><th>Requests</th></tr>
+  {% for s in j.steps %}
+  <tr><td>{{ s.n }}</td><td>{{ s.action }}{% if s.non_idempotent %} <span class="tag">changes data</span>{% endif %}</td>
+    <td>{{ s.url or (s.locator.description if s.locator else '') }}</td><td>{{ s.exchanges | length }}</td></tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+{% endblock %}
