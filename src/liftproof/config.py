@@ -488,7 +488,11 @@ database:
   #                             # replica (MySQL replication, on the target; name: channel),
   #                             # dms (any engines: the task's awsdms_status table on the
   #                             # target; name: the task's resource ID; control_schema if
-  #                             # the task sets ControlSchema)
+  #                             # the task sets ControlSchema),
+  #                             # goldengate (any engines: name: the Replicat;
+  #                             # checkpoint_table and/or heartbeat_table on the target),
+  #                             # availability_group (SQL Server, on the source; name: the
+  #                             # target's replica, or its group in a distributed one)
   #   name: dms_slot
   #   wait_seconds: 300         # wait this long for it to catch up; then not_checked
 

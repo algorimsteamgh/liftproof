@@ -73,7 +73,15 @@ def test_unverified_without_a_method_or_a_position():
 def test_config_rules():
     assert ReplicationConfig.from_dict(None).method == "none"
     with pytest.raises(ConfigError, match="must be one of"):
-        ReplicationConfig.from_dict({"method": "goldengate"})
+        ReplicationConfig.from_dict({"method": "logshipping"})
+    with pytest.raises(ConfigError, match="checkpoint_table, heartbeat_table or both"):
+        ReplicationConfig.from_dict({"method": "goldengate", "name": "REP1"})
+    with pytest.raises(ConfigError, match="table or schema.table"):
+        ReplicationConfig.from_dict({"method": "goldengate", "name": "REP1",
+                                     "checkpoint_table": "gg.ckpt; drop"})  # fmt: skip
+    gg = ReplicationConfig.from_dict({"method": "goldengate", "name": "REP1",
+                                      "checkpoint_table": "ggadmin.ggs_checkpoint"})  # fmt: skip
+    assert (gg.checkpoint_table, gg.heartbeat_table) == ("ggadmin.ggs_checkpoint", None)
     with pytest.raises(ConfigError, match="name is required"):
         ReplicationConfig.from_dict({"method": "slot"})
     with pytest.raises(ConfigError, match="name is required"):
@@ -165,3 +173,27 @@ def test_subscription_waits_until_rows_in_flight_have_landed(tmp_path, replicate
     assert result.replication["status"] == "caught_up", result.replication
     assert time.monotonic() - t0 < 60
     assert [x.status for x in result.tables] == ["matched"], [f.summary for f in findings]
+
+
+# ------------------------------------------------------------ GoldenGate on PostgreSQL
+@pytest.mark.postgres
+def test_goldengate_tables_on_a_postgresql_target(make_db, adapter_for):
+    import datetime as dt
+
+    db, cur = make_db("gg")
+    cur.execute("CREATE TABLE ggs_checkpoint (group_name varchar(8), group_key bigint, "
+                "log_cmplt_csn varchar(129));"
+                "CREATE TABLE gg_heartbeat (incoming_replicat varchar(8), "
+                "incoming_heartbeat_ts timestamp(6));"
+                "INSERT INTO ggs_checkpoint VALUES ('REP1    ', 1, '5000');"
+                "INSERT INTO gg_heartbeat VALUES ('REP1', '2026-10-09 05:00:00')")  # fmt: skip
+    a = adapter_for(db)
+    cfg = ReplicationConfig.from_dict({"method": "goldengate", "name": "rep1",
+                                       "checkpoint_table": "public.ggs_checkpoint",
+                                       "heartbeat_table": "gg_heartbeat"})  # fmt: skip
+    at = dt.datetime(2026, 10, 9, 5, 0, 30, tzinfo=dt.UTC).isoformat()
+    r = check(cfg, {"type": "scn", "position": "4000", "taken_at": at}, source=None, target=a)
+    assert r.status == "caught_up" and "source CSN 5000" in r.applied
+    # a PostgreSQL source has no SCN: the heartbeat answers, and is older than the snapshot
+    r = check(cfg, {"type": "lsn", "position": "0/1", "taken_at": at}, source=None, target=a)
+    assert r.status == "behind" and "heartbeat from 2026-10-09T05:00:00" in r.applied
