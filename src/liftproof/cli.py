@@ -86,6 +86,18 @@ def _refuse_env_credentials() -> None:
         )
 
 
+# The AMI ships the system CA certificates and the Amazon RDS CA bundle in one file
+# (spec 15), so RDS and publicly signed endpoints verify with no setting. A project's
+# own sslrootcert (a private CA) takes its place.
+CA_BUNDLE = Path(os.environ.get("LIFTPROOF_CA_BUNDLE", "/opt/mvt/certs/ca-bundle.pem"))
+
+
+def _sslrootcert(conn: Connection) -> str | None:
+    if conn.sslrootcert or not conn.tls_verified:
+        return conn.sslrootcert
+    return str(CA_BUNDLE) if CA_BUNDLE.is_file() else None
+
+
 def connect(conn: Connection) -> Adapter:
     creds = from_secrets_manager(conn.secret_arn) if conn.secret_arn else None
     cls = {"mysql": MySQLAdapter, "oracle": OracleAdapter, "sqlserver": SQLServerAdapter}.get(
@@ -98,7 +110,7 @@ def connect(conn: Connection) -> Adapter:
         user=(creds.username if creds and creds.username else conn.user),
         password=creds.password if creds else None,
         sslmode=conn.sslmode,
-        sslrootcert=conn.sslrootcert,
+        sslrootcert=_sslrootcert(conn),
         statement_timeout_ms=conn.statement_timeout_ms,
         rows_per_second=conn.rows_per_second,
         read_only=True,
@@ -112,8 +124,15 @@ def _instance_config() -> dict[str, Any]:
     """Instance level settings written at launch by the deployment template."""
     try:
         return yaml.safe_load(INSTANCE_CONFIG.read_text(encoding="utf-8")) or {}
-    except (FileNotFoundError, PermissionError):
+    except FileNotFoundError:
         return {}
+    except PermissionError:
+        # Carrying on without them would quietly drop the deployment's bucket, key and
+        # report lock, so this is a configuration error, not a default.
+        raise ConfigError(
+            f"cannot read the instance settings in {INSTANCE_CONFIG}; run Liftproof as "
+            "the mvt user (sudo -u mvt liftproof ...)"
+        ) from None
 
 
 def _store(project: Project, workdir: Path) -> Store:

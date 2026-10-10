@@ -46,6 +46,25 @@ python3.12 -m venv /opt/mvt
 ln -sf /opt/mvt/bin/liftproof /usr/local/bin/liftproof
 ln -sf /opt/mvt/bin/liftproof /usr/local/bin/mvt
 
+# Database TLS (spec 15). The Amazon RDS CA bundle is kept in the repository, so each
+# release ships a reviewed copy (refresh it from
+# https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem). Liftproof uses
+# the system CAs plus that bundle whenever a project names no sslrootcert; the hook
+# keeps the combined file current when the ca-certificates package is updated.
+install -d -o root -g root -m 0755 /opt/mvt/certs
+install -m 0644 /tmp/liftproof-files/rds-global-bundle.pem /opt/mvt/certs/
+install -d /etc/ca-certificates/update.d
+cat > /etc/ca-certificates/update.d/liftproof <<'HOOK'
+#!/bin/sh
+set -e
+cat /etc/ssl/certs/ca-certificates.crt /opt/mvt/certs/rds-global-bundle.pem \
+  > /opt/mvt/certs/ca-bundle.pem.new
+chmod 0644 /opt/mvt/certs/ca-bundle.pem.new
+mv /opt/mvt/certs/ca-bundle.pem.new /opt/mvt/certs/ca-bundle.pem
+HOOK
+chmod 0755 /etc/ca-certificates/update.d/liftproof
+/etc/ca-certificates/update.d/liftproof
+
 # Chromium for record and replay, in a shared read-only location. Playwright's own
 # installer pulls the system libraries Chromium needs from the Ubuntu archive.
 browsers=/opt/mvt/browsers

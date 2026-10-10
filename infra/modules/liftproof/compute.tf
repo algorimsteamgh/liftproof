@@ -54,7 +54,7 @@ resource "aws_instance" "this" {
     write_files:
       - path: /etc/mvt/config.yaml
         permissions: "0640"
-        owner: root:root
+        owner: root:mvt
         content: |
           ${indent(6, local.instance_config)}
   EOT

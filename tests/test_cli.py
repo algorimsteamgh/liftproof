@@ -126,6 +126,23 @@ def test_credentials_in_environment_are_refused(tmp_path, monkeypatch):
     assert run(tmp_path, "reconcile", "--project", str(p)) == EXIT_CONFIG
 
 
+def test_unreadable_instance_settings_are_a_configuration_error(tmp_path, dbs, capsys,
+                                                                monkeypatch):
+    """Running on without them would quietly drop the deployment's bucket, key and lock."""
+
+    class Unreadable:
+        def read_text(self, encoding):
+            raise PermissionError(13, "Permission denied")
+
+        def __str__(self):
+            return "/etc/mvt/config.yaml"
+
+    monkeypatch.setattr(cli, "INSTANCE_CONFIG", Unreadable())
+    s, t, _ = dbs
+    assert run(tmp_path, "reconcile", "--project", str(_project(tmp_path, s, t))) == EXIT_CONFIG
+    assert "sudo -u mvt" in capsys.readouterr().err
+
+
 def test_ignore_rule_without_reason_is_refused(tmp_path):
     p = _project(tmp_path, "a", "b", ignore=[{"table": "orders"}])
     assert run(tmp_path, "reconcile", "--project", str(p)) == EXIT_CONFIG

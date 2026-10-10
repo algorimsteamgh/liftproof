@@ -81,9 +81,14 @@ run `liftproof doctor`.
   Logs), GuardDuty, Amazon Inspector (EC2, ECR), Security Hub with AWS Foundational
   Security Best Practices, IAM Access Analyzer, account-wide S3 Block Public Access,
   EBS encryption by default, IMDSv2 by default, a strict password policy, S3 access
-  logging and a monthly budget alert.
+  logging and a monthly budget alert. EBS encryption by default is on in every account
+  except the build account, where it would encrypt the AMI (see below).
 - **Release path:** GitHub Actions assumes `liftproof-github-release` through OIDC, only
-  from `main` and `v*` tags. No stored keys (the second half of IAM-002).
+  from `main` and `v*` tags. No stored keys (the second half of IAM-002). The release
+  job runs without a GitHub environment, because a job in one presents an
+  environment subject that the role does not trust. Its settings are repository
+  variables: `LIFTPROOF_RELEASE_ROLE_ARN`, `LIFTPROOF_BUILD_SUBNET`,
+  `LIFTPROOF_BUILD_SG` and `LIFTPROOF_EVIDENCE_BUCKET`.
 - **AMI:** Packer builds over Session Manager in a private subnet. Amazon Inspector then
   scans an instance of the new AMI, and any HIGH or CRITICAL finding fails the release
   (ATS-009). Build logs, the dependency audit and scan findings go to an evidence bucket
