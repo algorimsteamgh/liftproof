@@ -22,10 +22,11 @@ report.
 | Parameter | Default | Values |
 |---|---|---|
 | `project` | | the project file name under `/var/lib/mvt/projects`, without `.yaml` |
-| `mode` | `reconcile` | `validate`, `reconcile`, `files`, `replay`, `smoke`, `baseline`, `rebaseline`, `doctor`, `support-bundle` |
+| `mode` | `reconcile` | `validate`, `reconcile`, `files`, `replay`, `smoke`, `baseline`, `rebaseline`, `doctor`, `support-bundle`, `ui-login` |
 | `baseline` | `latest` | baseline id, `latest` (newest source baseline) or `latest-target` (newest rebaseline); used by `reconcile` and `validate` |
 | `journeys` | all | comma separated journey ids; `replay`, `smoke`, `validate` |
 | `sets` | all | comma separated file set names; `files`, `validate` |
+| `resume` | `false` | `true` continues the interrupted `reconcile`, `baseline` or `rebaseline`, also on a replacement instance |
 | `failOn` | `differences` | `differences`, `errors`, `never` |
 | `executionTimeout` | `14400` | seconds |
 

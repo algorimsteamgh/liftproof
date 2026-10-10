@@ -69,7 +69,7 @@ line, or row and column. What the text says stays out of the report unless the s
 
 ```bash
 liftproof schedule --project acme.yaml     # the project's schedules and their next run
-liftproof runs     --project acme.yaml     # run history on this instance, newest first
+liftproof runs     --project acme.yaml     # run history, newest first (from S3 too)
 ```
 
 A project file can carry `schedules:` (a name, a five field cron expression, a time zone
@@ -78,6 +78,28 @@ it falls due. Runs of one project never overlap: a second run is refused with ex
 2, and a scheduled run that finds the previous one still going is skipped and recorded as
 a run with an error finding and a `ScheduledRunSkipped` CloudWatch metric. CI and CD
 pipelines start runs through the SSM document; see [docs/pipelines.md](docs/pipelines.md).
+
+## When the instance is lost
+
+Nothing irreplaceable stays on the instance. Every run copies its project file to the
+bucket; a reconciliation sends its findings there at least every minute and checkpoints
+its finished tables, and a baseline checkpoints its manifest the same way. On a
+replacement instance pointed at the same bucket, `mvt-restore.service` writes the
+project files back at first boot, `liftproof runs` and the UI list every run and journey
+in the bucket, and an interrupted run carries on from its last checkpoint:
+
+```bash
+liftproof reconcile  --project acme.yaml --resume   # the newest unfinished reconciliation
+liftproof baseline   --project acme.yaml --resume   # the newest unfinished baseline
+liftproof restore    --projects-dir /var/lib/mvt/projects   # what the service runs
+```
+
+A resumed run compares only the tables it had not finished and keeps the run id, the
+reference baseline and the sampling of the first attempt; its report says when it
+resumed. Against a live source, the tables compared after the resume are read as of the
+resume. The lost instance's run lock expires 15 minutes after its last renewal; until
+then a resume is refused with exit code 2. A run that fails rather than stops names each
+table, file set and journey it never reached as not checked.
 
 ## Exit codes
 

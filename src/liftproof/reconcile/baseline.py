@@ -184,7 +184,10 @@ def take_baseline(
     side: str = "source",
     progress: Callable[[str], None] = lambda _m: None,
     workers: int = 1,
+    checkpoint: Callable[[], object] = lambda: None,
 ) -> Baseline:
+    """`checkpoint` runs after each table's entry is saved to the manifest; the CLI
+    copies the manifest to the store there."""
     if side not in SIDES:
         raise ValueError(f"side must be one of {SIDES}")
     existing = Baseline.load(manifest_path) if resume and manifest_path.exists() else None
@@ -199,6 +202,10 @@ def take_baseline(
         if tables:
             wanted = {t.lower() for t in tables}
             refs = [r for r in refs if r.qualified.lower() in wanted or r.name.lower() in wanted]
+        if existing is not None and not tables:
+            # resumed without a table list: the tables it set out to take, no more
+            planned = set(existing.selection)
+            refs = [r for r in refs if r.qualified in planned]
         if existing is not None:
             baseline = existing
             if not existing.complete:
@@ -266,6 +273,7 @@ def take_baseline(
             for ref in todo:
                 baseline.tables[ref.qualified] = one(source, ref)
                 baseline.save(manifest_path)  # checkpoint per table
+                checkpoint()
         else:
             # every worker imports the snapshot exported above: one state of the database
             free: queue.SimpleQueue[Adapter] = queue.SimpleQueue()
@@ -288,6 +296,7 @@ def take_baseline(
                         ref, entry = f.result()
                         baseline.tables[ref.qualified] = entry
                         baseline.save(manifest_path)  # checkpoint per table
+                        checkpoint()
             finally:
                 for a in forks:
                     a.end_snapshot()

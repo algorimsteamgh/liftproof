@@ -11,7 +11,8 @@ from __future__ import annotations
 import datetime as dt
 import itertools
 import json
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -85,30 +86,62 @@ class FindingWriter:
     """Writes findings as numbered, completed JSONL segments.
 
     A segment is written to a temporary name and renamed when it is closed, so a reader
-    never sees a half written segment. The store uploads closed segments.
+    never sees a half written segment. `on_segment` receives each closed segment (the
+    run uploads it at once); a segment also closes once `flush_seconds` have passed
+    since the last, so a long run's evidence reaches the store as it goes.
+
+    `keep` resumes an interrupted run: those segments stay, any later ones are removed,
+    and numbering carries on after them.
     """
 
-    def __init__(self, directory: Path, run_id: str, segment_size: int = 1000) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        run_id: str,
+        segment_size: int = 1000,
+        *,
+        on_segment: Callable[[Path], None] | None = None,
+        flush_seconds: float | None = None,
+        keep: list[str] | None = None,
+    ) -> None:
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id
         self.segment_size = segment_size
-        self._ids = itertools.count(1)
-        self._segment_no = 0
+        self.on_segment = on_segment
+        self.flush_seconds = flush_seconds
+        self._last_flush = time.monotonic()
         self._buffer: list[str] = []
         self.closed_segments: list[Path] = []
         self.count = 0
+        if keep is not None:
+            for segment in self.directory.glob("findings-*.jsonl"):
+                if segment.name not in keep:
+                    segment.unlink()
+            self.closed_segments = [self.directory / name for name in sorted(keep)]
+            self.count = sum(
+                1
+                for seg in self.closed_segments
+                for line in seg.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        self._segment_no = len(self.closed_segments)
+        self._ids = itertools.count(self.count + 1)
 
     def write(self, finding: Finding) -> Finding:
         finding.run_id = self.run_id
         finding.finding_id = f"f-{next(self._ids):06d}"
         self._buffer.append(json.dumps(finding.to_dict(), sort_keys=True))
         self.count += 1
-        if len(self._buffer) >= self.segment_size:
+        if len(self._buffer) >= self.segment_size or (
+            self.flush_seconds is not None
+            and time.monotonic() - self._last_flush >= self.flush_seconds
+        ):
             self.flush()
         return finding
 
     def flush(self) -> Path | None:
+        self._last_flush = time.monotonic()
         if not self._buffer:
             return None
         self._segment_no += 1
@@ -118,6 +151,8 @@ class FindingWriter:
         tmp.replace(final)
         self._buffer.clear()
         self.closed_segments.append(final)
+        if self.on_segment is not None:
+            self.on_segment(final)
         return final
 
     def close(self) -> list[Path]:

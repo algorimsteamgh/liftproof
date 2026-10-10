@@ -69,3 +69,17 @@ def test_the_worked_example_finds_its_one_changed_amount(tmp_path, monkeypatch, 
         "provision.sh"
     )
     capsys.readouterr()
+
+
+def test_a_replacement_instance_restores_its_projects_before_anything_runs():
+    """Spec 3: the project files come back from S3 at first boot, before the scheduler
+    or the UI looks for them, once per instance."""
+    unit = _text("mvt-restore.service")
+    assert "Before=mvt-scheduler.service mvt-ui.service" in unit
+    assert "ConditionPathExists=!/var/lib/mvt/.restored" in unit
+    assert "ExecStartPost=/usr/bin/touch /var/lib/mvt/.restored" in unit
+    assert "liftproof restore --projects-dir /var/lib/mvt/projects" in unit
+    assert "User=mvt" in unit and "Type=oneshot" in unit
+    install = _text("scheduler.sh")
+    assert "mvt-restore.service /etc/systemd/system/" in install
+    assert "systemctl enable mvt-restore.service" in install

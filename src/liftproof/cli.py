@@ -20,6 +20,7 @@ from typing import Any
 import yaml
 
 from liftproof import __version__, aws, logs, support
+from liftproof import checkpoint as ckpt
 from liftproof.adapters.base import Adapter
 from liftproof.adapters.mysql import MySQLAdapter
 from liftproof.adapters.oracle import OracleAdapter
@@ -53,6 +54,10 @@ from liftproof.web.run import WebResult
 log = logging.getLogger("liftproof.cli")
 
 DEFAULT_WORKDIR = Path(os.environ.get("LIFTPROOF_WORKDIR", "/var/lib/mvt/projects"))
+PROJECT_KEY = "project.yaml"  # the project file, in the store (spec 4)
+# Every project's file again, at the bucket root, where `liftproof restore` finds them all
+# whatever prefix each project uses.
+PROJECT_INDEX = ".liftproof/projects"
 
 
 def _now() -> str:
@@ -202,7 +207,14 @@ def _take_baseline(args: argparse.Namespace, side: str) -> int:
     project = _project(args)
     project.require_database()
     store = _store(project, Path(args.workdir))
-    baseline_id = args.baseline_id or _new_id("b" if side == "source" else "t")
+    marker = Path(args.workdir) / project.name / ckpt.baseline_marker(side)
+    baseline_id = args.baseline_id
+    if baseline_id is None and args.resume:
+        # the interrupted one, wherever it ran: the marker is in the store
+        baseline_id = ckpt.read_marker(store, marker, ckpt.baseline_marker(side))
+        if baseline_id is None:
+            raise ConfigError(f"no interrupted {side} baseline to resume; give --baseline-id")
+    baseline_id = baseline_id or _new_id("b" if side == "source" else "t")
     if baseline_id in LATEST.values():
         raise ConfigError(f"{baseline_id!r} is reserved; choose another baseline id")
     mode = "baseline" if side == "source" else "rebaseline"
@@ -218,6 +230,10 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
     key = f"baselines/{baseline_id}/manifest.json"
     if args.resume:
         store.get_file(key, manifest)
+    marker_key = ckpt.baseline_marker(side)
+    marker_local = workdir / marker_key
+    ckpt.set_marker(store, marker_local, marker_key, baseline_id)
+    throttle = ckpt.Throttle()
     o = project.database
     source_conn, target_conn = project.require_database()
     with connect(source_conn if side == "source" else target_conn) as db:
@@ -235,8 +251,11 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
             side=side,
             progress=lambda m: log.info(m),
             workers=o.workers,
+            # each finished table reaches the store, so a lost instance resumes (9.16)
+            checkpoint=lambda: throttle.due() and ckpt.keep(store, key, manifest),
         )
     store.put_file(key, manifest)
+    ckpt.set_marker(store, marker_local, marker_key, "")
     # The marker goes to the store too, so a replacement instance still finds it.
     marker = workdir / "baselines" / LATEST[side]
     marker.write_text(baseline_id, encoding="utf-8")
@@ -274,7 +293,15 @@ def _load_baseline(args, project: Project, store: Store, workdir: Path) -> Basel
     path = workdir / "baselines" / bid / "manifest.json"
     if not path.exists() and not store.get_file(f"baselines/{bid}/manifest.json", path):
         raise ConfigError(f"baseline {bid} not found")
-    return Baseline.load(path)
+    baseline = Baseline.load(path)
+    if not baseline.complete:
+        how = "baseline" if baseline.side == "source" else "rebaseline"
+        raise ConfigError(
+            f"baseline {bid} is unfinished ({len(baseline.tables)} of "
+            f"{len(baseline.selection)} tables); finish it with "
+            f"liftproof {how} --resume --baseline-id {bid}"
+        )
+    return baseline
 
 
 def _save_results(run_dir: Path, result: ReconcileResult) -> None:
@@ -306,9 +333,16 @@ def _load_results(run_dir: Path) -> ReconcileResult:
 
 
 def _reconcile_into(
-    args: argparse.Namespace, project: Project, store: Store, workdir: Path, writer: FindingWriter
+    args: argparse.Namespace,
+    project: Project,
+    store: Store,
+    workdir: Path,
+    writer: FindingWriter,
+    checkpoint: ckpt.RunCheckpoint | None = None,
 ) -> tuple[ReconcileResult, Baseline | None]:
-    """The database comparison of a run. Failures propagate to _run, which records them."""
+    """The database comparison of a run. Failures propagate to _run, which records them.
+    With a checkpoint, finished tables reach the store as the run goes, and a resumed run
+    carries on after them."""
     src_conn, tgt_conn = project.require_database()
     o = project.database
     if getattr(args, "tables", None):
@@ -316,6 +350,12 @@ def _reconcile_into(
     if args.show_values:
         o.show_values = True
     baseline = _load_baseline(args, project, store, workdir)
+    progress = checkpoint.progress if checkpoint is not None else None
+    resuming = progress is not None and progress.prelude_done
+    if progress is not None:
+        progress.baseline = baseline.baseline_id if baseline is not None else None
+        if resuming and progress.sample_seed is not None:
+            o.sample_seed = progress.sample_seed
     target = source = None
     rec = None
     try:
@@ -329,7 +369,7 @@ def _reconcile_into(
                 if baseline is None:
                     raise
                 log.warning("source unreachable; comparing against the baseline only")
-        for conn in (src_conn, tgt_conn):
+        for conn in (src_conn, tgt_conn) if not resuming else ():  # written the first time
             if not conn.tls_verified:
                 writer.write(
                     Finding(
@@ -344,10 +384,26 @@ def _reconcile_into(
         if not getattr(args, "include_replay_rows", False):
             o = _without_replay_rows(o, store, workdir, target, baseline)
         rec = Reconciler(
-            target, writer, o, source=source, baseline=baseline, progress=lambda m: log.info(m)
-        )
-        return rec.run(), baseline
+            target, writer, o, source=source, baseline=baseline, progress=lambda m: log.info(m),
+            on_table=checkpoint.table_done if checkpoint is not None else None,
+            done=progress.done() if resuming else (),
+            resumed=resuming,
+            systemic=progress.systemic if resuming else False,
+        )  # fmt: skip
+        if progress is not None:
+            progress.sample_seed = rec.seed
+        result = rec.run()
+        if checkpoint is not None:
+            checkpoint.save(result, complete=True)
+            try:
+                ckpt.set_marker(store, workdir / ckpt.RUN_MARKER, ckpt.RUN_MARKER, "")
+            except LiftproofError as exc:  # --resume then finds the run complete and says so
+                log.warning("could not clear the in-progress run marker: %s", exc)
+        return result, baseline
     except Exception as exc:
+        if rec is not None:
+            # coverage counts what exists, not only what finished (spec 12, 18)
+            rec.mark_unfinished(f"{type(exc).__name__}: {logs.scrub(str(exc))}"[:300])
         exc.partial_result = rec.result if rec else ReconcileResult()  # type: ignore[attr-defined]
         exc.baseline = baseline  # type: ignore[attr-defined]
         raise
@@ -441,9 +497,66 @@ def _locked(args, project: Project, store: Store, run_id: str, mode: str, body) 
     try:
         if lock.body.get("took_over"):
             log.warning("took over the run lock of lost run %s", lock.body["took_over"])
+        _publish_project(project, store)
         return body()
     finally:
         lock.__exit__(None, None, None)
+
+
+def _publish_project(project: Project, store: Store) -> None:
+    """Every run copies its project file to the store (spec 3, 4): connections (secret
+    ARNs, never credentials), rules and schedules then outlive the instance, and
+    `liftproof restore` brings them back on a replacement."""
+    if project.path is None or not Path(project.path).is_file():
+        return
+    ckpt.keep(store, PROJECT_KEY, Path(project.path))
+    if isinstance(store, S3Store):
+        index = S3Store(store.bucket, "", store.kms_key_id, client=store.s3)
+        ckpt.keep(index, f"{PROJECT_INDEX}/{project.name}.yaml", Path(project.path))
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Put the deployment's project files back on this instance from the bucket. A
+    replacement instance runs this at boot (mvt-restore.service), so the scheduler and
+    the UI find every project again; recordings, baselines and reports are read from the
+    bucket as they are needed. A project file already on the instance is never replaced."""
+    inst = _instance_config()
+    bucket = args.bucket or inst.get("bucket")
+    if not bucket:
+        raise ConfigError("no bucket: this instance has no deployment settings; give --bucket")
+    store = S3Store(bucket, "", inst.get("kms_key"))
+    projects_dir = Path(args.projects_dir)
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    restored: list[str] = []
+    kept: list[str] = []
+    unreadable: list[str] = []
+    for key in store.list_keys(f"{PROJECT_INDEX}/"):
+        name = key[len(PROJECT_INDEX) + 1 :]
+        if "/" in name or not name.endswith(".yaml"):
+            continue
+        dest = projects_dir / name
+        if dest.exists():
+            kept.append(name)
+            continue
+        partial = dest.with_suffix(".partial")
+        if not store.get_file(key, partial):
+            continue
+        try:
+            load_project(partial)
+        except ConfigError as exc:
+            log.warning("not restoring %s: %s", name, exc)
+            partial.unlink(missing_ok=True)
+            unreadable.append(name)
+            continue
+        partial.replace(dest)
+        restored.append(name)
+    payload = {"bucket": bucket, "restored": restored, "kept": kept, "unreadable": unreadable}
+    text = [f"restored {len(restored)} project file(s) from s3://{bucket} to {projects_dir}"]
+    text += [f"  restored {n}" for n in restored]
+    text += [f"  kept {n} (already on this instance)" for n in kept]
+    text += [f"  skipped {n} (not a valid project file)" for n in unreadable]
+    _out(args, payload, "\n".join(text))
+    return EXIT_OK
 
 
 def _skipped(args, project: Project, store: Store, run_id: str, mode: str, exc) -> int:
@@ -492,10 +605,49 @@ def _run(
     project = _project(args)
     store = _store(project, Path(args.workdir))
     run_id = args.run_id or _new_id("r")
+    if getattr(args, "resume", False) and not args.run_id:
+        marker = Path(args.workdir) / project.name / ckpt.RUN_MARKER
+        run_id = ckpt.read_marker(store, marker, ckpt.RUN_MARKER) or ""
+        if not run_id:
+            raise ConfigError("no interrupted reconciliation to resume; give --run-id")
     return _locked(
         args, project, store, run_id, mode,
         lambda: _run_locked(args, mode, project, store, run_id, database, web, files),
     )  # fmt: skip
+
+
+# Findings reach the store at least this often while a run goes (spec 3).
+SEGMENT_SECONDS = 60.0
+# What a resumed reconciliation must be asked again, exactly as the first time.
+RESUMED_OPTIONS = ("tables", "no_source", "show_values", "include_replay_rows")
+
+
+def _restore_run(store: Store, run_dir: Path, run_id: str) -> ckpt.RunProgress:
+    """The progress of an interrupted reconciliation and the findings it had written,
+    from the store: the instance that ran it may be gone."""
+    local = run_dir / ckpt.PROGRESS
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if not store.get_file(f"runs/{run_id}/{ckpt.PROGRESS}", local) and not local.exists():
+        raise ConfigError(f"run {run_id} has no saved progress to resume")
+    progress = ckpt.RunProgress.load(local)
+    if progress.complete:
+        raise ConfigError(f"run {run_id} finished every table; there is nothing to resume")
+    for name in progress.segments:
+        seg = run_dir / name
+        if not store.get_file(f"runs/{run_id}/{name}", seg) and not seg.exists():
+            raise ConfigError(f"run {run_id}: findings segment {name} is missing from the store")
+    return progress
+
+
+def _void_later_segments(store: Store, run_dir: Path, run_id: str, keep: list[str]) -> None:
+    """Segments the interrupted attempt wrote after its last checkpoint hold findings of
+    tables that are compared again; emptied in the store so they are not read twice."""
+    empty = run_dir / "empty.partial"
+    empty.write_text("", encoding="utf-8")
+    for key in store.list_keys(f"runs/{run_id}/findings-"):
+        if key.rsplit("/", 1)[-1] not in keep and key.endswith(".jsonl"):
+            store.put_file(key, empty)
+    empty.unlink()
 
 
 def _run_locked(args, mode, project, store, run_id, database, web, files) -> int:
@@ -504,7 +656,28 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     run_dir.mkdir(parents=True, exist_ok=True)
     logs.set_context(run_id=run_id, project=project.name)
     started = _now()
-    writer = FindingWriter(run_dir, run_id)
+    progress = None
+    if getattr(args, "resume", False):
+        progress = _restore_run(store, run_dir, run_id)
+        for name in RESUMED_OPTIONS:
+            setattr(args, name, progress.options.get(name))
+        args.baseline = progress.baseline
+        started = progress.started_at
+        progress.resumed_at.append(_now())
+    uploads = ckpt.SegmentUploads(store, run_id, progress.segments if progress else ())
+    writer = FindingWriter(
+        run_dir, run_id, flush_seconds=SEGMENT_SECONDS, on_segment=uploads,
+        keep=progress.segments if progress is not None else None,
+    )  # fmt: skip
+    if progress is not None:
+        _void_later_segments(store, run_dir, run_id, progress.segments)
+    checkpoint = None
+    if mode == "reconcile":
+        progress = progress or ckpt.RunProgress(
+            run_id, started, {k: getattr(args, k, None) for k in RESUMED_OPTIONS}
+        )
+        checkpoint = ckpt.RunCheckpoint(store, run_dir, progress, writer, uploads)
+        ckpt.set_marker(store, workdir / ckpt.RUN_MARKER, ckpt.RUN_MARKER, run_id)
     result: ReconcileResult | None = ReconcileResult() if database else None
     web_result = None
     files_result: FileResult | None = None
@@ -514,7 +687,9 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     try:
         if database:
             try:
-                result, baseline = _reconcile_into(args, project, store, workdir, writer)
+                result, baseline = _reconcile_into(
+                    args, project, store, workdir, writer, checkpoint
+                )
             except Exception as exc:
                 result = getattr(exc, "partial_result", result)
                 baseline = getattr(exc, "baseline", None)
@@ -555,6 +730,15 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
                 json.dumps(files_result.to_dict(), indent=2), encoding="utf-8"
             )
 
+    not_reached: list[dict[str, str]] = []
+    if failure and files and files_result is None:
+        not_reached += [{"object": f"file set {c.name}", "reason": STOPPED} for c in project.files]
+    if failure and web and web_result is None:
+        try:
+            ids = _journey_ids(args, project, workdir, store)
+        except LiftproofError:  # the report still names the failure itself
+            ids = []
+        not_reached += [{"object": f"journey {j}", "reason": STOPPED} for j in ids]
     report = _report(
         project,
         run_id,
@@ -568,10 +752,16 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
         failure=failure,
         template=args.template,
         scheduled=getattr(args, "scheduled", None),
+        not_reached=not_reached,
+        resumed_at=progress.resumed_at if progress is not None else None,
     )
     for f in sorted(run_dir.iterdir()):
-        store.put_file(f"runs/{run_id}/{f.name}", f)
+        if f.name not in uploads.done:  # segments went up as they closed
+            store.put_file(f"runs/{run_id}/{f.name}", f)
     return _conclude(args, report, store, run_id)
+
+
+STOPPED = "the run stopped before this was compared"
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
@@ -602,13 +792,27 @@ def _journey_dir(workdir: Path) -> Path:
     return workdir / "journeys"
 
 
-def _journey_ids(args: argparse.Namespace, project: Project, workdir: Path) -> list[str]:
+def _journey_ids(
+    args: argparse.Namespace, project: Project, workdir: Path, store: Store
+) -> list[str]:
     if getattr(args, "journeys", None):
         return [j.strip() for j in args.journeys.split(",") if j.strip()]
     web = project.require_web()
     if web.journeys:
         return list(web.journeys)
-    return sorted(p.stem for p in _journey_dir(workdir).glob("*.json"))
+    return journey_index(store, workdir)
+
+
+def journey_index(store: Store, workdir: Path) -> list[str]:
+    """Every journey recorded for the project: those on this instance and those in the
+    store, recorded on another machine or before this instance replaced one (spec 4)."""
+    local = {p.stem for p in _journey_dir(workdir).glob("*.json")}
+    stored = {
+        key.split("/")[1][: -len(".json")]
+        for key in store.list_keys("journeys/")
+        if key.count("/") == 1 and key.endswith(".json")
+    }
+    return sorted(local | stored)
 
 
 def _load_journey(store: Store, workdir: Path, journey_id: str) -> Journey:
@@ -664,7 +868,9 @@ def _replay_into(
     web = project.require_web()
     if not web.target_url:
         raise ConfigError("web.target_url is required to replay")
-    journeys = [_load_journey(store, workdir, j) for j in _journey_ids(args, project, workdir)]
+    journeys = [
+        _load_journey(store, workdir, j) for j in _journey_ids(args, project, workdir, store)
+    ]
     if not journeys:
         raise ConfigError("no journeys recorded for this project; record one with liftproof record")
     options = WebOptions(
@@ -796,6 +1002,8 @@ def _report(
     failure=None,
     template=None,
     scheduled=None,
+    not_reached=None,
+    resumed_at=None,
 ) -> dict[str, Any]:
     findings = list(read_findings(run_dir))
     o = project.database
@@ -806,6 +1014,10 @@ def _report(
     }
     if scheduled:
         metadata["schedule"] = scheduled
+    if resumed_at:
+        # tables finished before a resume were read then; the rest after it
+        metadata["resumed_at"] = list(resumed_at)
+        range_block["resumed_at"] = list(resumed_at)
     if result is not None and project.source is not None:
         range_block.update(
             {
@@ -865,6 +1077,7 @@ def _report(
         range_block=range_block,
         run_failed=failure is not None,
         failure=failure,
+        not_reached=not_reached,
     )
     write_reports(report, run_dir, Path(template) if template else None)
     return report
@@ -914,9 +1127,11 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
 
 
 def cmd_runs(args: argparse.Namespace) -> int:
-    """Run history from the reports on this instance (spec 14)."""
+    """Run history (spec 14): every report in the store, whichever instance ran it."""
     project = _project(args)
-    rows = run_history(Path(args.workdir) / project.name / "runs")[: args.limit]
+    runs_dir = Path(args.workdir) / project.name / "runs"
+    sync_reports(_store(project, Path(args.workdir)), runs_dir)
+    rows = run_history(runs_dir)[: args.limit]
     text = "\n".join(
         f"{x['started_at']}  {x['run_id']:<34} {x['mode'] or '':<10} {x['verdict'] or '':<16} "
         f"{x['schedule'] or 'by hand'}"
@@ -924,6 +1139,17 @@ def cmd_runs(args: argparse.Namespace) -> int:
     )
     _out(args, {"runs": rows}, text or "no runs yet")
     return EXIT_OK
+
+
+def sync_reports(store: Store, runs_dir: Path) -> None:
+    """Copy the reports of runs this instance does not hold (another instance's, or a
+    replaced one's) from the store."""
+    for key in store.list_keys("runs/"):
+        parts = key.split("/")
+        if len(parts) == 3 and parts[2] == "report.json":
+            local = runs_dir / parts[1] / "report.json"
+            if not local.exists():
+                store.get_file(key, local)
 
 
 def run_history(runs_dir: Path) -> list[dict[str, Any]]:
@@ -1165,7 +1391,7 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
     if project.web is not None:
         workdir = Path(args.workdir) / project.name
         store = _store(project, Path(args.workdir))
-        for jid in _journey_ids(args, project, workdir):
+        for jid in _journey_ids(args, project, workdir, store):
 
             def _tokens(j=jid):
                 journey = _load_journey(store, workdir, j)
@@ -1341,6 +1567,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--template", help="directory holding a custom report.html.j2")
     s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
     s.add_argument("--include-replay-rows", action="store_true", help=REPLAY_ROWS_HELP)
+    s.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an interrupted reconciliation (the latest one, or --run-id), "
+        "on this instance or a replacement",
+    )
     s.set_defaults(fn=cmd_reconcile)
 
     def run_flags(s, database: bool) -> None:
@@ -1412,6 +1644,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--once", action="store_true", help="fire what is due now, then exit")
     s.add_argument("--interval", type=float, default=30.0, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_scheduler)
+
+    s = sub.add_parser("restore", parents=[common], help="bring project files back from S3")
+    s.add_argument("--projects-dir", default=str(DEFAULT_WORKDIR))
+    s.add_argument("--bucket", help="default: this deployment's bucket")
+    s.set_defaults(fn=cmd_restore)
 
     s = sub.add_parser("ui", parents=[common], help="the local web UI (127.0.0.1 only)")
     s.add_argument("--projects-dir", default=str(DEFAULT_WORKDIR))

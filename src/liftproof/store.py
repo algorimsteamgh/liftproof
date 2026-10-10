@@ -27,6 +27,10 @@ class Store:
 
     def location(self, key: str) -> str: ...
 
+    def list_keys(self, prefix: str) -> list[str]:
+        """Keys under a prefix, relative to the store, sorted."""
+        ...
+
 
 class LocalStore(Store):
     def __init__(self, root: Path) -> None:
@@ -50,6 +54,16 @@ class LocalStore(Store):
 
     def location(self, key: str) -> str:
         return str(self.root / key)
+
+    def list_keys(self, prefix: str) -> list[str]:
+        base = self.root / prefix
+        if not base.exists():
+            return []
+        return sorted(
+            p.relative_to(self.root).as_posix()
+            for p in base.rglob("*")
+            if p.is_file() and not p.name.endswith((".partial", ".tmp"))
+        )
 
     def run_lock(self, run_id: str, command: str) -> RunLock:
         return LocalRunLock(self.root / LOCK_KEY, run_id, command)
@@ -122,6 +136,24 @@ class S3Store(Store):
 
     def location(self, key: str) -> str:
         return f"s3://{self.bucket}/{self._key(key)}"
+
+    def list_keys(self, prefix: str) -> list[str]:
+        strip = len(self.prefix) + 1 if self.prefix else 0
+        keys: list[str] = []
+        try:
+            pages = self.s3.get_paginator("list_objects_v2").paginate(
+                Bucket=self.bucket, Prefix=self._key(prefix)
+            )
+            for page in pages:
+                keys.extend(o["Key"][strip:] for o in page.get("Contents", []))
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "error")
+            raise ConfigError(
+                f"cannot list s3://{self.bucket}/{self._key(prefix)}: {code}"
+            ) from None
+        except BotoCoreError as exc:
+            raise RunFailed(f"S3 list failed for {self._key(prefix)}: {exc}") from None
+        return sorted(keys)
 
     def run_lock(self, run_id: str, command: str) -> RunLock:
         return S3RunLock(
