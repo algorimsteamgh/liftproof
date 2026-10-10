@@ -1,0 +1,71 @@
+"""What the AMI build installs (infra/packer). No image is built here; these checks run
+the pieces that can run on any host and pin the rest."""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+from liftproof import cli
+from liftproof.errors import EXIT_DIFFERENCES
+from liftproof.findings import Severity
+
+ROOT = Path(__file__).resolve().parents[1]
+FILES = ROOT / "infra/packer/files"
+
+
+def _text(name: str) -> str:
+    return (FILES / name).read_text(encoding="utf-8")
+
+
+def test_cloudwatch_agent_finds_the_log_group_in_either_template(tmp_path):
+    """Terraform's yamlencode quotes the keys; CloudFormation writes them bare."""
+    code = re.search(r"python -c '\n(.*?)'\)", _text("mvt-cwagent-config"), re.S).group(1)
+    code = code.replace("/etc/mvt/config.yaml", str(tmp_path / "config.yaml"))
+    for written in ('"deployment": "x"\n"log_group": "/liftproof/x"\n',
+                    "deployment: x\nlog_group: /liftproof/x\n"):  # fmt: skip
+        (tmp_path / "config.yaml").write_text(written)
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert out.stdout.strip() == "/liftproof/x"
+
+
+def test_cloudwatch_agent_can_read_the_product_log():
+    provision = _text("provision.sh")
+    assert "usermod -aG adm cwagent" in provision
+    assert "install -d -o mvt -g adm -m 2750 /var/log/mvt" in provision
+    assert '"run_as_user": "cwagent"' in _text("mvt-cwagent-config")
+
+
+def test_the_image_audits_what_it_installed():
+    provision = _text("provision.sh")
+    assert "pip-audit --strict" in provision and "-r /var/tmp/ami-requirements.txt" in provision
+    packer = (ROOT / "infra/packer/liftproof.pkr.hcl").read_text(encoding="utf-8")
+    download = packer.index('source      = "/var/tmp/ami-dependency-audit.txt"')
+    assert packer.index("files/harden.sh") < download < packer.index("files/cleanup.sh")
+
+
+def test_the_worked_example_finds_its_one_changed_amount(tmp_path, monkeypatch, capsys):
+    """Spec 17: something runs on a fresh instance with nothing set up."""
+    project = tmp_path / "example.yaml"
+    project.write_text(_text("example/example.yaml").replace("/opt/mvt/example",
+                                                            str(FILES / "example")))  # fmt: skip
+    monkeypatch.setattr(cli, "INSTANCE_CONFIG", tmp_path / "no-instance-settings.yaml")
+    code = cli.main(["files", "--project", str(project), "--workdir", str(tmp_path / "w"),
+                     "--format", "json"])  # fmt: skip
+    assert code == EXIT_DIFFERENCES
+    report = json.loads(next((tmp_path / "w").rglob("report.json")).read_text())
+    found = {(f["object"], f["severity"], f["locator"]) for f in report["findings"]}
+    assert found == {
+        ("invoices:2026-09.csv", Severity.HIGH, "row 3, amount"),
+        ("exports:stock.csv", Severity.LOW, None),
+    }
+    assert yaml.safe_load(_text("example/example.yaml"))["project"] == "example"
+    assert "/tmp/liftproof-files/example/example.yaml /var/lib/mvt/projects/" in _text(
+        "provision.sh"
+    )
+    capsys.readouterr()

@@ -51,3 +51,14 @@ def test_blocked_release_keeps_its_audit_log():
     evidence = job["steps"][names.index("Keep evidence")]
     assert credentials < gate and evidence["if"] == "always()"
     assert "pip-audit.log" in evidence["run"]
+
+
+def test_release_waits_for_the_suite_review_and_version():
+    """OPE-004 and B6: the tagged commit passes the functional suite, sits on main, and
+    the product it builds reports the tag's version."""
+    assert "workflow_call" in _load(ROOT / ".github/workflows/ci.yml")[True]
+    jobs = _load(ROOT / ".github/workflows/release.yml")["jobs"]
+    assert jobs["tests"]["uses"] == "./.github/workflows/ci.yml"
+    assert set(jobs["ami"]["needs"]) == {"performance", "tests", "reviewed"}
+    checks = " ".join(s.get("run", "") for s in jobs["reviewed"]["steps"])
+    assert "merge-base --is-ancestor" in checks and "__version__" in checks

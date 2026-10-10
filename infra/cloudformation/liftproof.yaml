@@ -148,7 +148,7 @@ Parameters:
     Default: ""
   KmsKeyArn:
     Type: String
-    Description: Existing customer managed KMS key. Empty creates a dedicated key with rotation.
+    Description: Existing customer managed KMS key. Empty creates a dedicated key with rotation. An existing key's policy must first allow CloudWatch Logs and the instance role (statements in the deployment guide, "Bring your own KMS key").
     Default: ""
     AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:\\d{12}:key/.+$"
   BucketName:

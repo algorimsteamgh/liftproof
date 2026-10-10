@@ -75,6 +75,38 @@ Then store the database logins in Secrets Manager under `liftproof/acme-prod/`
 (`{"username": ..., "password": ...}`), open the UI with the `connect_ui` output, and
 run `liftproof doctor`.
 
+### Bring your own KMS key
+
+With `kms_key_arn` (Terraform) or `KmsKeyArn` (CloudFormation), the key's policy is
+yours, so add two statements to it before deploying. CloudWatch Logs cannot encrypt
+the log group without the first, and the deployment stops there. The second is
+needed only when the policy does not delegate to IAM (no statement for the account
+root). Terraform prints both, filled in, as `customer_key_policy_statements` in
+`terraform plan`. Replace REGION, ACCOUNT and NAME (the deployment name):
+
+```json
+[
+  {
+    "Sid": "CloudWatchLogs",
+    "Effect": "Allow",
+    "Principal": {"Service": "logs.REGION.amazonaws.com"},
+    "Action": ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
+    "Resource": "*",
+    "Condition": {"ArnLike": {"kms:EncryptionContext:aws:logs:arn": "arn:aws:logs:REGION:ACCOUNT:log-group:/liftproof/NAME*"}}
+  },
+  {
+    "Sid": "LiftproofInstanceRole",
+    "Effect": "Allow",
+    "Principal": {"AWS": "arn:aws:iam::ACCOUNT:role/liftproof-NAME-instance"},
+    "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+    "Resource": "*"
+  }
+]
+```
+
+Keys that encrypt the database secrets (`secret_kms_key_arns`, `SecretKmsKeyArns`)
+need the second statement, with only `kms:Decrypt`, under the same condition.
+
 ## Algorims build account
 
 - **Account baseline:** CloudTrail (all regions, log file validation, KMS, CloudWatch
@@ -89,6 +121,12 @@ run `liftproof doctor`.
   environment subject that the role does not trust. Its settings are repository
   variables: `LIFTPROOF_RELEASE_ROLE_ARN`, `LIFTPROOF_BUILD_SUBNET`,
   `LIFTPROOF_BUILD_SG` and `LIFTPROOF_EVIDENCE_BUCKET`.
+- **Cutting a release:** set `__version__` in `src/liftproof/__init__.py` to the new
+  version through a pull request, then push the tag `v<version>` on that commit of
+  `main`. The release refuses a tag that is not on `main` or does not match
+  `__version__`, and runs the functional suite, the dependency audit and the KPI suite
+  before building. The image's own installed packages are audited again during the
+  build, and that audit is kept with the evidence.
 - **AMI:** Packer builds over Session Manager in a private subnet. Amazon Inspector then
   scans an instance of the new AMI, and any HIGH or CRITICAL finding fails the release
   (ATS-009). Build logs, the dependency audit and scan findings go to an evidence bucket

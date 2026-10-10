@@ -24,8 +24,31 @@ jobs:
     # PRD N9: the KPI suite gates every release; its numbers are kept with the evidence
     uses: ./.github/workflows/perf.yml
 
+  tests:
+    # OPE-004: the functional suite and the dependency audit gate the release itself,
+    # on the tagged commit, not only the pull request that came before it
+    uses: ./.github/workflows/ci.yml
+
+  reviewed:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on main (reached through a reviewed pull request)
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: The product reports the version being released (B6)
+        run: |
+          version=$(python3 -c 'import re, pathlib; print(re.search(r"__version__ = \"(.+)\"",
+            pathlib.Path("src/liftproof/__init__.py").read_text()).group(1))')
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "src/liftproof/__init__.py says $version but the tag is $GITHUB_REF_NAME;"
+            echo "set __version__ to ${GITHUB_REF_NAME#v} on main, then tag that commit"
+            exit 1
+          fi
+
   ami:
-    needs: performance
+    needs: [performance, tests, reviewed]
     runs-on: ubuntu-24.04
     # No `environment:` here. A job in an environment gets the OIDC subject
     # repo:<repo>:environment:<name>, which the release role's trust policy does not
@@ -72,6 +95,7 @@ jobs:
         if: always()
         run: |
           prefix="s3://${{ vars.LIFTPROOF_EVIDENCE_BUCKET }}/releases/${GITHUB_REF_NAME}/${GITHUB_RUN_ID}"
-          for f in pip-audit.log perf-results.json packer-manifest.json scan-findings.json ami-id.txt; do
-            [ -f "$f" ] && aws s3 cp "$f" "$prefix/$f"
+          for f in pip-audit.log perf-results.json packer-manifest.json ami-dependency-audit.txt \
+            scan-findings.json ami-id.txt; do
+            if [ -f "$f" ]; then aws s3 cp "$f" "$prefix/$f"; fi
           done
