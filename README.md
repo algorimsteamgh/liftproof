@@ -113,6 +113,23 @@ table, file set and journey it never reached as not checked.
 
 `--fail-on never` returns 0 even when differences exist.
 
+## Flags, logs and the report
+
+`--format`, `--log-level`, `--workdir` and `--fail-on` work before or after the command
+name (`liftproof --format json reconcile ...`). Logs are JSON lines on stderr and in
+`/var/log/mvt/liftproof.log`; a log file that cannot be opened only costs the file.
+`--log-level debug` adds each SQL statement sent to either database (the text, never its
+parameters) and the locator each replay step used.
+
+The report's range block says what was compared: the journeys and API endpoints, the
+schemas and tables, the run window and, per table and side, the lowest and highest key
+and the earliest and latest value of each date and time column of the rows compared
+(`data_ranges`). Those are aggregates of integer keys and dates only; a text key's ends
+appear only with `show_values`. `database.ranges: false` turns them off, saving one
+MIN/MAX statement per table and side. `liftproof report --run ID` rebuilds the HTML and
+JSON from the run's findings and keeps what the run was (its reference, window, schedule
+and who ran it), adding when it was regenerated.
+
 ## Tests
 
 `pytest` runs everything. Record and replay tests need Chromium

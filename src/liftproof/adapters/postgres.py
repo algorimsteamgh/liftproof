@@ -17,6 +17,7 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
+from liftproof.adapters import sqllog
 from liftproof.adapters.base import (
     Adapter,
     BucketAggregate,
@@ -182,6 +183,7 @@ class PostgresAdapter(Adapter):
             raise ConfigError(
                 f"cannot connect to PostgreSQL at {host}:{port}/{database}: {exc}"
             ) from exc
+        self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
         self.rows_per_second = rows_per_second
         settings = dict(SESSION, statement_timeout=str(statement_timeout_ms))

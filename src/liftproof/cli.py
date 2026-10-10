@@ -253,6 +253,7 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
             workers=o.workers,
             # each finished table reaches the store, so a lost instance resumes (9.16)
             checkpoint=lambda: throttle.due() and ckpt.keep(store, key, manifest),
+            with_ranges=o.ranges,
         )
     store.put_file(key, manifest)
     ckpt.set_marker(store, marker_local, marker_key, "")
@@ -754,6 +755,11 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
         scheduled=getattr(args, "scheduled", None),
         not_reached=not_reached,
         resumed_at=progress.resumed_at if progress is not None else None,
+        values_shown=bool(
+            getattr(args, "show_values", False)
+            or project.database.show_values
+            or (files and any(c.show_content for c in project.files))
+        ),
     )
     for f in sorted(run_dir.iterdir()):
         if f.name not in uploads.done:  # segments went up as they closed
@@ -1004,13 +1010,23 @@ def _report(
     scheduled=None,
     not_reached=None,
     resumed_at=None,
+    values_shown=None,
+    finished_at=None,
+    prior=None,
 ) -> dict[str, Any]:
+    """`prior` is the run's own report when one is regenerated: what the run was (its
+    reference, window, schedule, who ran it, versions) is taken from it as recorded,
+    never restated from today's project file."""
     findings = list(read_findings(run_dir))
     o = project.database
-    range_block: dict[str, Any] = {"run_window": f"{started} to {_now()}"}
+    finished_at = finished_at or _now()
+    if prior:
+        return _rewrite_report(project, run_id, mode, run_dir, findings, result, started,
+                               web_result, files_result, failure, template, prior)  # fmt: skip
+    range_block: dict[str, Any] = {"run_window": f"{started} to {finished_at}"}
     metadata: dict[str, Any] = {
         "invoked_by": who_ran_it(),
-        "values_shown": o.show_values,
+        "values_shown": bool(o.show_values if values_shown is None else values_shown),
     }
     if scheduled:
         metadata["schedule"] = scheduled
@@ -1031,6 +1047,8 @@ def _report(
                     else "live source"
                 ),
                 "consistency_position": baseline.position if baseline else "live read",
+                # lowest and highest key and dates of the rows compared, per side
+                "data_ranges": {t.table: t.ranges for t in result.tables if t.ranges},
                 "replication": result.replication,
                 "sampling": None
                 if result.sample_seed is None
@@ -1052,6 +1070,7 @@ def _report(
         range_block.update(
             {
                 "journeys": [j.journey for j in web_result.journeys],
+                "endpoints": [e["endpoint"] for e in web_result.endpoints],
                 "web_source": project.web.source_url if project.web else None,
                 "web_target": web_result.target_url,
                 "journeys_in_parallel": web_result.parallel,
@@ -1072,9 +1091,39 @@ def _report(
         web=web_result,
         files=files_result,
         started_at=started,
-        finished_at=_now(),
+        finished_at=finished_at,
         metadata=metadata,
         range_block=range_block,
+        run_failed=failure is not None,
+        failure=failure,
+        not_reached=not_reached,
+    )
+    write_reports(report, run_dir, Path(template) if template else None)
+    return report
+
+
+def _rewrite_report(project, run_id, mode, run_dir, findings, result, started, web_result,
+                    files_result, failure, template, prior) -> dict[str, Any]:  # fmt: skip
+    run = dict(prior.get("run", {}))
+    finished = run.pop("finished_at", None) or _now()
+    run.pop("started_at", None)
+    run["regenerated"] = {"at": _now(), "by": who_ran_it(), "product_version": __version__}
+    not_reached = [
+        c for c in prior.get("coverage", {}).get("not_covered", [])
+        if c.get("reason") == STOPPED
+    ]  # fmt: skip
+    report = build_report(
+        run_id=run_id,
+        project=project.name,
+        mode=mode,
+        findings=findings,
+        db=result,
+        web=web_result,
+        files=files_result,
+        started_at=started,
+        finished_at=finished,
+        metadata=run,
+        range_block=dict(prior.get("range", {})),
         run_failed=failure is not None,
         failure=failure,
         not_reached=not_reached,
@@ -1251,7 +1300,17 @@ def cmd_report(args: argparse.Namespace) -> int:
         if (run_dir / "report.json").exists()
         else {}
     )
-    started = prior.get("run", {}).get("started_at", _now())
+    store = _store(project, Path(args.workdir))
+    baseline = None
+    progress_file = run_dir / ckpt.PROGRESS
+    if not prior and progress_file.exists():
+        # no report was written (the run stopped): its checkpoint names the reference
+        progress = ckpt.RunProgress.load(progress_file)
+        started = progress.started_at
+        if progress.baseline:
+            baseline = _baseline_by_id(store, workdir, progress.baseline)
+    else:
+        started = prior.get("run", {}).get("started_at", _now())
     web_file = run_dir / "web-results.json"
     files_file = run_dir / "files-results.json"
     report = _report(
@@ -1261,7 +1320,9 @@ def cmd_report(args: argparse.Namespace) -> int:
         run_dir,
         _load_results(run_dir) if (run_dir / "db-results.json").exists() else None,
         started,
-        None,
+        baseline,
+        finished_at=None if prior else _last_activity(run_dir),
+        prior=prior or None,
         web_result=(
             WebResult.from_dict(json.loads(web_file.read_text(encoding="utf-8")))
             if web_file.exists()
@@ -1275,10 +1336,23 @@ def cmd_report(args: argparse.Namespace) -> int:
         failure=prior.get("failure"),
         template=args.template,
     )
-    store = _store(project, Path(args.workdir))
     for name in ("report.html", "report.json"):
         store.put_file(f"runs/{args.run}/{name}", run_dir / name)
     return _conclude(args, report, store, args.run)
+
+
+def _last_activity(run_dir: Path) -> str:
+    """When a run that wrote no report last wrote anything: the end of its window."""
+    times = [f.stat().st_mtime for f in run_dir.iterdir() if not f.name.startswith("report.")]
+    when = dt.datetime.fromtimestamp(max(times), dt.UTC) if times else dt.datetime.now(dt.UTC)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _baseline_by_id(store: Store, workdir: Path, bid: str) -> Baseline | None:
+    path = workdir / "baselines" / bid / "manifest.json"
+    if not path.exists() and not store.get_file(f"baselines/{bid}/manifest.json", path):
+        return None
+    return Baseline.load(path)
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1503,17 +1577,36 @@ def _assert(cond: bool, message: str) -> None:
 
 
 # ----------------------------------------------------------------------- parser
-def build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--format", choices=["text", "json"], default="text")
-    common.add_argument("--log-level", default="info")
-    common.add_argument("--workdir", default=str(DEFAULT_WORKDIR))
-    common.add_argument(
-        "--fail-on", choices=["differences", "errors", "never"], default="differences"
-    )
+LOG_LEVELS = ("debug", "info", "warning", "error")
 
+
+def _common_flags(*, defaults: bool) -> argparse.ArgumentParser:
+    """The flags every command takes, before or after the command name. Only the top
+    level parser sets their defaults: a subcommand's default would otherwise overwrite
+    a flag given before the command (`liftproof --format json reconcile ...`)."""
+
+    def default(value: str) -> str:
+        return value if defaults else argparse.SUPPRESS
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--format", choices=["text", "json"], default=default("text"))
+    common.add_argument(
+        "--log-level", type=str.lower, choices=LOG_LEVELS, default=default("info"),
+        help="debug also logs each SQL statement (never its values) and each locator used",
+    )  # fmt: skip
+    common.add_argument("--workdir", default=default(str(DEFAULT_WORKDIR)))
+    common.add_argument(
+        "--fail-on", choices=["differences", "errors", "never"], default=default("differences")
+    )
+    return common
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = _common_flags(defaults=False)
     p = argparse.ArgumentParser(
-        prog="liftproof", description="Liftproof migration validation", parents=[common]
+        prog="liftproof",
+        description="Liftproof migration validation",
+        parents=[_common_flags(defaults=True)],
     )
     sub = p.add_subparsers(dest="command", required=True)
 

@@ -207,6 +207,7 @@ def _options(
         precision=int(d.get("timestamp_precision", 6)),
         diff_row_limit=int(d.get("diff_row_limit", 100)),
         show_values=bool(d.get("show_values", False)),
+        ranges=bool(d.get("ranges", True)),
     )
     opts.replication = ReplicationConfig.from_dict(d.get("replication"))
     breaker = d.get("circuit_breaker") or {}
@@ -461,6 +462,7 @@ database:
   timestamp_precision: 6
   diff_row_limit: 100
   show_values: false            # the report is an egress path; values need an explicit opt in
+  ranges: true                  # lowest/highest integer key and dates per table, in the report
   business_keys: {{}}           # e.g. orders: [order_number] where keys were renumbered
   workers: 1                    # tables hashed at once; each is another source connection
   # sampling:                    # large tables: compare a random share of the buckets;

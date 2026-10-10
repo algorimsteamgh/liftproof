@@ -30,6 +30,7 @@ from typing import Any
 import pytds
 from OpenSSL import SSL
 
+from liftproof.adapters import sqllog
 from liftproof.adapters.base import (
     Adapter,
     BucketAggregate,
@@ -312,6 +313,7 @@ class SQLServerAdapter(Adapter):
             raise ConfigError(
                 f"cannot connect to SQL Server at {host}:{port}/{database}: {exc}"
             ) from exc
+        self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
         self.rows_per_second = rows_per_second
         with self.conn.cursor() as cur:
@@ -344,6 +346,9 @@ class SQLServerAdapter(Adapter):
             else:
                 cur.execute(q)  # no parameters: % in LIKE patterns is literal
             return list(cur.fetchall())
+
+    def excluding(self, predicate: str) -> str:
+        return _excluding(predicate) or ""
 
     def _rows(self, q: str, args: Sequence[Any]) -> list[tuple[Any, ...]]:
         return self._query(q.format(*["%s"] * len(args)), list(args))

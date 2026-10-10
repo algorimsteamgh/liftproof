@@ -53,15 +53,29 @@ class JsonFormatter(logging.Formatter):
 
 
 def setup(level: str = "info", file: str | None = None) -> None:
+    """Never fails: an unknown level falls back to info and a log file that cannot be
+    opened to stderr alone, each with a warning, so a logging problem cannot stop a run
+    or end it with a traceback."""
     root = logging.getLogger("liftproof")
     root.handlers.clear()
-    root.setLevel(level.upper())
+    problems = []
+    try:
+        root.setLevel(level.upper())
+    except (ValueError, TypeError):
+        root.setLevel(logging.INFO)
+        problems.append(f"unknown log level {level!r}; logging at info")
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if file:
-        handlers.append(logging.FileHandler(file, encoding="utf-8"))
+        try:
+            handlers.append(logging.FileHandler(file, encoding="utf-8"))
+        except OSError as exc:
+            problems.append(f"cannot write the log file {file} ({exc.strerror}); stderr only")
     for h in handlers:
         h.setFormatter(JsonFormatter())
         root.addHandler(h)
     root.propagate = False
-    for noisy in ("psycopg", "botocore", "boto3", "urllib3"):
+    # driver logging stays off at every level: it can carry statement parameters
+    for noisy in ("psycopg", "pymysql", "oracledb", "pytds", "botocore", "boto3", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    for problem in problems:
+        root.getChild("logs").warning(problem)

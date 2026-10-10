@@ -35,6 +35,7 @@ from typing import Any
 
 import oracledb
 
+from liftproof.adapters import sqllog
 from liftproof.adapters.base import (
     Adapter,
     BucketAggregate,
@@ -307,6 +308,7 @@ class OracleAdapter(Adapter):
             raise ConfigError(
                 f"cannot connect to Oracle at {host}:{port}/{database}: {exc}"
             ) from exc
+        self.conn = sqllog.wrap(self.conn, self.engine)
         self.conn.outputtypehandler = _output_type_handler
         if statement_timeout_ms:
             self.conn.call_timeout = int(statement_timeout_ms)
@@ -339,6 +341,9 @@ class OracleAdapter(Adapter):
         with self.conn.cursor() as cur:
             cur.execute(q, args or [])
             return list(cur.fetchall())
+
+    def excluding(self, predicate: str) -> str:
+        return _excluding(predicate) or ""
 
     def _rows(self, q: str, args: Sequence[Any]) -> list[tuple[Any, ...]]:
         return self._query(q.format(*[f":{i + 1}" for i in range(len(args))]), list(args))
