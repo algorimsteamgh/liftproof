@@ -230,6 +230,9 @@ def _ssl_args(sslmode: str, sslrootcert: str | None) -> dict[str, Any]:
 
 class MySQLAdapter(Adapter):
     engine = "mysql"
+    product = "MySQL"
+    minimum_version = (8, 0)
+    minimum_shown = "MySQL 8.0 (Aurora MySQL 3)"
     supports_row_filters = True
     supports_sampling = True
     # Each connection opens its own snapshot: workers reconcile live tables, a baseline
@@ -281,13 +284,20 @@ class MySQLAdapter(Adapter):
         self.read_only = read_only
         self.rows_per_second = rows_per_second
         with self.conn.cursor() as cur:
+            cur.execute("SELECT VERSION()")
+            version = cur.fetchone()[0]
+        if "mariadb" in version.lower():
+            # different session variables (max_statement_time) and functions; never tested
+            self.close()
+            raise ConfigError(f"MariaDB ({version}) is not supported yet; only MySQL 8.0 and "
+                              "later, including Aurora MySQL 3")  # fmt: skip
+        self.require_version(version)
+        with self.conn.cursor() as cur:
             for name, value in SESSION.items():
                 cur.execute(f"SET SESSION {name} = %s", (value,))
             cur.execute("SET SESSION max_execution_time = %s", (int(statement_timeout_ms),))
             if read_only:
                 cur.execute("SET SESSION TRANSACTION READ ONLY")
-            cur.execute("SELECT VERSION()")
-            self.version = cur.fetchone()[0]
         settings = dict(SESSION, max_execution_time=str(statement_timeout_ms))
         if read_only:
             settings["transaction_read_only"] = "ON"

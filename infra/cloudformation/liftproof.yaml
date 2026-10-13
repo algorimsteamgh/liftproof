@@ -40,7 +40,7 @@ Metadata:
           - AccessLogBucket
           - LogRetentionDays
       - Label: { default: Operators and alarms }
-        Parameters: [OperatorPrincipalArns, AlarmTopicArn]
+        Parameters: [OperatorPrincipalArns, AlarmTopicArn, AwsRequestsPerSecond]
     ParameterLabels:
       ImageId: { default: Liftproof AMI }
       SecretArns: { default: Secrets the product may read }
@@ -191,6 +191,12 @@ Parameters:
     Type: String
     Description: SNS topic for alarms. Empty creates alarms without notifications.
     Default: ""
+  AwsRequestsPerSecond:
+    Type: Number
+    Description: Ceiling on the AWS API calls the product makes per second (all services together), so it never throttles your account.
+    Default: 20
+    MinValue: 1
+    MaxValue: 1000
 
 Conditions:
   CreateKey: { "Fn::Equals": [{ Ref: KmsKeyArn }, ""] }
@@ -836,6 +842,7 @@ Resources:
                     kms_key: ${KeyArn}
                     log_group: ${LogGroup}
                     report_lock_days: ${ReportLockDays}
+                    aws_requests_per_second: ${AwsRequestsPerSecond}
             - KeyArn: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
       Tags:
         - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}" } }

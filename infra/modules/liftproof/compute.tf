@@ -16,6 +16,8 @@ locals {
     kms_key          = local.kms_key_arn
     log_group        = aws_cloudwatch_log_group.this.name
     report_lock_days = var.report_lock_days
+    # every AWS client shares one token bucket of this rate (AWSAPI-002)
+    aws_requests_per_second = var.aws_requests_per_second
   })
 }
 

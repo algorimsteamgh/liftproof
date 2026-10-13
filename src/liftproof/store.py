@@ -125,9 +125,12 @@ class S3Store(Store):
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self._key(key))
         except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            code = exc.response.get("Error", {}).get("Code", "error")
+            if code in ("NoSuchKey", "404"):
                 return False
-            raise ConfigError(f"cannot read s3://{self.bucket}/{self._key(key)}") from None
+            raise ConfigError(f"cannot read s3://{self.bucket}/{self._key(key)}: {code}") from None
+        except BotoCoreError as exc:
+            raise RunFailed(f"S3 read failed for {self._key(key)}: {exc}") from None
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as fh:
             for chunk in resp["Body"].iter_chunks():

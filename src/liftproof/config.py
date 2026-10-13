@@ -285,6 +285,13 @@ def _side(d: Any, where: str) -> tuple[str, str | None, str | None]:
     if isinstance(d, str) and d:
         return d, None, None
     if isinstance(d, dict) and d.get("location"):
+        if d.get("secret_arn") and not d.get("endpoint_url"):
+            # keys in a secret would mean an IAM user with long lived keys (IAM-002)
+            raise ConfigError(
+                f"{where}.secret_arn is for an S3 compatible store outside AWS, with its "
+                "endpoint_url; a bucket in AWS is read with the instance role, so leave "
+                "secret_arn out and grant the role s3:ListBucket and s3:GetObject"
+            )
         return str(d["location"]), d.get("endpoint_url"), d.get("secret_arn")
     raise ConfigError(f"{where} must be a path, an s3:// location, or {{location: ...}}")
 

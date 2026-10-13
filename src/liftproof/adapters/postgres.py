@@ -144,6 +144,9 @@ def _excluding(predicate: str | None) -> sql.Composable:
 
 class PostgresAdapter(Adapter):
     engine = "postgresql"
+    product = "PostgreSQL"
+    minimum_version = (13,)  # trim_scale(), used to render exact numbers
+    minimum_shown = "PostgreSQL 13"
     supports_row_filters = True
     supports_sampling = True
 
@@ -198,6 +201,8 @@ class PostgresAdapter(Adapter):
                 )
         self._settings = settings
         self._in_snapshot = False
+        v = self.conn.info.server_version
+        self.require_version(f"{v // 10000}.{v % 10000}")
 
     def close(self) -> None:
         if not self.conn.closed:

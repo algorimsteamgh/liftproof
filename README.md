@@ -5,9 +5,10 @@ its database behave before a migration, checks the same behaviour afterwards, an
 produces the report a release manager signs at go live.
 
 This repository is being built against the *Migration Validation Tool* PRD and Technical
-Specification (Draft 1). Supported databases: PostgreSQL, MySQL (8.0 and later, including Aurora), Oracle (19c and later, including RDS for Oracle)
-and SQL Server (2016 and later, including RDS for SQL Server and Azure SQL), as source
-or target, in any combination. Built so far: the database core, PRD F2 (baseline), F6 (reconcile), F8/F9 (reports),
+Specification (Draft 1). Supported databases: PostgreSQL (13 and later, including RDS and Aurora), MySQL (8.0 and
+later, including Aurora MySQL 3; not MariaDB), Oracle (19c and later, including RDS for
+Oracle) and SQL Server (2016 and later, including RDS for SQL Server and Azure SQL), as
+source or target, in any combination. An older server is refused when Liftproof connects. Built so far: the database core, PRD F2 (baseline), F6 (reconcile), F8/F9 (reports),
 F11 (CLI and exit codes), F14 (credentials) and F15 (storage); and record and replay,
 F1 (record), F3 (replay), F4 (user interface comparison), F5 (API comparison) and F16
 (response times).
@@ -17,7 +18,7 @@ F1 (record), F3 (replay), F4 (user interface comparison), F5 (API comparison) an
 ```bash
 uv venv -p 3.12 && uv pip install -e ".[dev]"
 liftproof init acme                   # writes acme.yaml; no credentials go in it
-liftproof doctor --project acme.yaml  # connections, read only source, TLS, S3 and KMS
+liftproof doctor --project acme.yaml  # connections, versions, read only source, TLS, S3, KMS, endpoints
 liftproof baseline --project acme.yaml
 liftproof reconcile --project acme.yaml --baseline latest
 # after cutover: the target becomes the reference for scheduled regression
@@ -64,6 +65,9 @@ same text with different bytes (a regenerated PDF, Windows line endings, a new e
 is a low severity difference that says why, and different text is located to the page,
 line, or row and column. What the text says stays out of the report unless the set sets
 `show_content: true`. `validate` compares files after reconciling and before replaying.
+A bucket in AWS is read with the instance role. An S3 compatible store outside AWS is
+given as `{location: s3://..., endpoint_url: https://..., secret_arn: ...}`, with its
+access key pair in that secret (keys `access_key_id` and `secret_access_key`).
 
 ## Scheduled and pipeline runs
 
