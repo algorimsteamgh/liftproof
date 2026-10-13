@@ -107,15 +107,18 @@ def step_duration(acted_ms: float, exchanges: list[Captured]) -> float | None:
     return round(max(max(ends) - acted_ms, 0.0), 1) if ends else None
 
 
+OnDone = Callable[[int, Journey, JourneyRun], None]
+
+
 class _Worker(threading.Thread):
-    def __init__(self, replayer: Replayer, todo: queue.SimpleQueue, runs: list) -> None:
+    def __init__(self, replayer: Replayer, todo: queue.SimpleQueue, on_done: OnDone) -> None:
         super().__init__(daemon=True)
-        self.replayer, self.todo, self.runs = replayer, todo, runs
+        self.replayer, self.todo, self.on_done = replayer, todo, on_done
         self.error: BaseException | None = None
 
     def run(self) -> None:
         try:
-            self.replayer._worker(self.todo, self.runs)
+            self.replayer._worker(self.todo, self.on_done)
         except BaseException as exc:  # noqa: BLE001 - raised again on the calling thread
             self.error = exc
 
@@ -173,39 +176,50 @@ class Replayer:
         self.step_timeout_ms = step_timeout_ms
         self.headless = headless
         self.executable_path = executable_path
-        self.step_flakes: Counter[tuple[str, int]] = Counter()
-        self._lock = threading.Lock()
+        self.browser_version: str | None = None
+        self._done = threading.Lock()
+        self._closed = False  # the caller has stopped listening
 
-    def _flake(self, journey_id: str, step: int) -> None:
-        with self._lock:
-            self.step_flakes[(journey_id, step)] += 1
-
-    def run(self, journeys: list[Journey], workers: int = 1) -> list[JourneyRun]:
-        """Replay journeys, in order by default. workers > 1 replays independent journeys
-        at once (spec 6: an opt in, only where the journeys do not interfere); steps
-        inside a journey always run in recorded order. Results keep the journeys' order."""
+    def run(self, journeys: list[Journey], on_done: OnDone, workers: int = 1) -> None:
+        """Replay journeys, in order by default, handing each one's run to on_done (with
+        its index) as it finishes, one journey at a time; nothing here keeps it after
+        that. workers > 1 replays independent journeys at once (spec 6: an opt in, only
+        where the journeys do not interfere); steps inside a journey always run in
+        recorded order. A worker that fails stops, the others finish the queue, and the
+        first failure is then raised."""
         if workers <= 1 or len(journeys) <= 1:
-            return self._worker(list(enumerate(journeys)), [None] * len(journeys))
+            self._worker(list(enumerate(journeys)), on_done)
+            return
         todo: queue.SimpleQueue[tuple[int, Journey]] = queue.SimpleQueue()
         for item in enumerate(journeys):
             todo.put(item)
-        runs: list[JourneyRun | None] = [None] * len(journeys)
         # Playwright's sync API is per thread: each worker has its own driver and browser
-        threads = [_Worker(self, todo, runs) for _ in range(min(workers, len(journeys)))]
+        threads = [_Worker(self, todo, on_done) for _ in range(min(workers, len(journeys)))]
         for t in threads:
             t.start()
-        for t in threads:
-            t.join()
+        try:
+            for t in threads:
+                t.join()
+        except BaseException:
+            # interrupted while the workers go on: the caller is about to close the run,
+            # so a journey finishing from now on must not be written alongside it
+            with self._done:
+                self._closed = True
+            raise
         for t in threads:
             if t.error is not None:
                 raise t.error
-        return runs  # type: ignore[return-value]
+
+    def _hand_over(self, on_done: OnDone, i: int, journey: Journey, run: JourneyRun) -> None:
+        with self._done:
+            if not self._closed:
+                on_done(i, journey, run)
 
     def _worker(
         self,
         todo: list[tuple[int, Journey]] | queue.SimpleQueue[tuple[int, Journey]],
-        runs: list[JourneyRun | None],
-    ) -> list[JourneyRun]:
+        on_done: OnDone,
+    ) -> None:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as p:
@@ -213,7 +227,7 @@ class Replayer:
             browser = launch(p, headless=self.headless, executable_path=self.executable_path)
             self.browser_version = browser.version
             try:
-                while True:
+                while not self._closed:  # an interrupted run takes no more journeys
                     if isinstance(todo, list):
                         if not todo:
                             break
@@ -223,10 +237,10 @@ class Replayer:
                             i, j = todo.get_nowait()
                         except queue.Empty:
                             break
-                    runs[i] = self._journey(browser, j)
+                    # no name holds the run here, so it goes once on_done returns
+                    self._hand_over(on_done, i, j, self._journey(browser, j))
             finally:
                 browser.close()
-        return runs  # type: ignore[return-value]
 
     # ------------------------------------------------------------------ journeys
     def _journey(self, browser: Any, journey: Journey) -> JourneyRun:
@@ -252,8 +266,6 @@ class Replayer:
             if not retry_journey or attempt == JOURNEY_ATTEMPTS:
                 return run
             failed_step = next((s.n for s in run.steps if s.status == "failed"), None)
-            if failed_step is not None:
-                self._flake(journey.journey_id, failed_step)
             run.flakes.append(
                 {"step": failed_step, "attempt": attempt, "error": run.error, "unit": "journey"}
             )
@@ -298,7 +310,6 @@ class Replayer:
                         # time; the journey is the retry unit (spec 6)
                         run.status, run.failure_kind, run.error = "failed", kind, sr.error
                         return whole
-                    self._flake(journey.journey_id, step.n)
                     run.flakes.append(
                         {"step": step.n, "attempt": attempt, "error": sr.error, "unit": "step"}
                     )

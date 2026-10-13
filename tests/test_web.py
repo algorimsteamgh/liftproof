@@ -187,7 +187,10 @@ def test_parallel_journeys_opt_in(recorded):
         j.journey_id = f"checkout-{i}"
         journeys.append(j)
 
+    snapshots = []
+
     def run(workers):
+        snapshots.clear()
         with ShopApp(latency_ms=100) as target:
             result = run_journeys(
                 journeys,
@@ -197,6 +200,7 @@ def test_parallel_journeys_opt_in(recorded):
                 assets_dir=lambda j: assets,
                 secret_values=lambda j: {t: PASSWORD for t in j.secrets},
                 workers=workers,
+                on_journey=lambda make: snapshots.append(make()),
             )
             return result, target.peak_sessions
 
@@ -209,6 +213,9 @@ def test_parallel_journeys_opt_in(recorded):
     assert [j.journey for j in par.journeys] == [j.journey_id for j in journeys]
     assert {j.status for j in par.journeys} == {"passed"}
     assert (seq_peak, par_peak >= 2) == (1, True), (seq_peak, par_peak)
+    # each journey is compared as it finishes, in whatever order they finish
+    assert [sum(j.status == "passed" for j in s.journeys) for s in snapshots] == [1, 2, 3, 4]
+    assert not any(s.complete for s in snapshots) and par.complete
 
 
 @pytest.mark.parametrize("value", [0, 9, "many"])

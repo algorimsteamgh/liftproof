@@ -1,11 +1,21 @@
-"""Comparison and correlation rules that need no browser."""
+"""Comparison and correlation rules, and the replay's handling of finished journeys,
+that need no browser."""
 
-from liftproof.findings import Kind
-from liftproof.web import correlate
+import gc
+import threading
+import weakref
+
+import pytest
+
+from liftproof.findings import Kind, Severity
+from liftproof.web import correlate, replay
+from liftproof.web import run as webrun
 from liftproof.web.browser import normalise_path
 from liftproof.web.compare import Comparison, WebOptions
 from liftproof.web.journey import Correlation, Journey, shape
-from liftproof.web.replay import JourneyRun
+from liftproof.web.replay import JourneyRun, Replayer
+from liftproof.web.run import REASON_STOPPED, WebResult, run_journeys
+from tests import fakereplay
 
 
 def cmp(correlations=(), values=None, **opts):
@@ -82,3 +92,158 @@ def test_detect_skips_coincidences():
     ]
     found = correlate.detect(traffic, [[""], [""]])
     assert [(c.recorded_value, c.confirmed) for c in found] == [("48213", True), ("OPEN", False)]
+
+
+# ---------------------------------------------------- findings as journeys finish
+def _replay(journeys, emit, *, workers=1, on_journey=None):
+    return run_journeys(journeys, target_url="http://target.invalid", options=WebOptions(),
+                        emit=emit, assets_dir=lambda j: None, secret_values=lambda j: {},
+                        workers=workers, on_journey=on_journey)  # fmt: skip
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_a_worker_holds_one_journey_at_a_time(monkeypatch, workers):
+    journeys = [fakereplay.journey(f"j{n}") for n in range(1, 7)]
+    runs: list[weakref.ref] = []
+    findings, saved = [], []
+    j2_written = threading.Event()
+
+    def replay_one(j):
+        gc.collect()
+        # the run this worker finished last is gone; other workers may still hold theirs
+        alive = [r().journey_id for r in runs if r() is not None]
+        assert len(alive) <= workers - 1, alive
+        if workers > 1 and j.journey_id == "j1":
+            assert j2_written.wait(5)  # j1 finishes after j2
+        run = fakereplay.replayed(j, body=b"x" * 1_000_000)
+        runs.append(weakref.ref(run))
+        return run
+
+    def emit(f):
+        findings.append(f)
+        if f.journey == "j2":
+            j2_written.set()
+
+    fakereplay.no_browser(monkeypatch, replay_one)
+    def journey_done(make):
+        saved.append((sum(f.kind == Kind.DIFFERENCE for f in findings), make()))
+
+    result = _replay(journeys, emit, workers=workers, on_journey=journey_done)
+    assert result.complete and (result.parallel, result.workers) == (workers > 1, workers)
+    assert [r.journey for r in result.journeys] == [j.journey_id for j in journeys]
+    assert {r.status for r in result.journeys} == {"different"}
+    assert result.browser == "chromium 0-test"
+    assert result.endpoints == [{"endpoint": "GET /api/orders", "source_ms": 40.0,
+                                 "target_ms": 60.0, "change_pct": 50.0}]  # fmt: skip
+    # each journey's findings are written when it finishes, not at the end of the run
+    assert [(n, sum(r.status != "not_run" for r in s.journeys)) for n, s in saved] == [
+        (k, k) for k in range(1, 7)]
+    assert not any(s.complete for _, s in saved)
+    written = [f.journey for f in findings if f.kind == Kind.DIFFERENCE]
+    assert sorted(written) == sorted(j.journey_id for j in journeys)
+    if workers > 1:
+        assert written.index("j2") < written.index("j1")
+
+
+def test_a_failure_keeps_the_journeys_that_finished(monkeypatch):
+    journeys = [fakereplay.journey(f"j{n}") for n in range(1, 5)]
+
+    def replay_one(j):
+        if j.journey_id == "j3":
+            raise RuntimeError("Browser has been closed")
+        return fakereplay.replayed(j)
+
+    fakereplay.no_browser(monkeypatch, replay_one)
+    findings = []
+    with pytest.raises(RuntimeError) as exc:
+        _replay(journeys, findings.append)
+    partial = exc.value.partial_result
+    assert not partial.complete
+    assert [(r.journey, r.status) for r in partial.journeys] == [
+        ("j1", "different"), ("j2", "different"), ("j3", "not_run"), ("j4", "not_run")]
+    assert [r.reason for r in partial.journeys[2:]] == [REASON_STOPPED] * 2
+    assert partial.journeys[3].steps == 1 and partial.journeys[3].recorded_ms == 40.0
+    assert {f.object for f in findings if f.kind == Kind.DIFFERENCE} == {
+        "j1 step 1", "j2 step 1"}
+
+
+def test_other_workers_finish_the_queue_when_one_fails(monkeypatch):
+    journeys = [fakereplay.journey(f"j{n}") for n in range(1, 7)]
+    replayed = []
+
+    def replay_one(j):
+        if j.journey_id == "j1":
+            raise RuntimeError("Browser has been closed")
+        replayed.append(j.journey_id)
+        return fakereplay.replayed(j)
+
+    fakereplay.no_browser(monkeypatch, replay_one)
+    with pytest.raises(RuntimeError) as exc:
+        _replay(journeys, lambda f: None, workers=2)
+    assert sorted(replayed) == ["j2", "j3", "j4", "j5", "j6"]
+    assert [r.status for r in exc.value.partial_result.journeys] == (
+        ["not_run"] + ["different"] * 5)
+
+
+def test_a_comparison_that_fails_is_not_a_journey_never_reached(monkeypatch):
+    journeys = [fakereplay.journey(f"j{n}") for n in range(1, 4)]
+    fakereplay.no_browser(monkeypatch, fakereplay.replayed)
+    compare = webrun.compare_journey
+
+    def broken(j, *a):
+        if j.journey_id == "j2":
+            raise KeyError("$.items")
+        return compare(j, *a)
+
+    monkeypatch.setattr(webrun, "compare_journey", broken)
+    with pytest.raises(KeyError) as exc:
+        _replay(journeys, lambda f: None)
+    j1, j2, j3 = exc.value.partial_result.journeys
+    assert (j1.status, j2.status, j3.status) == ("different", "failed", "not_run")
+    assert j2.reason.startswith("comparison failed: KeyError") and j2.steps_run == 1
+
+
+def test_journeys_finishing_after_an_interrupt_are_dropped(monkeypatch):
+    journeys = [fakereplay.journey(f"j{n}") for n in range(1, 4)]
+    release, replayed = threading.Event(), []
+
+    def replay_one(j):
+        replayed.append(j.journey_id)
+        release.wait(5)
+        return fakereplay.replayed(j)
+
+    fakereplay.no_browser(monkeypatch, replay_one)
+    join = replay._Worker.join
+
+    def interrupted(self, timeout=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(replay._Worker, "join", interrupted)
+    handed = []
+    with pytest.raises(KeyboardInterrupt):
+        Replayer("http://target.invalid", secret_values=lambda j: {}).run(
+            journeys, lambda i, j, run: handed.append(i), workers=2)
+    release.set()
+    for t in [t for t in threading.enumerate() if isinstance(t, replay._Worker)]:
+        join(t, 5)
+    # the run was being closed: nothing is written alongside it, and nothing more replayed
+    assert handed == [] and "j3" not in replayed
+
+
+def test_a_step_that_flakes_repeatedly_is_reported_with_its_journey(monkeypatch):
+    flaky = [{"step": 1, "attempt": n, "error": "Timeout 15000ms exceeded", "unit": "step"}
+             for n in (1, 2)]  # fmt: skip
+    journeys = [fakereplay.journey("j1"), fakereplay.journey("j2")]
+    fakereplay.no_browser(monkeypatch, lambda j: fakereplay.replayed(
+        j, flakes=flaky if j.journey_id == "j1" else None))
+    findings = []
+    result = _replay(journeys, findings.append)
+    [repeated] = [f for f in findings if f.kind == Kind.FLAKE and f.severity == Severity.MEDIUM]
+    assert (repeated.journey, repeated.locator, repeated.detail) == ("j1", "step 1", {"flakes": 2})
+    assert findings.index(repeated) < min(i for i, f in enumerate(findings) if f.journey == "j2")
+    assert [r.flakes for r in result.journeys] == [2, 0]
+
+
+def test_web_results_written_before_this_read_as_complete():
+    assert WebResult.from_dict({"target_url": "http://t", "journeys": []}).complete
+    assert not WebResult.from_dict(WebResult(complete=False).to_dict()).complete

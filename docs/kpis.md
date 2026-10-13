@@ -15,7 +15,9 @@ Each release's numbers are kept in `perf-results.json` with the release evidence
 
 The suite also holds the streaming design in place (spec 17): drilling into differences
 spread over 13 buckets of a 1,000,000 row table must not grow the process by 200 MB or
-more (`test_large_table_drill_down_streams`).
+more (`test_large_table_drill_down_streams`), and a replay worker must not hold a journey's
+captured responses once that journey's findings are written
+(`test_a_worker_holds_one_journey_at_a_time`).
 
 ## First results (development container, 4 vCPU)
 

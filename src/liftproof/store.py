@@ -8,6 +8,7 @@ pointed at the same bucket carries on. LocalStore serves development and tests.
 from __future__ import annotations
 
 import datetime as dt
+import os
 import shutil
 from pathlib import Path
 
@@ -135,6 +136,9 @@ class S3Store(Store):
         with path.open("wb") as fh:
             for chunk in resp["Body"].iter_chunks():
                 fh.write(chunk)
+        if "LastModified" in resp:  # the object's time: a stopped run's end is read from it
+            written = resp["LastModified"].timestamp()
+            os.utime(path, (written, written))
         return True
 
     def location(self, key: str) -> str:

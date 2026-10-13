@@ -2,9 +2,11 @@
 
 Nothing irreplaceable stays on the instance. A reconciliation or a baseline that loses
 its instance halfway leaves what it finished in the bucket, and a replacement instance
-pointed at the same bucket resumes from there. Checkpoints are spaced out (at most one
-every CHECKPOINT_SECONDS, plus a last one), so a schema of thousands of small tables
-is not thousands of uploads; a loss repeats at most that much work.
+pointed at the same bucket resumes from there. A replay leaves the journeys it finished,
+for the report; it is never resumed, as it created data on the target. Checkpoints are
+spaced out (at most one every CHECKPOINT_SECONDS, plus a last one), so a schema of
+thousands of small tables is not thousands of uploads; a loss repeats at most that much
+work.
 """
 
 from __future__ import annotations
@@ -15,17 +17,22 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from liftproof.errors import LiftproofError
 from liftproof.findings import FindingWriter
 from liftproof.reconcile.engine import ReconcileResult, TableResult
 from liftproof.store import Store
 
+if TYPE_CHECKING:
+    from liftproof.web.run import WebResult
+
 log = logging.getLogger(__name__)
 
 CHECKPOINT_SECONDS = 15.0
 PROGRESS = "progress.json"
+WEB_RESULTS = "web-results.json"
+RUN_INFO = "run.json"  # the run's mode and start, written as it starts
 RUN_MARKER = "in-progress-run"  # the newest reconciliation that has not finished
 
 
@@ -167,3 +174,39 @@ class RunCheckpoint:
         local = self.run_dir / PROGRESS
         p.save(local)
         keep(self.store, f"runs/{p.run_id}/{PROGRESS}", local)
+
+
+class ReplayCheckpoint:
+    """Keeps a replay's finished journeys, and their findings, in the store, for the
+    report of a run that stops."""
+
+    def __init__(
+        self,
+        store: Store,
+        run_dir: Path,
+        run_id: str,
+        writer: FindingWriter,
+        uploads: SegmentUploads,
+    ) -> None:
+        self.store = store
+        self.run_dir = run_dir
+        self.run_id = run_id
+        self.writer = writer
+        self.uploads = uploads
+        self.throttle = Throttle()
+
+    def journey_done(self, result: Callable[[], WebResult]) -> None:
+        if self.throttle.due():
+            self.save(result())
+
+    def save(self, result: WebResult) -> None:
+        # As a reconciliation's: the results name only journeys whose findings are all
+        # written, and go to the store only once those findings are there.
+        self.writer.flush()
+        if not self.uploads.catch_up(self.writer.closed_segments):
+            return
+        local = self.run_dir / WEB_RESULTS
+        tmp = local.with_suffix(".tmp")
+        tmp.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        tmp.replace(local)
+        keep(self.store, f"runs/{self.run_id}/{WEB_RESULTS}", local)

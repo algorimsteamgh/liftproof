@@ -87,8 +87,9 @@ pipelines start runs through the SSM document; see [docs/pipelines.md](docs/pipe
 
 Nothing irreplaceable stays on the instance. Every run copies its project file to the
 bucket; a reconciliation sends its findings there at least every minute and checkpoints
-its finished tables, and a baseline checkpoints its manifest the same way. On a
-replacement instance pointed at the same bucket, `mvt-restore.service` writes the
+its finished tables, a replay writes each journey's findings as the journey finishes and
+checkpoints the finished journeys, and a baseline checkpoints its manifest the same way.
+On a replacement instance pointed at the same bucket, `mvt-restore.service` writes the
 project files back at first boot, `liftproof runs` and the UI list every run and journey
 in the bucket, and an interrupted run carries on from its last checkpoint:
 
@@ -104,6 +105,11 @@ resumed. Against a live source, the tables compared after the resume are read as
 resume. The lost instance's run lock expires 15 minutes after its last renewal; until
 then a resume is refused with exit code 2. A run that fails rather than stops names each
 table, file set and journey it never reached as not checked.
+
+A replay is never resumed, as its journeys created data on the target. The journeys it
+finished keep their findings and results; those it had not finished are listed as not
+run. `liftproof report --run ID` builds the report of a run that stopped, on any instance,
+from what reached the bucket, and that report reads as failed.
 
 ## Exit codes
 
@@ -131,8 +137,9 @@ and the earliest and latest value of each date and time column of the rows compa
 (`data_ranges`). Those are aggregates of integer keys and dates only; a text key's ends
 appear only with `show_values`. `database.ranges: false` turns them off, saving one
 MIN/MAX statement per table and side. `liftproof report --run ID` rebuilds the HTML and
-JSON from the run's findings and keeps what the run was (its reference, window, schedule
-and who ran it), adding when it was regenerated.
+JSON from the run's findings (copying from the bucket what this instance does not hold)
+and keeps what the run was (its reference, window, schedule and who ran it), adding when
+it was regenerated.
 
 ## Tests
 

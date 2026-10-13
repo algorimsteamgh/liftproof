@@ -1,0 +1,35 @@
+{
+  "product_version": "0.1.0.dev0",
+  "python": "3.12.3",
+  "platform": "Linux-6.18.44-fc-v114-x86_64-with-glibc2.39",
+  "cpus": 4,
+  "kpis": {
+    "replay_time_ratio": {
+      "value": 1.14,
+      "median": 1.05,
+      "threshold": 2.0,
+      "unit": "replayed / recorded journey wall clock (worst of the runs)",
+      "recorded_ms": 2426.5,
+      "runs": 60,
+      "steps": 6,
+      "latency_ms": 150,
+      "passed": true
+    },
+    "tool_failure_rate": {
+      "value": 0.0,
+      "threshold": 0.02,
+      "unit": "share of runs",
+      "runs": 60,
+      "failures": [],
+      "passed": true
+    },
+    "report_generation": {
+      "value": 0.22,
+      "threshold": 60.0,
+      "unit": "seconds",
+      "journeys": 500,
+      "findings": 4000,
+      "passed": true
+    }
+  }
+}

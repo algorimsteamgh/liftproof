@@ -688,6 +688,10 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     )  # fmt: skip
     if progress is not None:
         _void_later_segments(store, run_dir, run_id, progress.segments)
+    # what the run is, for a report rebuilt after it stopped, on any instance
+    info = run_dir / ckpt.RUN_INFO
+    info.write_text(json.dumps({"mode": mode, "started_at": started}), encoding="utf-8")
+    ckpt.keep(store, f"runs/{run_id}/{ckpt.RUN_INFO}", info)
     checkpoint = None
     if mode == "reconcile":
         progress = progress or ckpt.RunProgress(
@@ -716,7 +720,12 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
             files_result = _files_into(args, project, writer)
         if web:
             stage = Comparator.UI
-            web_result = _replay_into(args, project, store, workdir, writer)
+            replay = ckpt.ReplayCheckpoint(store, run_dir, run_id, writer, uploads)
+            try:
+                web_result = _replay_into(args, project, store, workdir, writer, replay)
+            except BaseException as exc:
+                web_result = getattr(exc, "partial_result", None)
+                raise
     except ConfigError:
         raise
     except LiftproofError as exc:
@@ -739,7 +748,7 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
         if result is not None:
             _save_results(run_dir, result)
         if web_result is not None:
-            (run_dir / "web-results.json").write_text(
+            (run_dir / ckpt.WEB_RESULTS).write_text(
                 json.dumps(web_result.to_dict(), indent=2), encoding="utf-8"
             )
         if files_result is not None:
@@ -882,8 +891,15 @@ def _journey_secrets(journey: Journey) -> dict[str, str]:
 
 
 def _replay_into(
-    args: argparse.Namespace, project: Project, store: Store, workdir: Path, writer: FindingWriter
+    args: argparse.Namespace,
+    project: Project,
+    store: Store,
+    workdir: Path,
+    writer: FindingWriter,
+    checkpoint: ckpt.ReplayCheckpoint | None = None,
 ) -> WebResult:
+    """The replay of a run. Each journey's findings are written as it finishes; with a
+    checkpoint, the finished journeys reach the store as the replay goes."""
     from liftproof.web.compare import WebOptions
     from liftproof.web.run import run_journeys
 
@@ -913,6 +929,7 @@ def _replay_into(
             step_timeout_ms=web.step_timeout_ms,
             executable_path=web.chromium_path,
             workers=web.parallel_journeys,
+            on_journey=checkpoint.journey_done if checkpoint is not None else None,
         )
     finally:
         if marks is not None:
@@ -1305,18 +1322,24 @@ def cmd_ui_login(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+UNFINISHED = "the run stopped before writing its report; this one is rebuilt from what it left"
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     project = _project(args)
     workdir = Path(args.workdir) / project.name
     run_dir = workdir / "runs" / args.run
+    store = _store(project, Path(args.workdir))
+    _fetch_run(store, run_dir, args.run)
     if not run_dir.exists():
-        raise ConfigError(f"run {args.run} not found under {workdir / 'runs'}")
+        raise ConfigError(f"run {args.run} not found under {workdir / 'runs'} or in the store")
     prior = (
         json.loads((run_dir / "report.json").read_text())
         if (run_dir / "report.json").exists()
         else {}
     )
-    store = _store(project, Path(args.workdir))
+    info_file = run_dir / ckpt.RUN_INFO
+    info = json.loads(info_file.read_text(encoding="utf-8")) if info_file.exists() else {}
     baseline = None
     progress_file = run_dir / ckpt.PROGRESS
     if not prior and progress_file.exists():
@@ -1326,13 +1349,13 @@ def cmd_report(args: argparse.Namespace) -> int:
         if progress.baseline:
             baseline = _baseline_by_id(store, workdir, progress.baseline)
     else:
-        started = prior.get("run", {}).get("started_at", _now())
-    web_file = run_dir / "web-results.json"
+        started = prior.get("run", {}).get("started_at") or info.get("started_at") or _now()
+    web_file = run_dir / ckpt.WEB_RESULTS
     files_file = run_dir / "files-results.json"
     report = _report(
         project,
         args.run,
-        prior.get("mode", "reconcile"),
+        prior.get("mode") or info.get("mode", "reconcile"),
         run_dir,
         _load_results(run_dir) if (run_dir / "db-results.json").exists() else None,
         started,
@@ -1349,12 +1372,21 @@ def cmd_report(args: argparse.Namespace) -> int:
             if files_file.exists()
             else None
         ),
-        failure=prior.get("failure"),
+        failure=prior.get("failure") if prior else UNFINISHED,
         template=args.template,
     )
     for name in ("report.html", "report.json"):
         store.put_file(f"runs/{args.run}/{name}", run_dir / name)
     return _conclude(args, report, store, args.run)
+
+
+def _fetch_run(store: Store, run_dir: Path, run_id: str) -> None:
+    """The run's files this instance does not hold, from the store: the run may have
+    stopped on an instance that is gone."""
+    for key in store.list_keys(f"runs/{run_id}/"):
+        parts = key.split("/")
+        if len(parts) == 3 and not (run_dir / parts[2]).exists():
+            store.get_file(key, run_dir / parts[2])
 
 
 def _last_activity(run_dir: Path) -> str:
