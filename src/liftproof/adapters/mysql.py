@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import ssl
-import time
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -30,6 +30,7 @@ from liftproof.adapters.base import (
     Column,
     FloatStats,
     HashPlan,
+    Pacer,
     TableRef,
     TableSchema,
     all_of,
@@ -255,8 +256,10 @@ class MySQLAdapter(Adapter):
         sslmode: str = "verify-full",
         sslrootcert: str | None = None,
         statement_timeout_ms: int = 0,
+        lock_timeout_ms: int = 0,
         read_only: bool = True,
         rows_per_second: int = 0,
+        pause_ms: int = 0,
         connect_timeout: int = 10,
     ) -> None:
         self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
@@ -282,7 +285,7 @@ class MySQLAdapter(Adapter):
             ) from exc
         self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
-        self.rows_per_second = rows_per_second
+        self.pacer = Pacer(rows_per_second, pause_ms)
         with self.conn.cursor() as cur:
             cur.execute("SELECT VERSION()")
             version = cur.fetchone()[0]
@@ -292,13 +295,29 @@ class MySQLAdapter(Adapter):
             raise ConfigError(f"MariaDB ({version}) is not supported yet; only MySQL 8.0 and "
                               "later, including Aurora MySQL 3")  # fmt: skip
         self.require_version(version)
+        protect = {}
+        if lock_timeout_ms:  # whole seconds, at least one; it covers metadata locks
+            protect["lock_wait_timeout"] = math.ceil(lock_timeout_ms / 1000)
+        if rows_per_second:  # one thread: the cap is per connection
+            protect["innodb_parallel_read_threads"] = 1
         with self.conn.cursor() as cur:
             for name, value in SESSION.items():
                 cur.execute(f"SET SESSION {name} = %s", (value,))
             cur.execute("SET SESSION max_execution_time = %s", (int(statement_timeout_ms),))
+            for name, value in protect.items():
+                cur.execute(f"SET SESSION {name} = %s", (value,))
             if read_only:
                 cur.execute("SET SESSION TRANSACTION READ ONLY")
-        settings = dict(SESSION, max_execution_time=str(statement_timeout_ms))
+        settings = dict(
+            SESSION,
+            max_execution_time=str(statement_timeout_ms),
+            lock_wait_timeout="server default",
+        )
+        settings.update(
+            {k: str(v) for k, v in protect.items()},
+            rows_per_second=str(rows_per_second),
+            pause_ms=str(pause_ms),
+        )
         if read_only:
             settings["transaction_read_only"] = "ON"
         self._settings = settings
@@ -508,13 +527,10 @@ class MySQLAdapter(Adapter):
         cols = ", ".join(quote(c) for c, _ in plan.columns)
         where = all_of(where, _excluding(plan.filter))
         q = f"SELECT {cols} FROM {self._ident(plan.table)}" + (f" WHERE {where}" if where else "")
-        interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         types = [t for _, t in plan.columns]
         with self.conn.cursor(pymysql.cursors.SSCursor) as cur:
             cur.execute(q)
-            for row in cur:
-                if interval:
-                    time.sleep(interval)
+            for row in self.pacer.each(cur):
                 yield [prepare(v, t, plan.precision) for v, t in zip(row, types, strict=True)]
 
     def _bucket_aggregates_fallback(

@@ -10,7 +10,6 @@ identical output by the parity tests.
 from __future__ import annotations
 
 import datetime as dt
-import time
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -24,6 +23,7 @@ from liftproof.adapters.base import (
     Column,
     FloatStats,
     HashPlan,
+    Pacer,
     TableRef,
     TableSchema,
 )
@@ -169,8 +169,10 @@ class PostgresAdapter(Adapter):
         sslmode: str = "verify-full",
         sslrootcert: str | None = None,
         statement_timeout_ms: int = 0,
+        lock_timeout_ms: int = 0,
         read_only: bool = True,
         rows_per_second: int = 0,
+        pause_ms: int = 0,
         connect_timeout: int = 10,
     ) -> None:
         self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
@@ -196,8 +198,12 @@ class PostgresAdapter(Adapter):
             ) from exc
         self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
-        self.rows_per_second = rows_per_second
-        settings = dict(SESSION, statement_timeout=str(statement_timeout_ms))
+        self.pacer = Pacer(rows_per_second, pause_ms)
+        settings = dict(
+            SESSION, statement_timeout=str(statement_timeout_ms), lock_timeout=str(lock_timeout_ms)
+        )
+        if rows_per_second:  # one core: the cap is per connection, not per parallel worker
+            settings["max_parallel_workers_per_gather"] = "0"
         if read_only:
             settings["default_transaction_read_only"] = "on"
         with self.conn.cursor() as cur:
@@ -207,7 +213,9 @@ class PostgresAdapter(Adapter):
                         sql.Literal(name), sql.Literal(value)
                     )
                 )
-        self._settings = settings
+        self._settings = dict(
+            settings, rows_per_second=str(rows_per_second), pause_ms=str(pause_ms)
+        )
         self._in_snapshot = False
         self.require_version(_shown_version(self.conn.info.server_version))
 
@@ -411,14 +419,10 @@ class PostgresAdapter(Adapter):
         q = sql.SQL("SELECT {} FROM {}{}").format(
             cols, self._ident(plan.table), _excluding(plan.filter)
         )
-        interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         with self.conn.transaction(), self.conn.cursor(name="liftproof_stream") as cur:
             cur.itersize = 5000
             cur.execute(q)
-            for row in cur:
-                if interval:
-                    time.sleep(interval)
-                yield row
+            yield from self.pacer.each(cur)
 
     def _bucket_aggregates_fallback(self, plan: HashPlan) -> dict[int, BucketAggregate]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
@@ -456,6 +460,9 @@ class PostgresAdapter(Adapter):
             cur.execute(q, (sorted(wanted),))
             for row in cur:
                 yield tuple(row[2:]), row[0]
+
+    def drill_passes(self, plan: HashPlan, buckets: int) -> int:
+        return 1 if self._pushdown(plan) else buckets
 
     def bucket_rows(
         self, plan: HashPlan, buckets: set[int]

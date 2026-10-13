@@ -243,7 +243,8 @@ def take_baseline(
         def one(a: Adapter, ref: TableRef) -> BaselineTable:
             progress(f"baselining {ref}")
             schema = a.describe(ref)
-            rows = a.row_count(ref)
+            with a.pacer.statement() as scan:  # each read of the table is charged (9.15)
+                rows = scan.rows = a.row_count(ref)
             tp = plan_table(
                 schema,
                 None,
@@ -256,14 +257,17 @@ def take_baseline(
             )
             if tp.plan.filter and not a.supports_row_filters:
                 raise ConfigError(f"{ref}: row ignore rules are not supported for {a.engine}")
-            buckets = a.bucket_aggregates(tp.plan) if tp.plan.columns else {}
+            buckets: dict[int, BucketAggregate] = {}
+            if tp.plan.columns:
+                with a.pacer.statement(scan.rows):
+                    buckets = a.bucket_aggregates(tp.plan)
             if tp.plan.filter:  # the rows the baseline holds, not the table's
                 rows = sum(b.count for b in buckets.values())
-            spans = (
-                ranges.read(a, ref, schema, list(ranges.columns_for(tp.plan)), tp.plan.filter)
-                if with_ranges and tp.plan.columns
-                else {}
-            )
+            spans = {}
+            names = list(ranges.columns_for(tp.plan)) if with_ranges else []
+            if names:
+                with a.pacer.statement(scan.rows):
+                    spans = ranges.read(a, ref, schema, names, tp.plan.filter)
             return BaselineTable(
                 schema,
                 tp.plan,

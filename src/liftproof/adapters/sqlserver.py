@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import datetime as dt
 import ssl
-import time
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -37,6 +36,7 @@ from liftproof.adapters.base import (
     Column,
     FloatStats,
     HashPlan,
+    Pacer,
     TableRef,
     TableSchema,
     all_of,
@@ -298,8 +298,10 @@ class SQLServerAdapter(Adapter):
         sslmode: str = "verify-full",
         sslrootcert: str | None = None,
         statement_timeout_ms: int = 0,
+        lock_timeout_ms: int = 0,
         read_only: bool = True,
         rows_per_second: int = 0,
+        pause_ms: int = 0,
         connect_timeout: int = 10,
     ) -> None:
         self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
@@ -322,11 +324,15 @@ class SQLServerAdapter(Adapter):
             ) from exc
         self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
-        self.rows_per_second = rows_per_second
+        self.pacer = Pacer(rows_per_second, pause_ms)
+        # one core: the cap is per connection, and SQL Server has no session MAXDOP
+        self._hint = " OPTION (MAXDOP 1)" if rows_per_second else ""
         self._natives: dict[TableRef, dict[str, str]] = {}
         self._in_snapshot = False  # before anything that can close() the adapter
+        # SQL Server's 0 is "never wait"; no limit is -1
+        stmts = [*SESSION, f"SET LOCK_TIMEOUT {int(lock_timeout_ms) or -1}"]
         with self.conn.cursor() as cur:
-            for stmt in SESSION:
+            for stmt in stmts:
                 cur.execute(stmt)
         version, edition = self._query(
             "SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar), "
@@ -336,10 +342,11 @@ class SQLServerAdapter(Adapter):
             self.version = f"{version} ({AZURE_EDITIONS[edition]})"
         else:
             self.require_version(version)
-        self._settings = {
-            s.removeprefix("SET ").split(" ", 1)[0]: s.split(" ")[-1] for s in SESSION
-        }
+        self._settings = {s.removeprefix("SET ").split(" ", 1)[0]: s.split(" ")[-1] for s in stmts}
         self._settings["statement_timeout_ms"] = str(statement_timeout_ms)
+        if rows_per_second:
+            self._settings["MAXDOP"] = "1"
+        self._settings.update(rows_per_second=str(rows_per_second), pause_ms=str(pause_ms))
         # SQL Server has no read only session. The adapter only ever reads, and doctor
         # checks the login holds no write permission.
 
@@ -354,6 +361,7 @@ class SQLServerAdapter(Adapter):
         return dict(self._settings, version=self.version)
 
     def _query(self, q: str, args: Sequence[Any] | None = None) -> list[tuple[Any, ...]]:
+        q += self._hint  # every statement sent here is one SELECT
         with self.conn.cursor() as cur:
             if args:
                 cur.execute(q, tuple(args))
@@ -569,13 +577,10 @@ class SQLServerAdapter(Adapter):
         cols = ", ".join(quote(n) for n, _ in plan.columns)
         where = all_of(where, _excluding(plan.filter))
         q = f"SELECT {cols} FROM {self._ident(plan.table)}" + (f" WHERE {where}" if where else "")
-        interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         types = [t for _, t in plan.columns]
         with self.conn.cursor() as cur:
-            cur.execute(q)
-            for row in cur:
-                if interval:
-                    time.sleep(interval)
+            cur.execute(q + self._hint)
+            for row in self.pacer.each(cur):
                 yield [prepare(v, t) for v, t in zip(row, types, strict=True)]
 
     def _bucket_aggregates_fallback(

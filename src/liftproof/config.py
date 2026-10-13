@@ -28,6 +28,12 @@ FORBIDDEN_KEYS = re.compile(
 DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306, "oracle": 1521, "sqlserver": 1433}
 ENGINES = set(DEFAULT_PORTS)
 VERIFYING_TLS = {"verify-full", "verify-ca"}
+# Spec 9.15: the source is the machine not to saturate. Left out of the project file, its
+# connections read at most this many rows a second each, on one core, and pause between
+# statements; the target's do neither. Every connection gives up a lock wait after 10 s.
+SOURCE_ROWS_PER_SECOND = 50_000
+SOURCE_PAUSE_MS = 100
+LOCK_TIMEOUT_MS = 10_000
 
 
 @dataclass
@@ -41,7 +47,9 @@ class Connection:
     sslmode: str = "verify-full"
     sslrootcert: str | None = None
     statement_timeout_ms: int = 0
-    rows_per_second: int = 0
+    rows_per_second: int = 0  # 0: no cap
+    pause_ms: int = 0  # least time between two statements on a connection
+    lock_timeout_ms: int = LOCK_TIMEOUT_MS  # 0: wait for a lock as long as it takes
 
     @property
     def tls_verified(self) -> bool:
@@ -119,6 +127,13 @@ def _scan_for_credentials(node: Any, where: str = "") -> None:
             _scan_for_credentials(v, f"{where}{i}.")
 
 
+def _whole(d: dict[str, Any], key: str, default: int, where: str) -> int:
+    v = d.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise ConfigError(f"{where}.{key} is a whole number, 0 or more (0 turns it off)")
+    return v
+
+
 def _connection(d: dict[str, Any], role: str) -> Connection:
     if not isinstance(d, dict):
         raise ConfigError(f"{role}: connection settings missing")
@@ -128,6 +143,7 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
             f"{role}.engine {engine!r} is not supported in this build "
             f"(supported: {', '.join(sorted(ENGINES))})"
         )
+    cap, pause = (SOURCE_ROWS_PER_SECOND, SOURCE_PAUSE_MS) if role == "source" else (0, 0)
     try:
         return Connection(
             engine=engine,
@@ -139,7 +155,9 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
             sslmode=d.get("sslmode", "verify-full"),
             sslrootcert=d.get("sslrootcert"),
             statement_timeout_ms=int(d.get("statement_timeout_ms", 0)),
-            rows_per_second=int(d.get("rows_per_second", 0)),
+            rows_per_second=_whole(d, "rows_per_second", cap, role),
+            pause_ms=_whole(d, "pause_ms", pause, role),
+            lock_timeout_ms=_whole(d, "lock_timeout_ms", LOCK_TIMEOUT_MS, role),
         )
     except KeyError as exc:
         raise ConfigError(f"{role}.{exc.args[0]} is required") from None
@@ -416,7 +434,7 @@ store:
   s3_prefix: {name}
   # kms_key_id: arn:aws:kms:REGION:ACCOUNT:key/ID   # customer managed key (optional)
 
-source:
+source:                         # a read replica where there is one (README: Protecting the source)
   engine: postgresql
   host: source.db.example.internal
   port: 5432
@@ -428,7 +446,10 @@ source:
   # sslrootcert: /var/lib/mvt/certs/private-ca.pem   # only for a private CA; the AMI
                                 # already trusts Amazon RDS and public certificate authorities
   statement_timeout_ms: 600000
-  rows_per_second: 0            # application side hashing only; 0 = unlimited
+  lock_timeout_ms: 10000        # a read kept waiting this long for a lock fails the run
+  rows_per_second: 50000        # rows read a second, on one core, by each connection (each
+                                # worker has its own); 0 = no cap, e.g. for a read replica
+  pause_ms: 100                 # at least this long between two statements on a connection
 
 target:
   engine: postgresql            # postgresql, mysql, oracle or sqlserver; may differ
@@ -437,6 +458,9 @@ target:
   database: app
   secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/target
   sslmode: verify-full          # RDS certificates verify against the bundle on the AMI
+  lock_timeout_ms: 10000
+  rows_per_second: 0            # no cap; set one once the target is production
+  pause_ms: 0
 
 web:                            # record and replay; omit for database only projects
   source_url: https://app.example.internal

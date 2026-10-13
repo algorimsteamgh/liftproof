@@ -117,7 +117,9 @@ def connect(conn: Connection) -> Adapter:
         sslmode=conn.sslmode,
         sslrootcert=_sslrootcert(conn),
         statement_timeout_ms=conn.statement_timeout_ms,
+        lock_timeout_ms=conn.lock_timeout_ms,
         rows_per_second=conn.rows_per_second,
+        pause_ms=conn.pause_ms,
         read_only=True,
     )
 
@@ -407,6 +409,12 @@ def _reconcile_into(
             resumed=resuming,
             systemic=progress.systemic if resuming else False,
         )  # fmt: skip
+        # what limited the load on each database this run read (spec 9.15)
+        rec.result.protection = {
+            **({"source": source.protection()} if source is not None else {}),
+            "target": target.protection(),
+            "workers": o.workers,
+        }
         if progress is not None:
             progress.sample_seed = rec.seed
         result = rec.run()
@@ -1082,6 +1090,8 @@ def _report(
                 "timestamp_precision": o.precision,
             }
         )
+        if result.protection:
+            metadata["source_protection"] = result.protection
     if web_result is not None:
         range_block.update(
             {

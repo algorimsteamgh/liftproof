@@ -7,10 +7,13 @@ engine fixtures. Nothing outside the adapter changes.
 from __future__ import annotations
 
 import abc
+import contextlib
 import datetime as dt
 import decimal
+import math
 import re
-from collections.abc import Iterator, Sequence
+import time
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -115,6 +118,86 @@ def in_list(expr: str, values: Sequence[int], chunk: int | None = None) -> str:
     return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
 
 
+@dataclass
+class Statement:
+    rows: int  # rows the statement reads; raised in the block once more is known
+
+
+class Pacer:
+    """The rows per second cap and the pause of one connection (spec 9.15).
+
+    Every statement that reads a table is charged the rows it reads, and the connection
+    pays for them before its next statement: none starts before the rows read so far fit
+    under the cap, nor sooner than the pause after the last one ended. Nothing waits after
+    the last statement, and time spent idle earns no credit for a burst. The database runs
+    each statement at its own speed; only rows streamed here to be hashed are charged as
+    they arrive, which slows the read itself."""
+
+    def __init__(
+        self,
+        rows_per_second: int = 0,
+        pause_ms: int = 0,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.rate = rows_per_second
+        self.pause = pause_ms / 1000
+        self.clock = clock
+        self.sleep = sleep
+        self.charged = 0  # rows charged so far
+        self.waited = 0.0  # seconds spent waiting
+        self._paid = -math.inf  # when the rows charged so far fit under the cap
+        self._ended = -math.inf  # when the last statement ended
+
+    def _wait(self, until: float) -> None:
+        delay = until - self.clock()
+        if delay > 0:
+            self.sleep(delay)
+            self.waited += delay
+
+    def _charge(self, since: float, rows: int) -> None:
+        if rows <= 0:
+            return
+        self.charged += rows
+        if self.rate:
+            self._paid = max(self._paid, since) + rows / self.rate
+
+    @contextlib.contextmanager
+    def statement(self, rows: int = 0) -> Iterator[Statement]:
+        """Around one statement: waits for the rows before it and the pause, then charges
+        what it read, less what a stream inside it already paid."""
+        self._wait(max(self._paid, self._ended + self.pause))
+        s = Statement(rows)
+        start, before = self.clock(), self.charged
+        try:
+            yield s
+        finally:
+            self._ended = self.clock()
+            self._charge(start, s.rows - (self.charged - before))
+
+    def each(self, rows: Iterable[Any], batch: int = 1000) -> Iterator[Any]:
+        """Rows streamed here to be hashed, charged a batch at a time as they arrive."""
+        if not self.rate:
+            yield from rows
+            return
+        start, n = self.clock(), 0
+        try:
+            for row in rows:
+                yield row
+                n += 1
+                if n == batch:
+                    self._charge(start, n)
+                    self._wait(self._paid)
+                    start, n = self.clock(), 0
+        finally:
+            self._charge(start, n)
+
+
+UNPACED = Pacer()  # an adapter that never set its own: no cap, no pause
+PROTECTION = ("rows_per_second", "pause_ms", "statement_timeout_ms", "lock_timeout_ms")
+
+
 class Adapter(abc.ABC):
     engine: str = "abstract"
     hash_probe: str = "SELECT md5('liftproof')"  # doctor: MD5 is usable on this server
@@ -122,6 +205,8 @@ class Adapter(abc.ABC):
     minimum_version: tuple[int, ...] = ()  # the oldest server the adapter supports
     minimum_shown: str = ""
     version: str = ""
+    # spec 9.15: every statement that reads a table goes through this connection's pacer
+    pacer: Pacer = UNPACED
 
     def require_version(self, found: str) -> None:
         """Refuse a server older than the oldest supported when connecting, rather than
@@ -178,6 +263,29 @@ class Adapter(abc.ABC):
         for b in sorted(buckets):
             yield b, dict(self.row_hashes(plan, {b}))
 
+    def drill_passes(self, plan: HashPlan, buckets: int) -> int:
+        """How many times bucket_rows reads the whole table for this many buckets."""
+        return buckets
+
+    def paced_bucket_rows(
+        self, plan: HashPlan, buckets: set[int], rows: int
+    ) -> Iterator[tuple[int, dict[tuple[Any, ...], str]]]:
+        """bucket_rows under this connection's cap and pause, each read of the table a
+        statement charged its rows. A single pass is one statement, never paused inside:
+        its cursor holds a transaction open."""
+        found = self.bucket_rows(plan, buckets)
+        try:
+            if self.drill_passes(plan, len(buckets)) == 1:
+                with self.pacer.statement(rows):
+                    yield from found
+                return
+            for _ in range(len(buckets)):
+                with self.pacer.statement(rows):
+                    item = next(found)
+                yield item
+        finally:
+            found.close()
+
     @abc.abstractmethod
     def fetch_rows(
         self, plan: HashPlan, keys: Sequence[tuple[Any, ...]]
@@ -190,6 +298,12 @@ class Adapter(abc.ABC):
     def session_settings(self) -> dict[str, str]:
         """Pinned session parameters, recorded in the manifest."""
         return {}
+
+    def protection(self) -> dict[str, int]:
+        """What limits this connection's load on its database (spec 9.15), for the report;
+        0 is off."""
+        given = getattr(self, "_kwargs", {})
+        return {k: int(given.get(k) or 0) for k in PROTECTION}
 
     # replication position (spec 9.2) -----------------------------------------------
     # Engines that cannot answer leave these as they are; the check then reports that

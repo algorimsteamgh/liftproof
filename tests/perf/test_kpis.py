@@ -9,6 +9,7 @@ import time
 
 import pytest
 
+from liftproof.config import LOCK_TIMEOUT_MS, SOURCE_PAUSE_MS, SOURCE_ROWS_PER_SECOND
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity, read_findings
 from liftproof.reconcile.engine import ReconcileOptions, Reconciler
 from liftproof.report.builder import build_report, write_reports
@@ -145,8 +146,17 @@ def big_pair(pg_available):
             c.execute(f'DROP DATABASE IF EXISTS "{n}" WITH (FORCE)')
 
 
-def _reconcile(tmp_path, adapter_for, names):
-    source, target = adapter_for(names[0]), adapter_for(names[1])
+# The product as shipped (spec 9.15): the source read under the default cap and pause, one
+# core per connection; the target without either. Every connection's lock timeout.
+SHIPPED = (
+    {"rows_per_second": SOURCE_ROWS_PER_SECOND, "pause_ms": SOURCE_PAUSE_MS,
+     "lock_timeout_ms": LOCK_TIMEOUT_MS},
+    {"lock_timeout_ms": LOCK_TIMEOUT_MS},
+)  # fmt: skip
+
+
+def _reconcile(tmp_path, adapter_for, names, settings=({}, {})):
+    source, target = (adapter_for(n, **kw) for n, kw in zip(names, settings, strict=True))
     writer = FindingWriter(tmp_path / "findings", "r-perf")
     t0 = time.perf_counter()
     result = Reconciler(target, writer, ReconcileOptions(), source=source).run()
@@ -159,7 +169,7 @@ def test_kpi_database_throughput(tmp_path, adapter_for, big_pair, kpi):
     """At least 1 million rows per minute per table, stated with its variables
     (Technical Spec 17): column count, average row width, rows, cores, both sides read."""
     names, _, width = big_pair
-    result, elapsed = _reconcile(tmp_path, adapter_for, names)
+    result, elapsed = _reconcile(tmp_path, adapter_for, names, SHIPPED)
     assert [t.status for t in result.tables] == ["matched"]
     per_minute = ROWS / elapsed * 60
     kpi(
@@ -172,6 +182,8 @@ def test_kpi_database_throughput(tmp_path, adapter_for, big_pair, kpi):
         avg_row_bytes=width,
         seconds=round(elapsed, 2),
         engine="postgresql, hash pushdown",
+        source_rows_per_second=SOURCE_ROWS_PER_SECOND,
+        source_pause_ms=SOURCE_PAUSE_MS,
         passed=per_minute >= ROWS_PER_MINUTE_MIN,
     )
     assert per_minute >= ROWS_PER_MINUTE_MIN

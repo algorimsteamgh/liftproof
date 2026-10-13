@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from liftproof import cli
+from liftproof.config import LOCK_TIMEOUT_MS, SOURCE_PAUSE_MS, SOURCE_ROWS_PER_SECOND
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_OK, EXIT_RUN_FAILED
 from liftproof.store import LocalStore
@@ -215,6 +216,43 @@ def test_rebaseline_then_regression_against_the_target_alone(tmp_path, dbs, caps
     summaries = [f["summary"] for f in json.loads(
         (tmp_path / "work/acme/runs/r3/report.json").read_text())["findings"]]  # fmt: skip
     assert "row count differs: target baseline 10, target 11 (+1)" in summaries
+
+
+@pytest.mark.postgres
+def test_the_report_records_what_limited_each_database_it_read(tmp_path, dbs, capsys):
+    s, t, _ = dbs
+    p = _project(tmp_path, s, t)  # no limits in the file: the defaults
+
+    def limits(run_id):
+        report = json.loads((tmp_path / f"work/acme/runs/{run_id}/report.json").read_text())
+        return report["run"]["source_protection"]
+
+    assert run(tmp_path, "reconcile", "--project", str(p), "--run-id", "r1") == EXIT_OK
+    assert limits("r1") == {
+        "source": {"rows_per_second": SOURCE_ROWS_PER_SECOND, "pause_ms": SOURCE_PAUSE_MS,
+                   "statement_timeout_ms": 0, "lock_timeout_ms": LOCK_TIMEOUT_MS},
+        "target": {"rows_per_second": 0, "pause_ms": 0, "statement_timeout_ms": 0,
+                   "lock_timeout_ms": LOCK_TIMEOUT_MS},
+        "workers": 1,
+    }  # fmt: skip
+    assert "source protection" in (tmp_path / "work/acme/runs/r1/report.html").read_text()
+    assert run(tmp_path, "report", "--project", str(p), "--run", "r1") == EXIT_OK
+    assert limits("r1")["source"]["rows_per_second"] == SOURCE_ROWS_PER_SECOND
+
+    # no source entry whenever the source was not read
+    assert run(tmp_path, "baseline", "--project", str(p), "--baseline-id", "b1") == EXIT_OK
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest",
+               "--no-source", "--run-id", "r2") == EXIT_OK  # fmt: skip
+    assert run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "t1") == EXIT_OK
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target",
+               "--run-id", "r3") == EXIT_OK  # fmt: skip
+    doc = yaml.safe_load(p.read_text())
+    doc["source"]["host"], doc["source"]["port"] = "127.0.0.1", 1  # unreachable: baseline only
+    p.write_text(yaml.safe_dump(doc))
+    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest",
+               "--run-id", "r4") == EXIT_OK  # fmt: skip
+    for run_id in ("r2", "r3", "r4"):
+        assert set(limits(run_id)) == {"target", "workers"}
 
 
 @pytest.mark.postgres

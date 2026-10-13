@@ -100,6 +100,9 @@ class ReconcileResult:
     systemic: bool = False
     replication: dict[str, Any] | None = None  # the position check, for the report
     sample_seed: int | None = None  # set when a table was sampled: reruns the same sample
+    # each database's cap, pause and timeouts as the run read it; no source when it was
+    # not read (spec 9.15)
+    protection: dict[str, Any] | None = None
 
     def status_counts(self) -> Counter:
         return Counter(t.status for t in self.tables)
@@ -305,7 +308,7 @@ class Reconciler:
                 detail={"tables_checked": done, "tables_different": mismatched},
             )
 
-    def _ranges(self, table, ttable, plan, tplan, sschema, tschema, base_entry, *,
+    def _ranges(self, table, ttable, plan, tplan, sschema, tschema, base_entry, scan, *,
                 reference_live: bool) -> dict[str, dict[str, Any]]:  # fmt: skip
         """Lowest and highest key and dates of the rows compared, per side; the reference
         side's from the baseline when the baseline was the reference."""
@@ -316,10 +319,12 @@ class Reconciler:
             return {}
         names = list(roles)
         if reference_live:
-            ref = ranges.read(self.source, table, sschema, names, plan.filter)
+            with self.source.pacer.statement(scan[0]):
+                ref = ranges.read(self.source, table, sschema, names, plan.filter)
         else:
             ref = base_entry.ranges if base_entry is not None else {}
-        tgt = ranges.read(self.target, ttable, tschema, names, tplan.filter)
+        with self.target.pacer.statement(scan[1]):
+            tgt = ranges.read(self.target, ttable, tschema, names, tplan.filter)
         side = "target baseline" if self.against_target else "source"
         return {
             c: {"role": role, side: ref.get(c), "target": tgt.get(c)} for c, role in roles.items()
@@ -427,7 +432,8 @@ class Reconciler:
             source_rows = base_entry.row_count
         else:
             sschema = self.source.describe(table)
-            source_rows = self.source.row_count(table)
+            with self.source.pacer.statement() as counted:
+                source_rows = counted.rows = self.source.row_count(table)
 
         tp: TablePlan = plan_table(
             sschema,
@@ -550,14 +556,16 @@ class Reconciler:
             # and each database's own load is unchanged (spec 17: the source is the
             # resource to protect, not the clock).
             with ThreadPoolExecutor(max_workers=2) as pool:
-                s_job = pool.submit(self.source.bucket_aggregates, plan)
-                t_aggs = self.target.bucket_aggregates(tplan)
+                s_job = pool.submit(_aggregates, self.source, plan, full_rows)
+                t_aggs = _aggregates(self.target, tplan, full_rows)
                 s_aggs = s_job.result()
         else:
-            t_aggs = self.target.bucket_aggregates(tplan)
+            t_aggs = _aggregates(self.target, tplan, full_rows)
         res.target_rows = sum(a.count for a in t_aggs.values())
+        # the rows each later read of the table is charged on each side (spec 9.15)
+        scan = (full_rows, max(full_rows, res.target_rows))
         res.ranges = self._ranges(table, ttable, plan, tplan, sschema, tschema, base_entry,
-                                  reference_live=s_live)  # fmt: skip
+                                  scan, reference_live=s_live)  # fmt: skip
         if plan.filter or plan.sample is not None:
             # the table's row count includes rows the rules leave out or the sample skips
             source_rows = res.source_rows = sum(a.count for a in s_aggs.values())
@@ -596,7 +604,7 @@ class Reconciler:
         # 2. table aggregate
         s_total = reduce_total(sum(a.total for a in s_aggs.values()))
         t_total = reduce_total(sum(a.total for a in t_aggs.values()))
-        self._floats(table, ttable, tp, res, tschema, plan.filter, tfilter)
+        self._floats(table, ttable, tp, res, tschema, scan, plan.filter, tfilter)
         if s_total == t_total and res.target_rows == source_rows:
             return res
         res.status = "different"
@@ -638,9 +646,9 @@ class Reconciler:
         )
         drill = bad[:1] if systemic else bad
         if plan.key_columns:
-            self._keyed(q, plan, tplan, set(drill), res, systemic)
+            self._keyed(q, plan, tplan, set(drill), res, systemic, scan)
         else:
-            self._keyless(q, plan, tplan, set(drill), res)
+            self._keyless(q, plan, tplan, set(drill), res, scan)
         return res
 
     def _sample(self, q: str, plan: HashPlan, rows: int) -> HashPlan:
@@ -668,7 +676,7 @@ class Reconciler:
         return replace(plan, sample=tuple(sorted(rng.sample(range(plan.buckets), k))))
 
     # ------------------------------------------------------------------ details
-    def _keyed(self, q, plan, tplan, buckets, res, systemic) -> None:
+    def _keyed(self, q, plan, tplan, buckets, res, systemic, scan) -> None:
         """Bucket by bucket, both sides in step: one bucket's keys are held at a time, and
         of each kind of difference only the rows that can be shown are kept."""
         limit = self.o.diff_row_limit
@@ -678,8 +686,8 @@ class Reconciler:
         changed: list[tuple] = []
         counts = [0, 0, 0]
         pairs = zip(
-            self.source.bucket_rows(plan, buckets),
-            self.target.bucket_rows(tplan, buckets),
+            self.source.paced_bucket_rows(plan, buckets, scan[0]),
+            self.target.paced_bucket_rows(tplan, buckets, scan[1]),
             strict=True,
         )
         for (sb, s), (tb, t) in pairs:
@@ -701,7 +709,7 @@ class Reconciler:
             return f"{keyname} = {', '.join('NULL' if v is None else v for v in k)}"
 
         if systemic:
-            self._systemic(q, plan, tplan, changed[:5], n_changed, res)
+            self._systemic(q, plan, tplan, changed[:5], n_changed, res, scan)
             return
         shown = 0
         for k in missing:
@@ -730,7 +738,7 @@ class Reconciler:
             shown += 1
         remaining = max(0, limit - shown)
         if changed and remaining:
-            self._changed(q, plan, tplan, changed[:remaining], fmt)
+            self._changed(q, plan, tplan, changed[:remaining], fmt, scan)
             shown += min(len(changed), remaining)
         total = n_missing + n_extra + n_changed
         self.emit(
@@ -749,9 +757,14 @@ class Reconciler:
             },
         )
 
-    def _column_diffs(self, plan, tplan, keys) -> list[tuple[tuple, str, str | None, str | None]]:
-        s_vals = self.source.fetch_rows(plan, keys)
-        t_vals = self.target.fetch_rows(tplan, keys)
+    def _column_diffs(
+        self, plan, tplan, keys, scan
+    ) -> list[tuple[tuple, str, str | None, str | None]]:
+        # keys are matched on their rendering, which no index serves: a read of the table
+        with self.source.pacer.statement(scan[0]):
+            s_vals = self.source.fetch_rows(plan, keys)
+        with self.target.pacer.statement(scan[1]):
+            t_vals = self.target.fetch_rows(tplan, keys)
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = []
         for k in keys:
@@ -771,8 +784,8 @@ class Reconciler:
             return value
         return _short(column_digest(value))
 
-    def _changed(self, q, plan, tplan, keys, fmt) -> None:
-        for k, col, a, b in self._column_diffs(plan, tplan, keys):
+    def _changed(self, q, plan, tplan, keys, fmt, scan) -> None:
+        for k, col, a, b in self._column_diffs(plan, tplan, keys, scan):
             self.emit(
                 Kind.DIFFERENCE,
                 Severity.MEDIUM,
@@ -785,8 +798,8 @@ class Reconciler:
                 detail={"key": list(k), "values_shown": self.o.show_values},
             )
 
-    def _systemic(self, q, plan, tplan, sample_keys, changed_total, res) -> None:
-        diffs = self._column_diffs(plan, tplan, sample_keys)
+    def _systemic(self, q, plan, tplan, sample_keys, changed_total, res, scan) -> None:
+        diffs = self._column_diffs(plan, tplan, sample_keys, scan)
         cols = Counter(col for _, col, _, _ in diffs)
         types = dict(plan.columns)
         likely = {
@@ -820,14 +833,17 @@ class Reconciler:
             },
         )
 
-    def _keyless(self, q, plan, tplan, buckets, res) -> None:
+    def _keyless(self, q, plan, tplan, buckets, res, scan) -> None:
         """A multiset of row hashes per bucket (identical rows share a bucket), one bucket
-        at a time; only the first hashes of each kind are kept for the report."""
+        at a time, each a read of the table; only the first hashes of each kind are kept
+        for the report."""
         missing: list[str] = []
         extra: list[str] = []
         for b in sorted(buckets):
-            s = Counter(h for _, h in self.source.row_hashes(plan, {b}))
-            t = Counter(h for _, h in self.target.row_hashes(tplan, {b}))
+            with self.source.pacer.statement(scan[0]):
+                s = Counter(h for _, h in self.source.row_hashes(plan, {b}))
+            with self.target.pacer.statement(scan[1]):
+                t = Counter(h for _, h in self.target.row_hashes(tplan, {b}))
             m, e = s - t, t - s
             res.missing_rows += sum(m.values())
             res.extra_rows += sum(e.values())
@@ -852,6 +868,7 @@ class Reconciler:
         tp: TablePlan,
         res: TableResult,
         tschema: TableSchema,
+        scan: tuple[int, int],
         sfilter: str | None = None,
         tfilter: str | None = None,
     ) -> None:
@@ -868,11 +885,13 @@ class Reconciler:
             return
         tol = self.o.float_rel_tolerance
         for col in tp.float_columns:
-            a = self.source.float_stats(table, col, **({"where": sfilter} if sfilter else {}))
+            with self.source.pacer.statement(scan[0]):
+                a = self.source.float_stats(table, col, **({"where": sfilter} if sfilter else {}))
             tcol = tschema.column(col)  # the target's own spelling (Oracle: upper case)
-            b = self.target.float_stats(
-                ttable, tcol.name if tcol else col, **({"where": tfilter} if tfilter else {})
-            )
+            with self.target.pacer.statement(scan[1]):
+                b = self.target.float_stats(
+                    ttable, tcol.name if tcol else col, **({"where": tfilter} if tfilter else {})
+                )
             problems = []
             for name in ("non_null", "nan_count", "inf_count"):
                 if getattr(a, name) != getattr(b, name):
@@ -902,6 +921,15 @@ class Reconciler:
                     column=col,
                     detail={"rel_tolerance": tol},
                 )
+
+
+def _aggregates(a: Adapter, plan: HashPlan, rows: int) -> dict[int, BucketAggregate]:
+    """One side's bucket aggregates: a read of the whole table whatever the row rules and
+    the sample keep, so charged at least the table's rows (spec 9.15)."""
+    with a.pacer.statement(rows) as s:
+        aggs = a.bucket_aggregates(plan)
+        s.rows = max(rows, sum(x.count for x in aggs.values()))
+    return aggs
 
 
 def _norm(a: BucketAggregate | None) -> tuple[int, str]:

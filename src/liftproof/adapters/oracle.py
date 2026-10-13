@@ -29,7 +29,6 @@ from __future__ import annotations
 import datetime as dt
 import decimal
 import ssl
-import time
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -42,6 +41,7 @@ from liftproof.adapters.base import (
     Column,
     FloatStats,
     HashPlan,
+    Pacer,
     TableRef,
     TableSchema,
     all_of,
@@ -290,8 +290,10 @@ class OracleAdapter(Adapter):
         sslmode: str = "verify-full",
         sslrootcert: str | None = None,
         statement_timeout_ms: int = 0,
+        lock_timeout_ms: int = 0,
         read_only: bool = True,
         rows_per_second: int = 0,
+        pause_ms: int = 0,
         connect_timeout: int = 10,
     ) -> None:
         self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
@@ -316,13 +318,21 @@ class OracleAdapter(Adapter):
         if statement_timeout_ms:
             self.conn.call_timeout = int(statement_timeout_ms)
         self.read_only = read_only
-        self.rows_per_second = rows_per_second
+        self.pacer = Pacer(rows_per_second, pause_ms)
         with self.conn.cursor() as cur:
             for name, value in SESSION.items():
                 cur.execute(f"ALTER SESSION SET {name} = {value}")
+            if rows_per_second:  # one core: the cap is per connection
+                cur.execute("ALTER SESSION DISABLE PARALLEL QUERY")
         self.require_version(self.conn.version)
         self._settings = {k: v.strip("'") for k, v in SESSION.items()}
         self._settings["call_timeout_ms"] = str(statement_timeout_ms)
+        # Queries read the version current when they started and take no row or table
+        # lock, so no writer makes one wait: lock_timeout_ms has nothing to set.
+        self._settings["lock_timeout"] = "not applicable: Oracle queries take no locks"
+        if rows_per_second:
+            self._settings["parallel_query"] = "disabled"
+        self._settings.update(rows_per_second=str(rows_per_second), pause_ms=str(pause_ms))
         # Oracle has no read only session. The adapter only ever reads, a snapshot is a
         # READ ONLY transaction, and doctor checks the login holds no write privilege.
         self._settings["snapshot"] = "SET TRANSACTION READ ONLY"
@@ -556,14 +566,11 @@ class OracleAdapter(Adapter):
         q = f"SELECT {self._select_sql(plan)} FROM {self._ident(plan.table)}" + (
             f" WHERE {where}" if where else ""
         )
-        interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         types = [t for _, t in plan.columns]
         with self.conn.cursor() as cur:
             cur.arraysize = 1000
             cur.execute(q)
-            for row in cur:
-                if interval:
-                    time.sleep(interval)
+            for row in self.pacer.each(cur):
                 yield [prepare(v, t) for v, t in zip(row, types, strict=True)]
 
     def _bucket_aggregates_fallback(

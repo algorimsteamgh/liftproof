@@ -67,10 +67,10 @@ def make_db(pg_available):
 def adapter_for():
     opened: list[PostgresAdapter] = []
 
-    def factory(dbname: str, read_only: bool = True) -> PostgresAdapter:
+    def factory(dbname: str, read_only: bool = True, **kw) -> PostgresAdapter:
         a = PostgresAdapter(
             host=PG["host"], port=PG["port"], database=dbname, user=PG["user"],
-            password=PG["password"], sslmode="disable", read_only=read_only,
+            password=PG["password"], sslmode="disable", read_only=read_only, **kw,
         )
         opened.append(a)
         return a
@@ -158,10 +158,10 @@ def mysql_adapter_for():
 
     opened: list[MySQLAdapter] = []
 
-    def factory(dbname: str, read_only: bool = True) -> MySQLAdapter:
+    def factory(dbname: str, read_only: bool = True, **kw) -> MySQLAdapter:
         a = MySQLAdapter(
             host=MY["host"], port=MY["port"], database=dbname, user=MY["user"],
-            password=MY["password"], sslmode="disable", read_only=read_only,
+            password=MY["password"], sslmode="disable", read_only=read_only, **kw,
         )
         opened.append(a)
         return a

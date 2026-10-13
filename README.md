@@ -33,6 +33,71 @@ liftproof support-bundle --project acme.yaml --doctor
 KPIs, thresholds and how each is measured are in `docs/kpis.md`; `pytest -m perf` runs
 the suite that gates every release.
 
+## Protecting the source
+
+The source is usually production, and the one machine Liftproof must not saturate. Point
+`source` at a read replica where there is one: an RDS or Aurora reader, a PostgreSQL hot
+standby, a MySQL replica, an Oracle Active Data Guard standby or a readable availability
+group secondary. On a PostgreSQL hot standby turn on `hot_standby_feedback`, or set
+`max_standby_streaming_delay` above the longest statement; otherwise the standby cancels
+the hash queries that conflict with replication.
+
+Each connection has its own limits, whole numbers where 0 turns one off:
+
+| Setting | Source default | Target default | What it limits |
+|---|---|---|---|
+| `rows_per_second` | 50000 | 0 | rows read a second by one connection, over its statements |
+| `pause_ms` | 100 | 0 | the least time between two statements on a connection |
+| `lock_timeout_ms` | 10000 | 10000 | how long a read waits for a lock before the run fails |
+| `statement_timeout_ms` | 0 (`init` writes 600000) | 0 | how long one statement may run |
+
+Every statement that reads a table is charged the table's rows: the row count, the bucket
+aggregate (the whole table, whatever row rules or a sample keep), the data ranges, each
+float column's statistics, each pass of a drill-down and the fetch of changed rows'
+values. A connection pays before its next statement, so nothing waits after the last one,
+and idle time earns no credit. The database runs each statement at its own speed, which
+`statement_timeout_ms` bounds; rows Liftproof hashes itself (JSON columns, and rows with
+non-ASCII text outside PostgreSQL) are charged as they stream, which slows the read
+itself. A capped connection runs each statement on one core (PostgreSQL
+`max_parallel_workers_per_gather = 0`, SQL Server `OPTION (MAXDOP 1)`, Oracle `DISABLE
+PARALLEL QUERY`, MySQL `innodb_parallel_read_threads = 1`), so the load is the cap times
+`database.workers`, each worker being another connection. With the defaults a matched
+table costs three reads (count, aggregate, ranges; `database.ranges: false` saves one), so
+a source connection gets through about a million rows a minute. The pause falls between
+tables, and between the buckets a drill-down reads one pass at a time: on MySQL, Oracle
+and SQL Server, and for tables without a key everywhere. PostgreSQL drills into every
+differing bucket in one pass and is not paused inside it.
+
+The lock timeout is PostgreSQL's `lock_timeout`, SQL Server's `SET LOCK_TIMEOUT` (0 in
+the project file is SQL Server's -1, wait), and MySQL's `lock_wait_timeout` in whole
+seconds rounded up, which covers metadata locks. Oracle queries take no locks, so there
+is nothing to set. A read that times out fails the run with exit code 2 and `--resume`
+carries on; raise the timeout, or set 0 to wait as long as it takes. A live comparison on
+SQL Server reads under READ COMMITTED, taking shared locks that wait for writers, unless
+READ_COMMITTED_SNAPSHOT is on.
+
+Slowing the reads has costs of its own. Everything that holds a snapshot lasts longer: a
+baseline (one snapshot over every table) and PostgreSQL's drill-down cursor. Meanwhile
+PostgreSQL keeps dead rows (bloat), Oracle needs undo to cover it (ORA-01555 when
+`undo_retention` is too short), SQL Server keeps row versions in tempdb, and MySQL's purge
+falls behind. On PostgreSQL and MySQL an `ALTER TABLE` waits for the lock a read holds on
+the table (a baseline holds them to its end), and every later query of that table queues
+behind the `ALTER`: keep schema changes and baselines apart, or give the DDL session its
+own lock timeout.
+
+The databases' own governors: on SQL Server, `QUERY_GOVERNOR_COST_LIMIT` is not set,
+because the hash queries' estimated cost grows with the table and the governor would
+refuse them outright rather than slow them; a Resource Governor workload group, with a
+classifier on `APP_NAME() = 'liftproof'` and a pool with `CAP_CPU_PERCENT`, limits them
+instead. On Oracle, Resource Manager can map the sessions to a consumer group by
+`CLIENT_PROGRAM` `liftproof` (`DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP_MAPPING`).
+PostgreSQL and MySQL have no governor; a replica is how the load stays off the primary.
+
+After cutover the target is production: give `target` a cap and a pause too, before
+`rebaseline` and scheduled regression runs. The report's run block records the limits of
+each database the run read (`source_protection`; no `source` entry when the source was
+not read).
+
 ## Record and replay
 
 ```bash

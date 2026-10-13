@@ -71,6 +71,9 @@ terraform apply -var ami_id=ami-... -var source_database_cidr=10.1.2.0/24 \
   -var target_database_cidr=10.42.0.0/20 -var 'application_cidrs=["10.1.3.0/24"]'
 ```
 
+`source_database_cidr` is where the source is read: a read replica's network where there
+is one, the recommended source (README, Protecting the source).
+
 Then store the database logins in Secrets Manager under `liftproof/acme-prod/`
 (`{"username": ..., "password": ...}`), open the UI with the `connect_ui` output, and
 run `liftproof doctor`. On the instance, doctor also connects to every AWS service
