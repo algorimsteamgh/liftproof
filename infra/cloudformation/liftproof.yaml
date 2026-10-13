@@ -193,7 +193,7 @@ Parameters:
     Default: ""
   AwsRequestsPerSecond:
     Type: Number
-    Description: Ceiling on the AWS API calls the product makes per second (all services together), so it never throttles your account.
+    Description: Ceiling on the AWS API calls each Liftproof process (a run, the UI, the scheduler) makes per second, all services together. Runs going at once each have this ceiling.
     Default: 20
     MinValue: 1
     MaxValue: 1000
@@ -838,12 +838,14 @@ Resources:
                   content: |
                     deployment: ${DeploymentName}
                     region: ${AWS::Region}
+                    vpc_cidr: ${VpcCidr}
                     bucket: ${Bucket}
                     kms_key: ${KeyArn}
                     log_group: ${LogGroup}
                     report_lock_days: ${ReportLockDays}
                     aws_requests_per_second: ${AwsRequestsPerSecond}
             - KeyArn: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+              VpcCidr: { "Fn::GetAtt": [VpcInfo, CidrBlock] }
       Tags:
         - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}" } }
         - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }

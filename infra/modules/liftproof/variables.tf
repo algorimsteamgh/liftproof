@@ -140,7 +140,7 @@ variable "alarm_topic_arn" {
 }
 
 variable "aws_requests_per_second" {
-  description = "Ceiling on the AWS API calls the product makes per second (all services together), so it never throttles the customer account."
+  description = "Ceiling on the AWS API calls each Liftproof process (a run, the UI, the scheduler) makes per second, all services together. Runs going at once each have this ceiling."
   type        = number
   default     = 20
   validation {

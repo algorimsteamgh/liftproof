@@ -141,11 +141,13 @@ def _instance_config() -> dict[str, Any]:
 
 
 def _configure_aws() -> None:
-    """The deployment's ceiling on AWS calls per second (AWSAPI-002)."""
+    """The deployment's region, and its ceiling on AWS calls per second (AWSAPI-002)."""
     try:
-        rate = _instance_config().get("aws_requests_per_second")
+        inst = _instance_config()
     except ConfigError:
-        rate = None  # a command that needs the settings says so itself
+        inst = {}  # a command that needs the settings says so itself
+    aws.configure_region(inst.get("region"))
+    rate = inst.get("aws_requests_per_second")
     try:
         aws.configure_rate_limit(float(rate) if rate else aws.DEFAULT_RATE)
     except (TypeError, ValueError):
@@ -1476,8 +1478,19 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                 "the pg_monitor role (or pg_read_all_stats)",
             ),
         )
-    store = _store(project, Path(args.workdir))
-    if project.web is not None:
+    try:
+        store: Store | None = _store(project, Path(args.workdir))
+    except ConfigError:
+        raise  # instance settings this user cannot read stop the command (decision 67)
+    except Exception as exc:  # an SDK set up wrongly (a missing AWS_PROFILE): one failure
+        store = None
+        checks.append(
+            {"check": "results storage", "result": "fail",
+             "detail": logs.scrub(f"{type(exc).__name__}: {exc}"),
+             "remedy": "fix the AWS profile (AWS_PROFILE, ~/.aws/config) or unset it to "
+                       "use the instance role"}
+        )  # fmt: skip
+    if project.web is not None and store is not None:
         workdir = Path(args.workdir) / project.name
         for jid in _journey_ids(args, project, workdir, store):
 
@@ -1553,20 +1566,21 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
             "kms:Decrypt on the key; for a customer managed key the key policy must also "
             "allow the instance role",
         )
-    else:
+    elif store is not None:
         where = store.location("")
         checks.append(
             {"check": "results storage", "result": "pass",
              "detail": f"no S3 bucket set: results stay in {where}"}
         )  # fmt: skip
-    region = _instance_config().get("region")
-    if region:
+    inst = _instance_config()
+    if inst.get("region"):
+        vpc_cidrs = (str(inst["vpc_cidr"]),) if inst.get("vpc_cidr") else ()
 
-        def _endpoints(r=region):
+        def _endpoints(r=inst["region"], cidrs=vpc_cidrs):
             routes, failed = {}, []
             for svc in aws.ENDPOINT_SERVICES:
                 try:
-                    routes[svc] = aws.reach(svc, r)
+                    routes[svc] = aws.reach(svc, r, vpc_cidrs=cidrs)
                 except OSError as exc:
                     failed.append(f"{svc} ({exc.strerror or type(exc).__name__})")
             if failed:
@@ -1576,6 +1590,13 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
             if public:
                 # works through a NAT gateway, but that traffic leaves the VPC
                 detail += f"; through a public address, not a VPC endpoint: {', '.join(public)}"
+            gateways = [svc for svc, how in routes.items() if how == "gateway"]
+            if gateways:
+                detail += (
+                    f"; {', '.join(gateways)} keeps public addresses through a gateway "
+                    "endpoint, so its route is not checked here: the private route tables "
+                    "need that endpoint"
+                )
             return detail
 
         check(

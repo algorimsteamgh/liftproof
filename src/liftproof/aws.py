@@ -48,12 +48,21 @@ class TokenBucket:
             time.sleep(wait)
 
 
+# One per process: a run, doctor, the UI and the scheduler each limit their own calls.
 _bucket = TokenBucket(rate_per_second=20, burst=40)  # until configure_rate_limit
+# The deployment's region from the instance settings. The SDK does not read it from the
+# instance metadata, so without it a client has no region, or the profile's.
+_region: str | None = None
 
 
 def configure_rate_limit(rate_per_second: float, burst: int | None = None) -> None:
     global _bucket
     _bucket = TokenBucket(rate_per_second, burst or max(1, int(rate_per_second * 2)))
+
+
+def configure_region(region: str | None) -> None:
+    global _region
+    _region = region or None
 
 
 def sdk_versions() -> dict[str, str]:
@@ -77,7 +86,7 @@ def client(
     cfg = Config(
         retries={"mode": "adaptive", "max_attempts": 10},
         user_agent_extra=f"liftproof/{__version__}",
-        region_name=region,
+        region_name=region or _region,
     )
     c = boto3.session.Session().client(
         service, config=cfg, endpoint_url=endpoint_url, **(credentials or {})
@@ -117,11 +126,14 @@ ENDPOINT_SERVICES = (
 GATEWAY_SERVICES = ("s3",)
 
 
-def reach(service: str, region: str, timeout: float = 5.0) -> str:
+def reach(service: str, region: str, timeout: float = 5.0, vpc_cidrs: tuple[str, ...] = ()) -> str:
     """Opens a TCP connection to the service's regional endpoint on 443 and closes it.
-    Returns "vpc endpoint" when the name resolves to a private address (an interface
-    endpoint with private DNS), "gateway" for S3, and "public address" otherwise. Raises
-    OSError when the name does not resolve or nothing answers."""
+    Returns "vpc endpoint" when the name resolves inside the VPC (an interface endpoint
+    with private DNS): an address that is not publicly routable, or one in the VPC's own
+    ranges, which a customer may have taken from public space. Returns "gateway" for S3,
+    whose addresses stay public through a gateway endpoint, so its route cannot be seen
+    from here; "public address" otherwise. Raises OSError when the name does not resolve
+    or nothing answers."""
     host = f"{service}.{region}.amazonaws.com"
     infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     family, kind, proto, _name, addr = infos[0]
@@ -130,4 +142,6 @@ def reach(service: str, region: str, timeout: float = 5.0) -> str:
         sock.connect(addr)
     if service in GATEWAY_SERVICES:
         return "gateway"
-    return "vpc endpoint" if ipaddress.ip_address(addr[0]).is_private else "public address"
+    ip = ipaddress.ip_address(addr[0])
+    inside = not ip.is_global or any(ip in ipaddress.ip_network(c, strict=False) for c in vpc_cidrs)
+    return "vpc endpoint" if inside else "public address"

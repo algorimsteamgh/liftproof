@@ -11,14 +11,17 @@ import yaml
 
 from liftproof import aws, cli
 from liftproof.adapters import mysql as mysql_mod
+from liftproof.adapters import oracle as oracle_mod
+from liftproof.adapters import sqlserver as sqlserver_mod
 from liftproof.adapters.base import Adapter
 from liftproof.adapters.mysql import MySQLAdapter
 from liftproof.adapters.oracle import OracleAdapter
-from liftproof.adapters.postgres import PostgresAdapter
+from liftproof.adapters.postgres import PostgresAdapter, _shown_version
 from liftproof.adapters.sqlserver import SQLServerAdapter
 from liftproof.config import load_project
 from liftproof.errors import EXIT_CONFIG, EXIT_OK, ConfigError
 from liftproof.files.sources import S3Source, open_source
+from liftproof.store import S3Store
 from tests.conftest import PG
 
 BUCKET = "liftproof-doctor-test"
@@ -137,8 +140,8 @@ def test_the_doctor_names_the_engine_and_version(pg_available, tmp_path, capsys,
 
 
 class _Cursor:
-    def __init__(self, version):
-        self.version, self.sent = version, []
+    def __init__(self, *row):
+        self.row, self.sent = row, []
 
     def __enter__(self):
         return self
@@ -150,20 +153,70 @@ class _Cursor:
         self.sent.append(q)
 
     def fetchone(self):
-        return (self.version,)
+        return self.row
+
+    def fetchall(self):
+        return [self.row]
 
 
 class _Conn:
+    """A driver connection that only answers the version query."""
+
     open = True
 
-    def __init__(self, version):
-        self.cur = _Cursor(version)
+    def __init__(self, *row, version=None):
+        self.cur = _Cursor(*row)
+        self.version = version  # python-oracledb's attribute
 
     def cursor(self):
         return self.cur
 
+    def rollback(self):
+        pass
+
     def close(self):
         self.open = False
+
+
+@pytest.mark.parametrize(
+    "version, edition, shown",
+    [
+        ("12.0.2000.8", 5, "12.0.2000.8 (Azure SQL Database)"),
+        ("12.0.2000.8", 8, "12.0.2000.8 (Azure SQL Managed Instance)"),
+        ("13.0.6300.2", 3, "13.0.6300.2"),
+        ("16.0.4135.4", 2, "16.0.4135.4"),
+    ],
+)
+def test_sql_server_2016_and_azure_sql_are_accepted(monkeypatch, version, edition, shown):
+    monkeypatch.setattr(sqlserver_mod.pytds, "connect", lambda **kw: _Conn(version, edition))
+    a = SQLServerAdapter(host="db", database="d", sslmode="disable")
+    assert a.version == shown
+
+
+def test_an_old_sql_server_is_refused_and_its_connection_closed(monkeypatch):
+    conn = _Conn("12.0.6024.0", 3)  # SQL Server 2014, not Azure
+    monkeypatch.setattr(sqlserver_mod.pytds, "connect", lambda **kw: conn)
+    with pytest.raises(ConfigError, match=r"SQL Server 12\.0\.6024\.0 .*SQL Server 2016 \(13\.x\)"):
+        SQLServerAdapter(host="db", database="d", sslmode="disable")
+    assert not conn.open
+
+
+def test_an_old_oracle_is_refused_and_its_connection_closed(monkeypatch):
+    conn = _Conn(version="18.0.0.0.0")
+    monkeypatch.setattr(oracle_mod.oracledb, "connect", lambda params: conn)
+    with pytest.raises(ConfigError, match=r"Oracle Database 18\.0\.0\.0\.0 .*19c or later"):
+        OracleAdapter(host="db", database="ORCLPDB1", sslmode="disable")
+    assert not conn.open
+    monkeypatch.setattr(oracle_mod.oracledb, "connect", lambda params: _Conn(version="19.3.0.0.0"))
+    assert OracleAdapter(host="db", database="ORCLPDB1", sslmode="disable").version == (
+        "19.3.0.0.0"
+    )
+
+
+def test_postgres_versions_are_shown_as_postgres_writes_them():
+    assert _shown_version(160004) == "16.4"
+    assert _shown_version(130000) == "13.0"
+    assert _shown_version(90624) == "9.6.24"  # before 10 the minor had its own digits
 
 
 @pytest.mark.parametrize("version", ["10.11.6-MariaDB", "11.4.2-MariaDB-log"])
@@ -185,17 +238,37 @@ def test_an_old_mysql_is_refused_before_any_session_setting(monkeypatch):
 
 
 # ------------------------------------------------------------------- AWS rate limit
-def test_the_rate_limit_comes_from_the_instance_settings(monkeypatch, settings, capsys):
+def test_rate_limit_and_region_come_from_the_instance_settings(monkeypatch, settings, capsys):
     rates = []
     monkeypatch.setattr(aws, "configure_rate_limit", lambda rate, burst=None: rates.append(rate))
-    settings(aws_requests_per_second=5)
+    monkeypatch.setattr(aws, "_region", None)
+    settings(aws_requests_per_second=5, region="ap-south-1")
     assert cli.main(["version"]) == EXIT_OK
+    # the SDK does not read the region from instance metadata: every client gets it here
+    assert aws.client("s3").meta.region_name == "ap-south-1"
+    assert aws.client("secretsmanager", "eu-west-1").meta.region_name == "eu-west-1"
     settings(bucket="b")  # not set: the default
     assert cli.main(["version"]) == EXIT_OK
     assert rates == [5.0, aws.DEFAULT_RATE]
     settings(aws_requests_per_second="fast")
     assert cli.main(["version"]) == EXIT_CONFIG
     assert "aws_requests_per_second" in capsys.readouterr().err
+
+
+def test_unreadable_instance_settings_leave_other_commands_working(monkeypatch, tmp_path):
+    rates = []
+    monkeypatch.setattr(aws, "configure_rate_limit", lambda rate, burst=None: rates.append(rate))
+
+    class Unreadable:  # /etc/mvt/config.yaml is 0640 root:mvt; ssm-user cannot read it
+        def read_text(self, encoding):
+            raise PermissionError(13, "Permission denied")
+
+        def __str__(self):
+            return "/etc/mvt/config.yaml"
+
+    monkeypatch.setattr(cli, "INSTANCE_CONFIG", Unreadable())
+    assert cli.main(["version"]) == EXIT_OK
+    assert rates == [aws.DEFAULT_RATE]
 
 
 def test_an_s3_file_source_uses_the_shared_rate_limited_client(monkeypatch):
@@ -270,6 +343,34 @@ def test_doctor_proves_the_deployment_bucket_and_key(s3, settings, files_project
     assert "NoSuchBucket" in storage["detail"] and "kms:Decrypt" in storage["remedy"]
 
 
+def test_doctor_fails_when_the_probe_does_not_read_back(s3, settings, files_project, tmp_path,
+                                                       capsys, monkeypatch):  # fmt: skip
+    _client, key = s3
+    settings(bucket=BUCKET, kms_key=key)
+    monkeypatch.setattr(S3Store, "get_file", lambda self, k, path: False)
+    code, checks = _doctor(files_project, tmp_path, capsys)
+    storage = checks["S3 bucket writable and readable with KMS encryption"]
+    assert code == EXIT_CONFIG and storage["result"] == "fail"
+    assert "not found again" in storage["detail"]
+
+
+def test_a_broken_aws_profile_fails_one_check_not_doctor(settings, files_project, tmp_path,
+                                                         capsys, monkeypatch):  # fmt: skip
+    from botocore.exceptions import ProfileNotFound
+
+    settings(bucket=BUCKET)
+
+    def no_profile(project, workdir):
+        raise ProfileNotFound(profile="missing")
+
+    monkeypatch.setattr(cli, "_store", no_profile)
+    code, checks = _doctor(files_project, tmp_path, capsys)
+    assert code == EXIT_CONFIG
+    assert checks["results storage"]["result"] == "fail"
+    assert "ProfileNotFound" in checks["results storage"]["detail"]
+    assert checks["file set docs source readable"]["result"] == "pass"  # the rest still ran
+
+
 def test_doctor_without_a_bucket_says_where_results_go(settings, files_project, tmp_path,
                                                        capsys):  # fmt: skip
     settings()
@@ -282,22 +383,23 @@ def test_doctor_without_a_bucket_says_where_results_go(settings, files_project, 
 # ------------------------------------------------------------------- doctor endpoints
 def test_doctor_checks_every_endpoint_on_the_instance(settings, files_project, tmp_path,
                                                       capsys, monkeypatch):  # fmt: skip
-    settings(region="ap-south-1")
+    settings(region="ap-south-1", vpc_cidr="10.20.0.0/16")
     asked = []
 
-    def reach(service, region, timeout=5.0):
-        asked.append((service, region))
+    def reach(service, region, timeout=5.0, vpc_cidrs=()):
+        asked.append((service, region, vpc_cidrs))
         return {"s3": "gateway", "logs": "public address"}.get(service, "vpc endpoint")
 
     monkeypatch.setattr(aws, "reach", reach)
     code, checks = _doctor(files_project, tmp_path, capsys)
     assert code == EXIT_OK
-    assert asked == [(s, "ap-south-1") for s in aws.ENDPOINT_SERVICES]
+    assert asked == [(s, "ap-south-1", ("10.20.0.0/16",)) for s in aws.ENDPOINT_SERVICES]
     endpoints = checks["AWS service endpoints reachable"]
     assert endpoints["result"] == "pass"
-    assert endpoints["detail"].endswith("not a VPC endpoint: logs")
+    assert "through a public address, not a VPC endpoint: logs;" in endpoints["detail"]
+    assert "s3 keeps public addresses through a gateway endpoint" in endpoints["detail"]
 
-    def unreachable(service, region, timeout=5.0):
+    def unreachable(service, region, timeout=5.0, vpc_cidrs=()):
         if service == "kms":
             raise ConnectionRefusedError(111, "Connection refused")
         if service == "ssm":
@@ -334,6 +436,8 @@ class _Sock:
     "service, address, route",
     [
         ("kms", "10.0.3.17", "vpc endpoint"),
+        ("kms", "100.64.3.17", "vpc endpoint"),  # shared address space, not routable
+        ("kms", "11.0.3.17", "vpc endpoint"),  # a VPC built on its owner's public range
         ("logs", "52.95.86.10", "public address"),
         ("s3", "52.219.62.9", "gateway"),  # a gateway endpoint keeps public addresses
     ],
@@ -347,7 +451,7 @@ def test_reach_names_the_route(monkeypatch, service, address, route):
 
     monkeypatch.setattr(aws.socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr(aws.socket, "socket", _Sock)
-    assert aws.reach(service, "ap-south-1") == route
+    assert aws.reach(service, "ap-south-1", vpc_cidrs=("11.0.0.0/16",)) == route
     assert looked_up == [(f"{service}.ap-south-1.amazonaws.com", 443)]
 
 

@@ -323,6 +323,8 @@ class SQLServerAdapter(Adapter):
         self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
         self.rows_per_second = rows_per_second
+        self._natives: dict[TableRef, dict[str, str]] = {}
+        self._in_snapshot = False  # before anything that can close() the adapter
         with self.conn.cursor() as cur:
             for stmt in SESSION:
                 cur.execute(stmt)
@@ -340,8 +342,6 @@ class SQLServerAdapter(Adapter):
         self._settings["statement_timeout_ms"] = str(statement_timeout_ms)
         # SQL Server has no read only session. The adapter only ever reads, and doctor
         # checks the login holds no write permission.
-        self._natives: dict[TableRef, dict[str, str]] = {}
-        self._in_snapshot = False
 
     def close(self) -> None:
         try:
