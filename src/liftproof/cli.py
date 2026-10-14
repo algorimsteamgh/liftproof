@@ -940,7 +940,9 @@ def _record_replay_windows(marks, store: Store, workdir: Path, writer: FindingWr
     target, tables, before = marks
     try:
         after = watermark.read(target, tables)
-        new = watermark.windows(tables, before, after, writer.run_id)
+        new, problems = watermark.windows(tables, before, after, writer.run_id)
+        for p in problems:
+            _replay_mark_notice(writer, p)
         if new:
             local = workdir / watermark.STORE_KEY
             store.get_file(watermark.STORE_KEY, local)
@@ -1044,10 +1046,12 @@ def _report(
     values_shown=None,
     finished_at=None,
     prior=None,
+    canonical_revision=None,
 ) -> dict[str, Any]:
     """`prior` is the run's own report when one is regenerated: what the run was (its
     reference, window, schedule, who ran it, versions) is taken from it as recorded,
-    never restated from today's project file."""
+    never restated from today's project file. `canonical_revision`: the one a run that
+    wrote no report hashed under, from its checkpoint."""
     findings = list(read_findings(run_dir))
     o = project.database
     finished_at = finished_at or _now()
@@ -1061,6 +1065,8 @@ def _report(
     }
     if scheduled:
         metadata["schedule"] = scheduled
+    if canonical_revision is not None:
+        metadata["canonical_revision"] = canonical_revision
     if resumed_at:
         # tables finished before a resume were read then; the rest after it
         metadata["resumed_at"] = list(resumed_at)
@@ -1336,11 +1342,14 @@ def cmd_report(args: argparse.Namespace) -> int:
     )
     store = _store(project, Path(args.workdir))
     baseline = None
+    revision = None
     progress_file = run_dir / ckpt.PROGRESS
     if not prior and progress_file.exists():
         # no report was written (the run stopped): its checkpoint names the reference
+        # and the rules it hashed under
         progress = ckpt.RunProgress.load(progress_file)
         started = progress.started_at
+        revision = progress.canonical_revision
         if progress.baseline:
             baseline = _baseline_by_id(store, workdir, progress.baseline)
     else:
@@ -1369,6 +1378,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         ),
         failure=prior.get("failure"),
         template=args.template,
+        canonical_revision=revision,
     )
     for name in ("report.html", "report.json"):
         store.put_file(f"runs/{args.run}/{name}", run_dir / name)

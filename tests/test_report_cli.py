@@ -136,6 +136,25 @@ def test_regenerating_a_report_keeps_what_the_run_was(tmp_path, project):
     assert after["findings"] == before["findings"]
 
 
+def test_a_report_rebuilt_from_a_checkpoint_states_its_revision(tmp_path, project):
+    """A run that stopped wrote no report: the one rebuilt from its checkpoint states the
+    rules the run hashed under, not this build's."""
+    work = ["--workdir", str(tmp_path / "w"), "--format", "json"]
+    cli.main(["reconcile", "--project", str(project), "--run-id", "r1", *work])
+    run_dir = tmp_path / "w" / "acme" / "runs" / "r1"
+    progress = run_dir / "progress.json"
+    saved = json.loads(progress.read_text())
+    assert saved["canonical_revision"] == CANONICAL_REVISION
+    # as a build from before canonical revisions left a run it never finished
+    del saved["canonical_revision"]
+    saved["complete"] = False
+    progress.write_text(json.dumps(saved))
+    for name in ("report.json", "report.html"):
+        (run_dir / name).unlink()
+    cli.main(["report", "--project", str(project), "--run", "r1", *work])
+    assert _report(tmp_path, "r1")["run"]["canonical_revision"] == 0
+
+
 def test_the_classification_follows_show_values_for_files(tmp_path):
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()

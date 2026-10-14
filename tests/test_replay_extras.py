@@ -199,7 +199,8 @@ def test_rows_created_inside_the_replay_window_are_left_out(tmp_path, engine_pai
     before = watermark.read(target, tables)
     e.insert(_orders(3, start=501))  # what the replay's journeys placed
     after = watermark.read(target, tables)
-    windows = watermark.windows(tables, before, after, "r-replay")
+    windows, problems = watermark.windows(tables, before, after, "r-replay")
+    assert not problems
     assert len(windows) == 1 and windows[0].kind == ("timestamp" if column else "number")
 
     table, _ = _reconcile(tmp_path, e)
@@ -228,13 +229,17 @@ def test_windows_after_a_target_baseline_only():
 
 def test_no_window_from_an_infinite_watermark():
     # PostgreSQL infinity reads as Verbatim: no window can be written with it, and a stored
-    # one would fail every later reconciliation
+    # one would fail every later reconciliation; the replay says so
     t = TableRef("public", "orders")
     at = dt.datetime(2026, 10, 1)
-    for before, after in [(None, Verbatim("infinity")), (at, Verbatim("infinity")),
-                          (Verbatim("infinity"), at), (None, Decimal("Infinity"))]:  # fmt: skip
-        assert watermark.windows({t: "c"}, {t: before}, {t: after}, "r1") == []
-    [w] = watermark.windows({t: "c"}, {t: None}, {t: at}, "r1")
+    inf = Verbatim("infinity")
+    for before, after in [(None, inf), (at, inf), (inf, at), (inf, inf),
+                          (None, Decimal("Infinity"))]:  # fmt: skip
+        windows, [problem] = watermark.windows({t: "c"}, {t: before}, {t: after}, "r1")
+        assert windows == [] and "watermark c reads " in problem
+        assert "replay_watermarks" in problem
+    assert watermark.windows({t: "c"}, {t: inf}, {t: None}, "r1") == ([], [])  # emptied
+    [w], [] = watermark.windows({t: "c"}, {t: None}, {t: at}, "r1")
     assert (w.after, w.upto, w.kind) == (None, "2026-10-01T00:00:00", "timestamp")
 
 
@@ -255,6 +260,31 @@ def secret(monkeypatch):
                         lambda arn: DbCredentials(PG["user"], PG["password"]))  # fmt: skip
 
 
+def _replay_project(tmp_path, monkeypatch, src, tgt, tc, database) -> list[str]:
+    """A project whose one journey writes orders; replaying it places two on the target."""
+    conn = {"engine": "postgresql", "host": PG["host"], "port": PG["port"], "user": PG["user"],
+            "sslmode": "disable", "secret_arn": TEST_SECRET_ARN}  # fmt: skip
+    project = tmp_path / "acme.yaml"
+    project.write_text(yaml.safe_dump({
+        "project": "acme", "source": dict(conn, database=src), "target": dict(conn, database=tgt),
+        "database": database,
+        "web": {"source_url": "http://src.invalid", "target_url": "http://tgt.invalid"},
+    }))  # fmt: skip
+    work = tmp_path / "work"
+    jdir = work / "acme" / "journeys"
+    jdir.mkdir(parents=True)
+    Journey("checkout", "http://src.invalid", writes_tables=["orders"]).save(jdir / "checkout.json")
+
+    def fake_replay(journeys, **kw):
+        tc.execute("INSERT INTO orders (item) VALUES ('replayed'), ('replayed')")
+        from liftproof.web.run import WebResult
+
+        return WebResult(target_url=kw["target_url"])
+
+    monkeypatch.setattr("liftproof.web.run.run_journeys", fake_replay)
+    return ["--project", str(project), "--workdir", str(work), "--format", "json"]
+
+
 @pytest.mark.postgres
 def test_replay_then_reconcile_leaves_replay_rows_out(tmp_path, make_db, secret, monkeypatch):
     s, sc = make_db("src")
@@ -263,27 +293,8 @@ def test_replay_then_reconcile_leaves_replay_rows_out(tmp_path, make_db, secret,
         c.execute("CREATE TABLE orders (id serial PRIMARY KEY, item text);"
                   "INSERT INTO orders (item) SELECT 'i' || g "
                   "FROM generate_series(1, 300) g")  # fmt: skip
-    conn = {"engine": "postgresql", "host": PG["host"], "port": PG["port"], "user": PG["user"],
-            "sslmode": "disable", "secret_arn": TEST_SECRET_ARN}  # fmt: skip
-    project = tmp_path / "acme.yaml"
-    project.write_text(yaml.safe_dump({
-        "project": "acme", "source": dict(conn, database=s), "target": dict(conn, database=t),
-        "database": {"rows_per_bucket": 100},
-        "web": {"source_url": "http://src.invalid", "target_url": "http://tgt.invalid"},
-    }))  # fmt: skip
+    argv = _replay_project(tmp_path, monkeypatch, s, t, tc, {"rows_per_bucket": 100})
     work = tmp_path / "work"
-    jdir = work / "acme" / "journeys"
-    jdir.mkdir(parents=True)
-    Journey("checkout", "http://src.invalid", writes_tables=["orders"]).save(jdir / "checkout.json")
-
-    def fake_replay(journeys, **kw):  # the journeys place two orders on the target
-        tc.execute("INSERT INTO orders (item) VALUES ('replayed'), ('replayed')")
-        from liftproof.web.run import WebResult
-
-        return WebResult(target_url=kw["target_url"])
-
-    monkeypatch.setattr("liftproof.web.run.run_journeys", fake_replay)
-    argv = ["--project", str(project), "--workdir", str(work), "--format", "json"]
     cli.main(["replay", *argv, "--run-id", "rp1"])
     assert cli.main(["reconcile", *argv, "--run-id", "rc1"]) == EXIT_OK
     assert cli.main(["reconcile", *argv, "--include-replay-rows"]) == EXIT_DIFFERENCES
@@ -291,6 +302,24 @@ def test_replay_then_reconcile_leaves_replay_rows_out(tmp_path, make_db, secret,
     findings = [json.loads(line) for f in sorted(run_dir.glob("findings-*"))
                 for line in f.read_text().splitlines()]  # fmt: skip
     assert any("rows created by replay (rp1)" in f["summary"] for f in findings)
+
+
+@pytest.mark.postgres
+def test_a_watermark_reading_infinity_is_reported(tmp_path, make_db, secret, monkeypatch):
+    # every replay on the table: its rows are not marked, and its report says so
+    s, _ = make_db("src")
+    t, tc = make_db("tgt")
+    tc.execute("CREATE TABLE orders (id serial PRIMARY KEY, item text,"
+               " placed timestamptz NOT NULL DEFAULT now());"
+               "INSERT INTO orders (item, placed) VALUES ('open ended', 'infinity')")  # fmt: skip
+    argv = _replay_project(tmp_path, monkeypatch, s, t, tc,
+                           {"replay_watermarks": {"orders": "placed"}})  # fmt: skip
+    cli.main(["replay", *argv, "--run-id", "rp1"])
+    work = tmp_path / "work" / "acme"
+    notices = [f.summary for f in read_findings(work / "runs" / "rp1") if f.object == "replay"]
+    assert notices == ["replay rows cannot be marked: public.orders: watermark placed reads "
+                       "infinity; name another column in database.replay_watermarks"]  # fmt: skip
+    assert not (work / watermark.STORE_KEY).exists()
 
 
 def test_replay_watermarks_must_be_a_mapping(tmp_path):
