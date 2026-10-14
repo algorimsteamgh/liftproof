@@ -22,6 +22,7 @@ from liftproof.adapters.sqlserver import (
 from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import render
 from liftproof.errors import ConfigError
+from liftproof.reconcile.baseline import Baseline, take_baseline
 
 pytestmark = pytest.mark.sqlserver
 
@@ -282,6 +283,27 @@ def test_snapshot_isolation(loaded, make_sqlserver_db, sqlserver_adapter_for):
     assert snap["type"] == "none" and snap["consistent"] is False
     assert not a.snapshot_available()
     a.end_snapshot()
+
+
+def test_a_baseline_per_table_without_snapshot_isolation(tmp_path, make_sqlserver_db,
+                                                         sqlserver_adapter_for):  # fmt: skip
+    """Per table there is no snapshot to open either: the tables are read one at a time,
+    not by several locking readers, and the baseline says no point was held."""
+    db, cur = make_sqlserver_db("nosnap", snapshot=False)
+    for t in ("a", "b", "c"):
+        cur.execute(f"CREATE TABLE dbo.{t} (id int PRIMARY KEY, v nvarchar(10))")
+        cur.execute(f"INSERT INTO dbo.{t} VALUES (1, N'x'), (2, N'y')")
+    messages: list[str] = []
+    manifest = tmp_path / "b" / "manifest.json"
+    take_baseline(sqlserver_adapter_for(db), manifest, baseline_id="b1", schemas=["dbo"],
+                  tables=None, ignore=[], business_keys={}, rows_per_bucket=10, precision=6,
+                  workers=3, progress=messages.append, snapshot="per_table")  # fmt: skip
+    b = Baseline.load(manifest)
+    assert any("without a snapshot; tables are baselined one at a time" in m for m in messages)
+    assert {t.snapshot for t in b.tables.values()} == {"none"}
+    c = b.consistency()
+    assert (c["held"], c["snapshot"]) == (False, "none")
+    assert "snapshot isolation is off" in c["summary"]
 
 
 def test_verify_read_only(make_sqlserver_db, sqlserver_adapter_for):

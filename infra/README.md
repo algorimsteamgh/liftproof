@@ -83,6 +83,14 @@ endpoint. S3 keeps public addresses through its gateway endpoint, so doctor cann
 its route: check that the private route tables carry the S3 gateway endpoint
 (`private_route_table_ids` / `PrivateRouteTableIds`).
 
+A baseline holds one snapshot of the source for as long as it runs, and that has a cost
+on the source: PostgreSQL cannot vacuum the rows changed since it began, MySQL's undo
+grows, SQL Server keeps row versions in tempdb, and Oracle needs `undo_retention` to cover
+it or fails the baseline with ORA-01555 (snapshot too old). Where the source cannot afford
+that, set `snapshot: per_table` on it in the project file: each table is read in a
+snapshot of its own, and the report says in plain words that cross table consistency was
+not held (README, Protecting the source).
+
 Each Liftproof process (a run, doctor, the UI, the scheduler) limits its own AWS calls to
 20 requests a second unless `aws_requests_per_second` (CloudFormation:
 `AwsRequestsPerSecond`) says otherwise; runs going at once each have that limit. Lower it

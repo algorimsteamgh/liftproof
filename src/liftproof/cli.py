@@ -255,7 +255,8 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
     throttle = ckpt.Throttle()
     o = project.database
     source_conn, target_conn = project.require_database()
-    with connect(source_conn if side == "source" else target_conn) as db:
+    conn = source_conn if side == "source" else target_conn
+    with connect(conn) as db:
         b = take_baseline(
             db,
             manifest,
@@ -273,6 +274,7 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
             # each finished table reaches the store, so a lost instance resumes (9.16)
             checkpoint=lambda: throttle.due() and ckpt.keep(store, key, manifest),
             with_ranges=o.ranges,
+            snapshot=conn.snapshot,
         )
     store.put_file(key, manifest)
     ckpt.set_marker(store, marker_local, marker_key, "")
@@ -280,12 +282,14 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
     marker = workdir / "baselines" / LATEST[side]
     marker.write_text(baseline_id, encoding="utf-8")
     store.put_file(f"baselines/{LATEST[side]}", marker)
+    consistency = b.consistency()
     payload = {
         "baseline_id": baseline_id,
         "side": side,
         "tables": len(b.tables),
         "rows": sum(t.row_count for t in b.tables.values()),
         "consistency": b.position,
+        "cross_table_consistency": consistency,
         "manifest": store.location(key),
     }
     _out(
@@ -293,6 +297,7 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
         payload,
         f"{side} baseline {baseline_id}: {payload['tables']} tables, {payload['rows']:,} rows\n"
         f"consistency position: {b.position.get('position')}\nmanifest: {payload['manifest']}"
+        + ("" if consistency["held"] else f"\n{consistency['summary']}")
         + (f"\ncompare against it with: --baseline {LATEST['target']}" if side == "target" else ""),
     )
     return EXIT_OK
@@ -1084,6 +1089,8 @@ def _report(
                     else "live source"
                 ),
                 "consistency_position": baseline.position if baseline else "live read",
+                # spec 9.2: says in plain words when the tables were not read at one point
+                **({"cross_table_consistency": baseline.consistency()} if baseline else {}),
                 # lowest and highest key and dates of the rows compared, per side
                 "data_ranges": {t.table: t.ranges for t in result.tables if t.ranges},
                 "replication": result.replication,
@@ -1193,6 +1200,9 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
             f"different, {c['files_missing']} missing)"
         )
     lines.append(f"differences: {c['differences']}, not checked: {c['not_checked']}")
+    consistency = report["range"].get("cross_table_consistency")
+    if consistency and not consistency["held"]:
+        lines.append(consistency["summary"])
     lines.append(f"report: {html}")
     _out(
         args,
@@ -1201,6 +1211,7 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
             "verdict": report["verdict"],
             "counts": c,
             "coverage": {k: v for k, v in cov.items() if k.endswith("_pct")},
+            **({"cross_table_consistency": consistency} if consistency else {}),
             "report_html": html,
             "report_json": store.location(f"runs/{run_id}/report.json"),
         },

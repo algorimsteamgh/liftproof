@@ -17,6 +17,7 @@ import yaml
 
 from liftproof.errors import ConfigError
 from liftproof.files.compare import FileSetConfig, IgnoreFile
+from liftproof.reconcile.baseline import SNAPSHOT_MODES
 from liftproof.reconcile.engine import ReconcileOptions
 from liftproof.reconcile.plan import IgnoreRule
 from liftproof.reconcile.replication import ReplicationConfig
@@ -50,6 +51,8 @@ class Connection:
     rows_per_second: int = 0  # 0: no cap
     pause_ms: int = 0  # least time between two statements on a connection
     lock_timeout_ms: int = LOCK_TIMEOUT_MS  # 0: wait for a lock as long as it takes
+    # a baseline of this database: one snapshot over every table, or one per table
+    snapshot: str = "whole"
 
     @property
     def tls_verified(self) -> bool:
@@ -144,6 +147,13 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
             f"(supported: {', '.join(sorted(ENGINES))})"
         )
     cap, pause = (SOURCE_ROWS_PER_SECOND, SOURCE_PAUSE_MS) if role == "source" else (0, 0)
+    snapshot = d.get("snapshot", "whole")
+    if snapshot not in SNAPSHOT_MODES:
+        raise ConfigError(
+            f"{role}.snapshot is whole (a baseline holds one snapshot over every table, the "
+            "default) or per_table (one snapshot per table, where the database cannot hold "
+            "one that long; the report then says cross table consistency was not held)"
+        )
     try:
         return Connection(
             engine=engine,
@@ -158,6 +168,7 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
             rows_per_second=_whole(d, "rows_per_second", cap, role),
             pause_ms=_whole(d, "pause_ms", pause, role),
             lock_timeout_ms=_whole(d, "lock_timeout_ms", LOCK_TIMEOUT_MS, role),
+            snapshot=snapshot,
         )
     except KeyError as exc:
         raise ConfigError(f"{role}.{exc.args[0]} is required") from None
@@ -450,6 +461,8 @@ source:                         # a read replica where there is one (README: Pro
   rows_per_second: 75000        # rows read a second, on one core, by each connection (each
                                 # worker has its own); 0 = no cap, e.g. for a read replica
   pause_ms: 100                 # at least this long between two statements on a connection
+  # snapshot: per_table         # a baseline holds one snapshot over every table; per_table
+                                # when the source cannot (README: Protecting the source)
 
 target:
   engine: postgresql            # postgresql, mysql, oracle or sqlserver; may differ
@@ -461,6 +474,7 @@ target:
   lock_timeout_ms: 10000
   rows_per_second: 0            # no cap; set one once the target is production
   pause_ms: 0
+  # snapshot: per_table         # rebaseline: one snapshot per table instead
 
 web:                            # record and replay; omit for database only projects
   source_url: https://app.example.internal

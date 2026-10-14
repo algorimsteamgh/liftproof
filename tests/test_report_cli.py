@@ -168,3 +168,42 @@ def test_the_classification_follows_show_values_for_files(tmp_path):
     assert _report(tmp_path, "f1")["classification"].startswith("hashes")
     cli.main(["files", "--project", str(path), "--run-id", "f2", "--show-values", *work])
     assert _report(tmp_path, "f2")["classification"] == "contains row values"
+
+
+def test_a_baseline_per_table_says_cross_table_consistency_was_not_held(tmp_path, project,
+                                                                        capsys):  # fmt: skip
+    doc = yaml.safe_load(project.read_text())
+    doc["source"]["snapshot"] = "per_table"  # the target keeps one snapshot
+    project.write_text(yaml.safe_dump(doc))
+    work = ["--workdir", str(tmp_path / "w"), "--format", "json"]
+    assert cli.main(["baseline", "--project", str(project), "--baseline-id", "b1", *work]) == 0
+    assert json.loads(capsys.readouterr().out)["cross_table_consistency"]["held"] is False
+    assert cli.main(["reconcile", "--project", str(project), "--baseline", "latest",
+                     "--run-id", "r1", *work]) == EXIT_DIFFERENCES  # fmt: skip
+    assert json.loads(capsys.readouterr().out)["cross_table_consistency"]["held"] is False
+    held = _report(tmp_path, "r1")["range"]["cross_table_consistency"]
+    assert (held["held"], held["snapshot"]) == (False, "per_table")
+    assert "2 points" in held["summary"]
+    html = (tmp_path / "w" / "acme" / "runs" / "r1" / "report.html").read_text()
+    assert '<p class="consistency">Cross table consistency was not held: ' in html
+    # regenerated, the report still says so
+    cli.main(["report", "--project", str(project), "--run", "r1", *work])
+    assert json.loads(capsys.readouterr().out)["cross_table_consistency"] == held
+    assert _report(tmp_path, "r1")["range"]["cross_table_consistency"] == held
+    # and so does the text the commands print
+    text = ["--workdir", str(tmp_path / "w"), "--format", "text"]
+    cli.main(["baseline", "--project", str(project), "--baseline-id", "b2", *text])
+    cli.main(["reconcile", "--project", str(project), "--baseline", "b2", *text])
+    assert capsys.readouterr().out.count("Cross table consistency was not held") == 2
+
+    # the target is rebaselined in one snapshot: nothing to say
+    assert cli.main(["rebaseline", "--project", str(project), "--baseline-id", "t1", *work]) == 0
+    assert json.loads(capsys.readouterr().out)["cross_table_consistency"]["held"] is True
+    cli.main(["reconcile", "--project", str(project), "--baseline", "latest-target",
+              "--run-id", "r2", *work])  # fmt: skip
+    assert _report(tmp_path, "r2")["range"]["cross_table_consistency"]["held"] is True
+    html = (tmp_path / "w" / "acme" / "runs" / "r2" / "report.html").read_text()
+    assert 'class="consistency"' not in html
+    # a live run read no baseline
+    cli.main(["reconcile", "--project", str(project), "--run-id", "r3", *work])
+    assert "cross_table_consistency" not in _report(tmp_path, "r3")["range"]

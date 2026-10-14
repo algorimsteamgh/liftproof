@@ -1,8 +1,10 @@
 """Baselines (PRD F2, Technical Spec 9.2, 9.16, 14).
 
 A baseline is taken inside one consistent snapshot and records its consistency position.
-Each table is checkpointed as it completes, so a lost instance or session resumes from
-the last finished table instead of starting again.
+Where a database cannot hold one snapshot that long, each table is read in a snapshot of
+its own, and the baseline then says that cross table consistency was not held. Each table
+is checkpointed as it completes, so a lost instance or session resumes from the last
+finished table instead of starting again.
 
 A source baseline freezes the source before cutover. A target baseline (`rebaseline`)
 snapshots the target after cutover, so scheduled regression compares the target with its
@@ -42,11 +44,13 @@ from liftproof.canonical import (
     RenderError,
     reduce_total,
 )
-from liftproof.errors import ConfigError
+from liftproof.errors import ConfigError, RunFailed
 from liftproof.reconcile import ranges
 from liftproof.reconcile.plan import NOT_CANONICALISABLE, NOT_IN_BASELINE, IgnoreRule, plan_table
 
 SIDES = ("source", "target")
+# how a baseline holds its snapshot (spec 9.2): one over every table, or one per table
+SNAPSHOT_MODES = ("whole", "per_table")
 # native types the adapters map to xml since canonical revision 2 (MySQL has none)
 XML_NATIVE = {"xml", "xmltype"}
 REASON_XML = (
@@ -68,13 +72,18 @@ class BaselineTable:
     canonical_revision: int = CANONICAL_REVISION
     # columns of a compared type it did not hash: lower cased name -> (issue, why)
     unhashed: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # when the snapshot it was read in was taken, and which: the baseline's (whole), its
+    # own (per_table), or none (SQL Server without snapshot isolation); None for entries
+    # from before they were kept
+    read_at: str | None = None
+    snapshot: str | None = None
 
     @property
     def aggregate(self) -> str:
         return reduce_total(sum(b.total for b in self.buckets.values()))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "columns": [
                 [c.name, c.native_type, str(c.canonical), c.fixed_width]
                 for c in self.schema.columns
@@ -99,6 +108,9 @@ class BaselineTable:
             "canonical_revision": self.canonical_revision,
             "unhashed": {c: list(v) for c, v in sorted(self.unhashed.items())},
         }
+        if self.snapshot:
+            d.update(read_at=self.read_at, snapshot=self.snapshot)
+        return d
 
     @classmethod
     def from_dict(cls, qualified: str, d: dict[str, Any]) -> BaselineTable:
@@ -137,6 +149,8 @@ class BaselineTable:
             d.get("ranges", {}),
             revision,
             unhashed,
+            d.get("read_at"),
+            d.get("snapshot"),
         )
 
 
@@ -165,10 +179,74 @@ class Baseline:
     selection: list[str] = field(default_factory=list)
     tables: dict[str, BaselineTable] = field(default_factory=dict)
     side: str = "source"  # target: taken by rebaseline
+    # whole, per_table, or mixed: resumed in the other mode
+    snapshot_mode: str = "whole"
+    # per table: a position read after the last table, which replication must reach
+    end_position: dict[str, Any] | None = None
 
     @property
     def complete(self) -> bool:
         return all(q in self.tables for q in self.selection)
+
+    @property
+    def reference_position(self) -> dict[str, Any]:
+        """What replication must have applied through (spec 9.2): the latest point a table
+        was read at. Per table, the position read after the last table; otherwise the
+        snapshot the last tables were read in, the first one or a resume's."""
+        if self.end_position is not None:
+            return self.end_position
+        snapshots = [self.position, *self.position.get("resumed_at", [])]
+        read = [t.read_at for t in self.tables.values() if t.read_at]
+        if not read:  # entries from before read_at: the last snapshot opened
+            return snapshots[-1]
+        last = max(read, key=dt.datetime.fromisoformat)
+        return next((s for s in snapshots if s.get("taken_at") == last), snapshots[-1])
+
+    def consistency(self) -> dict[str, Any]:
+        """Whether every table was read at one point (spec 9.2), and in plain words why
+        not: tables read per table, after a resume, or without a snapshot at all."""
+        tables = list(self.tables.values())
+        if self.position.get("consistent") is False or any(t.snapshot == "none" for t in tables):
+            return {
+                "held": False,
+                "snapshot": "none",
+                "summary": f"Cross table consistency was not held: the {self.side} was read "
+                "without a snapshot (SQL Server snapshot isolation is off), so neither the "
+                "tables nor one table's count and hashes were read at one point.",
+            }
+        resumed = [str(p.get("taken_at")) for p in self.position.get("resumed_at", [])]
+        if resumed and not all(t.snapshot for t in tables):  # entries that did not say where
+            return {
+                "held": False,
+                "snapshot": self.snapshot_mode,
+                "summary": "Cross table consistency was not held: the baseline was resumed at "
+                f"{', '.join(resumed)}, and the tables finished after a resume were read in "
+                "a later snapshot.",
+            }
+        # snapshots, not times: two can be taken within one tick of the database's clock
+        own = sum(t.snapshot == "per_table" for t in tables)
+        points = own + len({t.read_at for t in tables if t.snapshot != "per_table"})
+        if points > 1:
+            times = sorted({t.read_at for t in tables if t.read_at}, key=dt.datetime.fromisoformat)
+            how = (
+                "each in its own snapshot" if own == len(tables)
+                else "part of them each in its own snapshot, after a resume" if own
+                else "in a new snapshot after a resume"
+            )  # fmt: skip
+            return {
+                "held": False,
+                "snapshot": self.snapshot_mode,
+                "read_between": [times[0], times[-1]],
+                "summary": f"Cross table consistency was not held: the {self.side}'s tables "
+                f"were read at {points} points from {times[0]} to {times[-1]} ({how}), so a "
+                "row that refers to another table may have been read at a different point "
+                "than that table.",
+            }
+        return {
+            "held": True,
+            "snapshot": self.snapshot_mode,
+            "summary": f"Every table of the {self.side} was read in one snapshot.",
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -184,6 +262,8 @@ class Baseline:
             "selection": self.selection,
             "complete": self.complete,
             "tables": {q: t.to_dict() for q, t in sorted(self.tables.items())},
+            "snapshot_mode": self.snapshot_mode,
+            "end_position": self.end_position,
         }
 
     def save(self, path: Path) -> None:
@@ -224,9 +304,17 @@ class Baseline:
             d["product_version"],
             list(d["selection"]),
             side=d.get("side", "source"),  # manifests from before rebaseline existed
+            snapshot_mode=d.get("snapshot_mode", "whole"),
+            end_position=d.get("end_position"),
         )
         b.tables = {q: BaselineTable.from_dict(q, t) for q, t in d["tables"].items()}
         return b
+
+
+def _snapshot_too_old(exc: Exception) -> bool:
+    """The database could not keep the snapshot: PostgreSQL's snapshot too old (SQLSTATE
+    72000, old_snapshot_threshold), Oracle's ORA-01555 (undo retention)."""
+    return getattr(exc, "sqlstate", None) == "72000" or "ORA-01555" in str(exc)
 
 
 def take_baseline(
@@ -246,11 +334,17 @@ def take_baseline(
     workers: int = 1,
     checkpoint: Callable[[], object] = lambda: None,
     with_ranges: bool = True,
+    snapshot: str = "whole",
 ) -> Baseline:
     """`checkpoint` runs after each table's entry is saved to the manifest; the CLI
-    copies the manifest to the store there."""
+    copies the manifest to the store there. `snapshot`: whole holds one snapshot over
+    every table; per_table opens one for each table instead, for a database that cannot
+    hold one that long (spec 9.2)."""
     if side not in SIDES:
         raise ValueError(f"side must be one of {SIDES}")
+    if snapshot not in SNAPSHOT_MODES:
+        raise ValueError(f"snapshot must be one of {SNAPSHOT_MODES}")
+    per_table = snapshot == "per_table"
     existing = Baseline.load(manifest_path) if resume and manifest_path.exists() else None
     if existing is not None and existing.side != side:
         raise ConfigError(
@@ -274,9 +368,6 @@ def take_baseline(
                     f"resuming baseline {existing.baseline_id}; "
                     f"{len(existing.tables)} of {len(existing.selection)} tables done"
                 )
-            # A resumed baseline keeps its original position only if the source still
-            # holds that point; record the new one per table otherwise.
-            baseline.position.setdefault("resumed_at", []).append(position)
         else:
             baseline = Baseline(
                 baseline_id,
@@ -286,6 +377,7 @@ def take_baseline(
                 dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
                 selection=[r.qualified for r in refs],
                 side=side,
+                snapshot_mode=snapshot,
             )
         todo = [
             ref
@@ -293,8 +385,25 @@ def take_baseline(
             if ref.qualified not in baseline.tables
             and not any(r.whole_table and r.matches_table(ref.qualified) for r in ignore)
         ]
+        if existing is not None and todo:
+            # the rest is read at a later point than the tables done; each table records
+            # when, so the baseline says that consistency was not held
+            baseline.position.setdefault("resumed_at", []).append(position)
+            if baseline.snapshot_mode != snapshot:
+                baseline.snapshot_mode = "mixed"
+        if per_table:
+            source.end_snapshot()  # it held the table list; each table opens its own
 
         def one(a: Adapter, ref: TableRef) -> BaselineTable:
+            if not per_table:
+                return read(a, ref, position)
+            own = a.begin_snapshot()  # the table's schema, count, hashes and ranges
+            try:
+                return read(a, ref, own)
+            finally:
+                a.end_snapshot()
+
+        def read(a: Adapter, ref: TableRef, snap: dict[str, Any]) -> BaselineTable:
             progress(f"baselining {ref}")
             schema = a.describe(ref)
             with a.pacer.statement() as scan:  # each read of the table is charged (9.15)
@@ -345,12 +454,23 @@ def take_baseline(
                 dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
                 spans,
                 unhashed=unhashed,
+                read_at=snap.get("taken_at"),
+                snapshot="none" if snap.get("consistent") is False else snapshot,
             )
 
         n = min(workers, len(todo))
-        # a baseline is one state of the database: workers only when every connection
-        # can read the snapshot this one holds
-        if n > 1 and not (source.supports_workers and source.shares_snapshot(position)):
+        # A whole baseline is one state of the database: workers only when every
+        # connection can read the snapshot this one holds. Per table each worker opens its
+        # own, unless the database has none to open: each would be another locking reader.
+        if n > 1 and per_table and position.get("consistent") is False:
+            progress(
+                f"{source.engine} reads this database without a snapshot; "
+                "tables are baselined one at a time"
+            )
+            n = 1
+        elif n > 1 and not (
+            source.supports_workers and (per_table or source.shares_snapshot(position))
+        ):
             progress(
                 f"{source.engine} cannot share this snapshot between connections; "
                 "tables are baselined one at a time"
@@ -362,13 +482,13 @@ def take_baseline(
                 baseline.save(manifest_path)  # checkpoint per table
                 checkpoint()
         else:
-            # every worker imports the snapshot exported above: one state of the database
+            # every worker imports the snapshot exported above, or opens one per table
             free: queue.SimpleQueue[Adapter] = queue.SimpleQueue()
             free.put(source)
             forks: list[Adapter] = []
             try:
                 for _ in range(n - 1):
-                    forks.append(source.fork(position))
+                    forks.append(source.fork(None if per_table else position))
                     free.put(forks[-1])
 
                 def job(ref: TableRef) -> tuple[TableRef, BaselineTable]:
@@ -388,8 +508,20 @@ def take_baseline(
                 for a in forks:
                     a.end_snapshot()
                     a.close()
+        if todo:
+            # replication must reach the latest point a table was read at; per table, that
+            # is a position read after the last one
+            none = {"type": "none", "position": None}
+            baseline.end_position = (source.current_position() or none) if per_table else None
         baseline.selection = [r.qualified for r in refs if r.qualified in baseline.tables]
         baseline.save(manifest_path)
         return baseline
+    except Exception as exc:
+        if per_table or not _snapshot_too_old(exc):
+            raise
+        raise RunFailed(
+            f"{exc}. The {side} could not keep one snapshot for the whole baseline: set "
+            f"{side}.snapshot: per_table in the project file and finish it with --resume"
+        ) from exc
     finally:
         source.end_snapshot()

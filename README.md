@@ -89,6 +89,22 @@ the table (a baseline holds them to its end), and every later query of that tabl
 behind the `ALTER`: keep schema changes and baselines apart, or give the DDL session its
 own lock timeout.
 
+Where the source cannot hold one snapshot for a whole baseline, set `snapshot: per_table`
+on it (on `target` for `rebaseline`). Each table is then read in a snapshot of its own,
+which lasts as long as that table and holds its locks no longer: its count, hashes and
+ranges are still one state of it, but the tables are read at different points, so a row
+that refers to another table may have been read at a different point than that table.
+The baseline command, the report (a line under the verdict, and `cross_table_consistency`
+in the range block) and the run's output then say that cross table consistency was not
+held, as they do for a baseline finished after a resume and for SQL Server without
+snapshot isolation; the verdict is unchanged. Replication must have applied through a
+position read after the last table. Workers read tables at once on every engine in this
+mode, each with its own snapshot; SQL Server without snapshot isolation, with none to
+open, reads one table at a time. A whole baseline that fails because the snapshot got too
+old (Oracle ORA-01555, PostgreSQL `old_snapshot_threshold`) says to set it and finish
+with `--resume`: the tables done keep their snapshot and the rest are read per table. It
+does not help a single table too large to hold a snapshot for.
+
 The databases' own governors: on SQL Server, `QUERY_GOVERNOR_COST_LIMIT` is not set,
 because the hash queries' estimated cost grows with the table and the governor would
 refuse them outright rather than slow them; a Resource Governor workload group, with a
@@ -171,11 +187,13 @@ liftproof restore    --projects-dir /var/lib/mvt/projects   # what the service r
 A resumed run compares only the tables it had not finished and keeps the run id, the
 reference baseline and the sampling of the first attempt; its report says when it
 resumed. Against a live source, the tables compared after the resume are read as of the
-resume. The lost instance's run lock expires 15 minutes after its last renewal; until
-then a resume is refused with exit code 2. A resume on a build that hashes under another
-canonical revision (docs/canonical-v1.md) is refused with exit code 3: start a new run. A
-run that fails rather than stops names each table, file set and journey it never reached
-as not checked.
+resume. A resumed baseline reads the tables left in a new snapshot (one each with
+`snapshot: per_table`), so it says that cross table consistency was not held (Protecting
+the source), and replication must reach that later point. The lost instance's run
+lock expires 15 minutes after its last renewal; until then a resume is refused with exit
+code 2. A resume on a build that hashes under another canonical revision
+(docs/canonical-v1.md) is refused with exit code 3: start a new run. A run that fails
+rather than stops names each table, file set and journey it never reached as not checked.
 
 ## Exit codes
 

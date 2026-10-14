@@ -410,12 +410,13 @@ class Reconciler:
 
     def _replication_behind(self, tables: Sequence[TableRef]) -> bool:
         """Spec 9.2: before any difference is reported, replication must have applied
-        through the reference position. Not compared against a target baseline: there
-        the reference is the target itself."""
+        through the reference position: a baseline's is the latest point it read a table
+        at. Not compared against a target baseline: there the reference is the target
+        itself."""
         if self.against_target:
             return False
         if self.baseline is not None:
-            position = self.baseline.position
+            position = self.baseline.reference_position
         else:
             position = self.source.current_position() if self.source else None
         r = check(self.o.replication, position, source=self.source, target=self.target)

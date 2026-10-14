@@ -18,6 +18,7 @@
   .passed { color: var(--ok); } .passed_with_differences { color: var(--warn); }
   .failed { color: var(--bad); }
   .sub { color: var(--muted); }
+  .consistency { color: var(--warn); font-weight: 600; }
   .classification { display:inline-block; margin-top:10px; padding:3px 10px; border-radius:99px;
                     background:var(--panel); border:1px solid var(--line); font-size:12px; }
   .tiles { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap:12px; }
@@ -47,6 +48,7 @@
   <p class="verdict {{ r.verdict }}">{{ {"passed":"Passed","passed_with_differences":"Passed with differences","failed":"Failed"}[r.verdict] }}</p>
   <div class="sub">Run {{ r.run_id }} · {{ r.mode }} · {{ r.run.started_at }} to {{ r.run.finished_at }}</div>
   {% if r.failure %}<p class="failed"><strong>The run did not complete:</strong> {{ r.failure }}</p>{% endif %}
+  {% set cx = r.range.cross_table_consistency %}{% if cx and not cx.held %}<p class="consistency">{{ cx.summary }}</p>{% endif %}
   <div class="classification">Classification: {{ r.classification }}</div>
 
   <h2>Counts</h2>
