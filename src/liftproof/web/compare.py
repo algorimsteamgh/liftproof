@@ -9,7 +9,10 @@ values (only for bodies the project opted in to keep) value by value with number
 compared as numbers, and only the headers the project names.
 
 Every correlation is ignored at its source and masked everywhere it reappears, so the
-ids a replay legitimately creates are never reported (spec 6).
+ids a replay legitimately creates are never reported (spec 6). A correlation the replay
+did not resolve is named, with why, and so are the findings it explains: a request that
+sent its recorded value and was answered differently, a request or value that carries it
+(spec 6: which unresolved values caused a failure, so the engineer knows what to add).
 """
 
 from __future__ import annotations
@@ -26,8 +29,8 @@ from typing import Any
 
 from liftproof.findings import Comparator, Finding, Kind, Severity
 from liftproof.web import correlate
-from liftproof.web.browser import Captured, normalise_path
-from liftproof.web.journey import Exchange, Journey, shape
+from liftproof.web.browser import REDACTED, Captured, endpoints, normalise_path
+from liftproof.web.journey import Correlation, Exchange, Journey, shape
 from liftproof.web.replay import JourneyRun
 
 DEFAULT_VOLATILE = [
@@ -38,6 +41,10 @@ DEFAULT_VOLATILE = [
     (r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "<uuid>"),
     (r"@@REDACTED_[0-9a-f]+", "<secret>"),
 ]
+
+
+# a failure the page's content can cause, so one a stale value sent before it may explain
+STALE_FAILURES = ("not_found", "ambiguous", "transport")
 
 
 @dataclass
@@ -52,6 +59,30 @@ class WebOptions:
 
 def _digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(str(value).encode()).hexdigest()[:16]
+
+
+@dataclass
+class Unresolved:
+    """A correlation the replay did not carry forward: why, the steps that sent its
+    recorded value instead, and the findings it explains."""
+
+    correlation: Correlation
+    # not_in_response | empty_value | transform_failed | header_redacted |
+    # source_not_requested | unconfirmed
+    cause: str
+    source_step: int | None
+    status: int | None = None  # the target's answer to the source request
+    found: str | None = None  # what the rule found there: undecodable, or not confirmed
+    sent_in: list[int] = field(default_factory=list)
+    caused: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _carries(c: Correlation, text: str) -> bool:
+    return any(form in text for form in correlate.forms(c, c.recorded_value))
+
+
+def _steps(ns: list[int]) -> str:
+    return f"step {ns[0]}" if len(ns) == 1 else f"steps {', '.join(map(str, ns[:-1]))} and {ns[-1]}"
 
 
 def _number(v: Any) -> Decimal | None:
@@ -94,6 +125,80 @@ class Comparison:
         self.ignored_at_source = {
             (c.source, c.expression) for c in journey.correlations if c.extractor == "json_path"
         }
+        self.unresolved: dict[str, Unresolved] = {}
+        for c in journey.correlations:
+            u = self._diagnose(c)
+            if u is not None:
+                self.unresolved[c.name] = u
+        self.stale_at_failure: list[str] = []  # set by report_unresolved
+
+    def _diagnose(self, c: Correlation) -> Unresolved | None:
+        """Why a correlation was not carried forward, worked out from what the target
+        answered. None when it was; when the journey stopped before its value existed
+        (that stop is reported); and for a candidate never confirmed, unless the target
+        sent a different value and a later request the recorded one."""
+        if c.recorded_value in self.run.values:
+            return None
+        source_step = next((s.n for s in self.j.steps if c.source in endpoints(s.exchanges)), None)
+        u = Unresolved(c, "source_not_requested", source_step)
+        source = next(
+            (
+                cap
+                for s in self.run.steps
+                if s.status == "ok"
+                for cap in s.exchanges
+                if f"{cap.exchange.method} {normalise_path(cap.exchange.url)}" == c.source
+            ),
+            None,
+        )
+        if source is None:
+            # never requested: the step that made the request at recording ran, or, for a
+            # rule whose source no recorded step names, the whole journey did
+            reached = (
+                self.run.status == "completed"
+                if source_step is None
+                else any(s.n == source_step and s.status == "ok" for s in self.run.steps)
+            )
+            if not reached:
+                return None
+        else:
+            headers = source.exchange.response_headers
+            u.status = source.exchange.status
+            raw = correlate.extract(c.extractor, c.expression, json=source.json,
+                                    body=source.body, headers=headers)  # fmt: skip
+            new = correlate.apply(c.transforms, raw)
+            header = c.expression.partition(":")[0].lower()
+            if c.extractor in ("header", "header_segment") and headers.get(header) == REDACTED:
+                u.cause = "header_redacted"
+            elif raw is None:
+                u.cause = "not_in_response"
+            elif raw == "":
+                u.cause = "empty_value"
+            elif not new:
+                u.cause, u.found = "transform_failed", raw
+            elif c.confirmed or new == c.recorded_value:
+                return None
+            else:
+                u.cause, u.found = "unconfirmed", new
+        if not c.confirmed and u.cause != "unconfirmed":
+            return None
+        u.sent_in = [
+            s.n
+            for s in self.run.steps
+            if source_step is None or s.n >= source_step
+            if any(_carries(c, f"{x.exchange.url}\n{x.request_body or ''}") for x in s.exchanges)
+        ]
+        if not c.confirmed and not u.sent_in:
+            return None
+        return u
+
+    def _carrying(self, text: str) -> list[str]:
+        """The unresolved correlations whose recorded value the text carries."""
+        return [n for n, u in self.unresolved.items() if _carries(u.correlation, text)]
+
+    def _named(self, *masked: str) -> list[str]:
+        """The unresolved correlations these masked texts name."""
+        return [n for n in self.unresolved if any("{" + n + "}" in t for t in masked)]
 
     def emit(
         self,
@@ -103,10 +208,19 @@ class Comparison:
         obj: str,
         summary: str,
         step: int | None = None,
+        *,
+        blame: list[str] | None = None,
         **kw: Any,
     ) -> None:
         if kind == Kind.DIFFERENCE:
             self.differences += 1
+        if blame:
+            # the correlations left unresolved that explain it (spec 6)
+            kw["detail"] = {**kw.get("detail", {}), "unresolved_correlations": blame}
+            for name in blame:
+                self.unresolved[name].caused.append(
+                    {"step": step, "object": obj, "summary": summary}
+                )
         self.emit_finding(
             Finding(
                 comparator,
@@ -125,6 +239,94 @@ class Comparison:
         if v is None:
             return None
         return str(v) if self.o.show_values else _digest(v)
+
+    # ---------------------------------------------------- unresolved correlations
+    def report_unresolved(self) -> None:
+        """One finding for each correlation the replay left unresolved, once the steps
+        are compared: not checked when its recorded value was sent or it explains other
+        findings, a notice when the page carried the target's own value and nothing
+        differed. Sets stale_at_failure, those whose recorded value was sent at or
+        before the step the journey failed at."""
+        failed = next((s.n for s in self.run.steps if s.status == "failed"), None)
+        if self.run.failure_kind not in STALE_FAILURES:
+            failed = None
+        for name, u in self.unresolved.items():
+            c = u.correlation
+            summary = f"correlation {name} not resolved: {self._cause(u)}"
+            if u.sent_in:
+                summary += f"; {_steps(u.sent_in)} sent the recorded value"
+            if u.caused:
+                k, steps = len(u.caused), sorted({x["step"] for x in u.caused})
+                summary += f"; it explains {k} finding{'s' * (k > 1)} in {_steps(steps)}"
+            if failed is not None and u.sent_in and u.sent_in[0] <= failed:
+                self.stale_at_failure.append(name)
+                summary += f"; the journey then failed at step {failed}"
+            if not c.confirmed:
+                summary += (
+                    "; if the server generates it, confirm it (liftproof bind --confirm, "
+                    "or the journey's page)"
+                )
+            if u.caused or name in self.stale_at_failure:
+                kind, severity = Kind.NOT_CHECKED, Severity.MEDIUM
+            elif u.sent_in:
+                kind, severity = Kind.NOT_CHECKED, Severity.LOW
+            else:
+                kind, severity = Kind.NOTICE, Severity.INFO
+            # no "reason" key: a notice with one is listed as an exclusion
+            self.emit(
+                Comparator.UI,
+                kind,
+                severity,
+                self.j.journey_id,
+                summary,
+                u.source_step,
+                column=name,
+                expected=self._value(c.recorded_value),
+                actual=self._value(u.found),
+                detail={
+                    "correlation": name,
+                    "cause": u.cause,
+                    "confirmed": c.confirmed,
+                    "extractor": c.extractor,
+                    "expression": c.expression,
+                    "transforms": c.transforms,
+                    "source_endpoint": self._source(c),
+                    "source_step": u.source_step,
+                    "source_status": u.status,
+                    "sent_in": u.sent_in,
+                    "caused": u.caused,
+                },
+            )
+
+    def _source(self, c: Correlation) -> str:
+        method, _, path = c.source.partition(" ")
+        return f"{method} {normalise_path(path, self.masks)}"
+
+    def _cause(self, u: Unresolved) -> str:
+        c = u.correlation
+        rule = f"{c.extractor} {c.expression}"
+        where = f"the target's {self._source(c)} response (status {u.status})"
+        match u.cause:
+            case "not_in_response":
+                return f"{rule} found no value in {where}"
+            case "empty_value":
+                return f"{rule} found an empty value in {where}"
+            case "transform_failed":
+                chain = " then ".join(c.transforms)
+                return f"what {rule} found in {where} did not decode with {chain}"
+            case "header_redacted":
+                header = c.expression.partition(":")[0].lower()
+                return (
+                    f"the {header} header of {where} is redacted before replay reads it; "
+                    "take the value from the body instead"
+                )
+            case "source_not_requested":
+                recorded = f" (recorded in step {u.source_step})" if u.source_step else ""
+                return f"the target never made the {self._source(c)} request{recorded}"
+        return (
+            "detected at recording but not confirmed, so not applied, and "
+            f"{where} carried a different value"
+        )
 
     # ------------------------------------------------------------------- UI
     def mask(self, text: str) -> str:
@@ -157,6 +359,7 @@ class Comparison:
             f"{self.j.journey_id} step {step}",
             "page content differs after the step",
             step,
+            blame=self._named(*removed, *added),
             expected=self._value(removed[0] if removed else ""),
             actual=self._value(added[0] if added else ""),
             detail={
@@ -172,10 +375,19 @@ class Comparison:
 
     def api(self, recorded: list[Exchange], replayed: list[Captured], step: int) -> None:
         pool = list(replayed)
+        # a request not made because its URL carries a value left unresolved, and the
+        # pattern the one made in its place matches
+        unmatched: list[tuple[re.Pattern[str], list[str]]] = []
         for rec in recorded:
             key = self._endpoint(rec)
             match = next((c for c in pool if self._endpoint(c.exchange) == key), None)
             if match is None:
+                names = self._named(key)
+                if names:
+                    loose = re.escape(key)
+                    for n in names:
+                        loose = loose.replace(re.escape("{" + n + "}"), "[^/]+")
+                    unmatched.append((re.compile(loose), names))
                 self.emit(
                     Comparator.API,
                     Kind.DIFFERENCE,
@@ -183,19 +395,22 @@ class Comparison:
                     key,
                     "request made on the source was not made on the target",
                     step,
+                    blame=names,
                     detail={"recorded_status": rec.status},
                 )
                 continue
             pool.remove(match)
             self._exchange(key, rec, match, step)
         for extra in pool:
+            key = self._endpoint(extra.exchange)
             self.emit(
                 Comparator.API,
                 Kind.DIFFERENCE,
                 Severity.LOW,
-                self._endpoint(extra.exchange),
+                key,
                 "request made on the target that the source did not make",
                 step,
+                blame=self._named(key) or next((n for p, n in unmatched if p.fullmatch(key)), []),
                 detail={"status": extra.exchange.status},
             )
 
@@ -209,6 +424,7 @@ class Comparison:
                 key,
                 "status code differs",
                 step,
+                blame=self._carrying(f"{ex.url}\n{rep.request_body or ''}"),
                 expected=str(rec.status),
                 actual=str(ex.status),
                 detail={"expected": rec.status, "actual": ex.status},
@@ -347,6 +563,7 @@ class Comparison:
             key,
             f"value of {path} differs",
             step,
+            blame=self._named(self.mask(str(a)), self.mask(str(b))),
             column=path,
             expected=self._value(a),
             actual=self._value(b),
@@ -374,9 +591,9 @@ def compare_journey(
     options: WebOptions,
     emit: Callable[[Finding], None],
     assets_dir: Path | None,
-) -> int:
-    """Emit every UI and API finding for one replayed journey; returns the number of
-    differences."""
+) -> Comparison:
+    """Emit every UI and API finding for one replayed journey, and one for each
+    correlation it left unresolved; returns the comparison, which counts the differences."""
 
     def asset(ref: str) -> bytes | None:
         if assets_dir is None:
@@ -404,4 +621,5 @@ def compare_journey(
             )
         cmp.ui(step.region, sr.region, step.n)
         cmp.api(step.exchanges, sr.exchanges, step.n)
-    return cmp.differences
+    cmp.report_unresolved()
+    return cmp

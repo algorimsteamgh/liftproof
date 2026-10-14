@@ -102,7 +102,7 @@
     <tr>
       <td><span class="sev s{{ f.severity }}">{{ f.severity }}</span></td>
       <td><code>{{ f.object }}{% if f.column %}.{{ f.column }}{% endif %}</code>{% if f.locator %}<br><span class="sub">{{ f.locator }}</span>{% endif %}</td>
-      <td>{{ f.summary }}{% if f.kind != "difference" %} <span class="sub">({{ f.kind|replace("_"," ") }})</span>{% endif %}</td>
+      <td>{{ f.summary }}{% if f.kind != "difference" %} <span class="sub">({{ f.kind|replace("_"," ") }})</span>{% endif %}{% if f.detail.unresolved_correlations %}<br><span class="sub">unresolved correlations: {{ f.detail.unresolved_correlations|join(", ") }}</span>{% endif %}</td>
       <td><code>{{ f.expected if f.expected is not none else "" }}</code></td>
       <td><code>{{ f.actual if f.actual is not none else "" }}</code></td>
     </tr>
@@ -141,10 +141,12 @@
 
   {% if r.journeys %}
   <h2>Journeys</h2>
+  {% set unresolved = r.findings | selectattr("detail.correlation", "defined") | list %}
   <div class="scroll"><table>
     <tr><th>Journey</th><th>Story</th><th>Status</th><th class="num">Steps run</th><th class="num">Differences</th><th class="num">Attempts</th><th class="num">Flakes</th></tr>
     {% for j in r.journeys %}
-    <tr><td><code>{{ j.journey }}</code></td><td>{{ j.story or "" }}</td>
+    {% set names = unresolved | selectattr("journey", "equalto", j.journey) | map(attribute="detail.correlation") | list %}
+    <tr><td><code>{{ j.journey }}</code>{% if names %}<br><span class="sub">unresolved correlations: {{ names|join(", ") }}</span>{% endif %}</td><td>{{ j.story or "" }}</td>
       <td class="status-{{ j.status }}">{{ j.status|replace("_"," ") }}{% if j.browser_crashes %} (browser crashed{% if j.browser_crashes > 1 %} {{ j.browser_crashes }} times{% endif %}){% endif %}</td>
       <td class="num">{{ j.steps_run }} of {{ j.steps }}</td><td class="num">{{ j.differences }}</td>
       <td class="num">{{ j.attempts }}</td><td class="num">{{ j.flakes }}</td></tr>

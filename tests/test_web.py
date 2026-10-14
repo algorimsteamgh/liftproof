@@ -18,10 +18,10 @@ from pathlib import Path
 import pytest
 
 from liftproof.errors import ConfigError
-from liftproof.findings import Comparator, Kind
+from liftproof.findings import Comparator, Kind, Severity
 from liftproof.web.browser import BodyPolicy, launch
 from liftproof.web.compare import WebOptions
-from liftproof.web.journey import Journey, Locator, Step
+from liftproof.web.journey import Exchange, Journey, Locator, Step
 from liftproof.web.recorder import Recorder
 from liftproof.web.replay import JourneyRun, Replayer
 from liftproof.web.run import run_journeys
@@ -116,6 +116,42 @@ def test_changed_target_reports_exactly_the_changes(recorded):
     # ids the replay created and 10.50 against 10.5 are not differences
     assert not [f for f in findings if f.column in ("$.id", "$.total")]
     assert all(f.story == "ORD-14" for f in findings if f.kind == Kind.DIFFERENCE)
+
+
+@pytest.mark.parametrize("resolved", [True, False])
+def test_an_unresolved_correlation_is_named_with_what_it_broke(recorded, resolved):
+    """Spec 6: a rule that finds nothing on the target is named, and so are the findings
+    it explains: the page left with the target's id unmasked, and a later step that went
+    to the recorded order, which the target does not have."""
+    journey, assets = recorded
+    j = copy.deepcopy(journey)
+    order = next(c for c in j.correlations if c.name == "orders.id")
+    rid = order.recorded_value
+    if not resolved:
+        order.expression = "$.order_id"
+    j.steps.append(Step(7, "goto", url=f"/orders/{rid}", exchanges=[
+        Exchange("GET", f"/orders/{rid}", 200), Exchange("GET", f"/api/orders/{rid}", 200)]))
+    result, findings = replay(j, assets, "same")
+    named = [f for f in findings if "correlation" in f.detail]
+    status = [f for f in findings if f.summary == "status code differs"]
+    if resolved:
+        assert result.journeys[0].status == "passed" and not named and not status
+        return
+    [u] = named
+    assert (u.kind, u.severity, u.column, u.locator) == (
+        Kind.NOT_CHECKED, Severity.MEDIUM, "orders.id", "step 6")
+    assert (u.detail["cause"], u.detail["source_status"], u.detail["sent_in"]) == (
+        "not_in_response", 201, [7])
+    [s7] = status
+    assert (s7.object, s7.locator, s7.expected, s7.actual) == (
+        "GET /api/orders/{orders.id}", "step 7", "200", "404")
+    # every difference in the run is traced to it, and it says so
+    diffs = [f for f in findings if f.kind == Kind.DIFFERENCE]
+    assert all(f.detail.get("unresolved_correlations") == ["orders.id"] for f in diffs), [
+        (f.object, f.summary) for f in diffs if "unresolved_correlations" not in f.detail]
+    assert ("POST /api/orders", "value of $.id differs") in {(f.object, f.summary) for f in diffs}
+    assert u.summary.endswith(f"it explains {len(diffs)} findings in steps 6 and 7")
+    assert rid not in json.dumps([f.to_dict() for f in findings])
 
 
 def test_unbound_secret_means_not_run(recorded):

@@ -2,19 +2,22 @@
 that need no browser."""
 
 import gc
+import json
 import threading
 import weakref
 from types import SimpleNamespace
 
 import pytest
 
+from liftproof import support
 from liftproof.findings import Kind, Severity
+from liftproof.report.builder import build_report, render_html
 from liftproof.web import correlate, replay
 from liftproof.web import run as webrun
-from liftproof.web.browser import NetworkLog, Write, normalise_path
-from liftproof.web.compare import Comparison, WebOptions
-from liftproof.web.journey import Correlation, Journey, Step, shape
-from liftproof.web.replay import JourneyRun, Replayer
+from liftproof.web.browser import Captured, NetworkLog, Write, normalise_path
+from liftproof.web.compare import Comparison, WebOptions, compare_journey
+from liftproof.web.journey import Correlation, Exchange, Journey, Step, shape
+from liftproof.web.replay import JourneyRun, Replayer, StepRun
 from liftproof.web.run import REASON_STOPPED, WebResult, run_journeys
 from tests import fakereplay
 
@@ -374,3 +377,198 @@ def test_a_step_that_sent_a_write_repeats_only_as_a_journey_would(
         assert (run.status, tries, run.flakes) == ("failed", [1], [])
         assert run.not_repeated == (f"the step sent POST /api/cart ({status}); running it "
                                     "again would submit it a second time")
+
+
+# ------------------------------------------------- correlations left unresolved (spec 6)
+RID = "482913"
+
+
+def _order_journey(**rule):
+    """Step 1 places an order, step 2 goes to it: the order id is a correlation."""
+    c = Correlation("orders.id", "json_path", "POST /api/orders", "$.id", RID, used_in=["step 2"])
+    for k, v in rule.items():
+        setattr(c, k, v)
+    steps = [Step(1, "click", exchanges=[Exchange("POST", "/api/orders", 201)]),
+             Step(2, "goto", url=f"/orders/{RID}", region=f'- heading "Order {RID}"',
+                  exchanges=[Exchange("GET", f"/orders/{RID}", 200),
+                             Exchange("GET", f"/api/orders/{RID}", 200)])]  # fmt: skip
+    return Journey("checkout", "http://source.invalid", story="ORD-14", steps=steps,
+                   correlations=[c])  # fmt: skip
+
+
+def _captured(method, url, status, json_body=None, headers=None):
+    body = json.dumps(json_body).encode() if json_body is not None else None
+    ex = Exchange(method, url, status, response_headers=headers or {})
+    return Captured(ex, 0.0, body, json_body, None)
+
+
+def _order_run(placed, *opened, region=None, failed_at=None, failure_kind="not_found"):
+    """The target's answer to the order (None: never asked), then step 2's requests."""
+    steps = [StepRun(1, "click", "ok", exchanges=[placed] if placed else []),
+             StepRun(2, "goto", "ok", exchanges=list(opened), region=region)]  # fmt: skip
+    run = JourneyRun("checkout", status="completed", steps=steps, attempts=1)
+    if failed_at:
+        steps.append(StepRun(failed_at, "click", "failed"))
+        run.status, run.failure_kind = "failed", failure_kind
+    return run
+
+
+def _compare(journey, run, **opts):
+    out = []
+    compare_journey(journey, run, WebOptions(**opts), out.append, None)
+    return out
+
+
+def _unresolved(findings):
+    return [f for f in findings if "correlation" in f.detail]
+
+
+def test_an_unresolved_correlation_names_the_failure_it_caused():
+    j = _order_journey()
+    run = _order_run(_captured("POST", "/api/orders", 201, {"order_id": 517001}),
+                     _captured("GET", f"/orders/{RID}", 200),
+                     _captured("GET", f"/api/orders/{RID}", 404, {}))  # fmt: skip
+    findings = _compare(j, run)
+    [status] = [f for f in findings if f.summary == "status code differs"]
+    assert (status.object, status.detail["unresolved_correlations"]) == (
+        "GET /api/orders/{orders.id}", ["orders.id"])
+    [u] = _unresolved(findings)
+    assert (u.kind, u.severity, u.column, u.locator, u.journey) == (
+        Kind.NOT_CHECKED, Severity.MEDIUM, "orders.id", "step 1", "checkout")
+    assert u.summary == (
+        "correlation orders.id not resolved: json_path $.id found no value in the target's "
+        "POST /api/orders response (status 201); step 2 sent the recorded value; it explains "
+        "1 finding in step 2")
+    assert {k: u.detail[k] for k in ("cause", "source_step", "source_status", "sent_in")} == {
+        "cause": "not_in_response", "source_step": 1, "source_status": 201, "sent_in": [2]}
+    assert u.detail["caused"] == [
+        {"step": 2, "object": "GET /api/orders/{orders.id}", "summary": "status code differs"}]
+    # the value stays out of the finding unless values are shown, and out of a bundle
+    assert u.expected.startswith("sha256:") and RID not in json.dumps(u.to_dict())
+    bundled = support.redact_finding(u.to_dict())
+    assert (bundled["summary"], bundled["detail"]) == (u.summary, u.detail)
+    assert bundled["expected"] == support.REDACTED
+    [u] = _unresolved(_compare(j, run, show_values=True))
+    assert (u.expected, u.actual) == (RID, None)
+    report = build_report(run_id="r", project="p", mode="replay", started_at="t",
+                          finished_at="t", db=None, findings=findings, metadata={},
+                          range_block={})  # fmt: skip
+    assert report["verdict"] == "failed"
+    html = render_html(report)
+    assert ("status code differs<br><span class=\"sub\">unresolved correlations: orders.id"
+            in html)  # fmt: skip
+
+
+@pytest.mark.parametrize(("rule", "placed", "cause", "says"), [
+    ({}, {"id": ""}, "empty_value", "json_path $.id found an empty value in the target's"),
+    ({"transforms": ["base64_decode"]}, {"id": "not-encoded"}, "transform_failed",
+     "what json_path $.id found in the target's POST /api/orders response (status 201) did "
+     "not decode with base64_decode"),
+    ({"extractor": "header", "expression": "X-CSRF-Token"}, {}, "header_redacted",
+     "the x-csrf-token header of the target's POST /api/orders response (status 201) is "
+     "redacted before replay reads it"),
+    ({}, None, "source_not_requested",
+     "the target never made the POST /api/orders request (recorded in step 1)"),
+])  # fmt: skip
+def test_why_a_correlation_was_not_resolved(rule, placed, cause, says):
+    j = _order_journey(**rule)
+    headers = {"x-csrf-token": "@@REDACTED"}
+    placed = None if placed is None else _captured("POST", "/api/orders", 201, placed, headers)
+    run = _order_run(placed,
+                     _captured("GET", f"/orders/{RID}", 200),
+                     _captured("GET", f"/api/orders/{RID}", 200, {}))  # fmt: skip
+    if rule.get("extractor") == "header":
+        Replayer._correlate(None, j, run.steps[0], run)  # a redacted header carries nothing
+        assert run.values == {}
+    [u] = _unresolved(_compare(j, run, show_values=True))
+    assert u.detail["cause"] == cause and says in u.summary
+    # nothing failed for it: the recorded value was sent and answered as at recording
+    assert (u.kind, u.severity, u.detail["sent_in"]) == (Kind.NOT_CHECKED, Severity.LOW, [2])
+    assert u.actual == ("not-encoded" if cause == "transform_failed" else None)
+
+
+def test_a_journey_stopped_before_the_value_existed_reports_nothing():
+    j = _order_journey()
+    run = JourneyRun("checkout", status="failed", failure_kind="transport", attempts=2,
+                     steps=[StepRun(1, "click", "failed")])  # fmt: skip
+    assert _unresolved(_compare(j, run)) == []
+    run = _order_run(_captured("POST", "/api/orders", 201, {"id": 517001}))
+    run.values[RID] = "517001"  # resolved
+    assert _unresolved(_compare(j, run)) == []
+
+
+def test_the_page_carried_the_targets_own_value():
+    """Unresolved, but the page used the id the target sent: nothing sent the recorded
+    value, and the differences it leaves unmasked are traced to it."""
+    j = _order_journey(expression="$.order_id")
+    run = _order_run(_captured("POST", "/api/orders", 201, {"id": 517001}),
+                     _captured("GET", "/orders/517001", 200),
+                     _captured("GET", "/api/orders/517001", 200, {}),
+                     region='- heading "Order 517001"')  # fmt: skip
+    findings = _compare(j, run)
+    named = {(f.object, f.summary) for f in findings
+             if f.detail.get("unresolved_correlations") == ["orders.id"]}  # fmt: skip
+    assert named == {
+        ("GET /orders/{orders.id}", "request made on the source was not made on the target"),
+        ("GET /api/orders/{orders.id}", "request made on the source was not made on the target"),
+        ("GET /orders/{id}", "request made on the target that the source did not make"),
+        ("GET /api/orders/{id}", "request made on the target that the source did not make"),
+        ("checkout step 2", "page content differs after the step"),
+    }
+    [u] = _unresolved(findings)
+    assert (u.kind, u.severity, u.detail["sent_in"]) == (Kind.NOT_CHECKED, Severity.MEDIUM, [])
+    assert u.summary.endswith("; it explains 5 findings in step 2")
+    # with nothing traced to it, a notice that still names it
+    j.steps[1] = Step(2, "goto", url="/orders", exchanges=[Exchange("GET", "/orders", 200)])
+    run.steps[1] = StepRun(2, "goto", "ok", exchanges=[_captured("GET", "/orders", 200)])
+    findings = _compare(j, run)
+    [u] = _unresolved(findings)
+    assert (u.kind, u.severity) == (Kind.NOTICE, Severity.INFO)
+    web = WebResult(journeys=[webrun.JourneyResult("checkout", "ORD-14", "passed", 2, 2, 1, 0,
+                                                   0, 1.0, 1.0)])  # fmt: skip
+    report = build_report(run_id="r", project="p", mode="replay", started_at="t",
+                          finished_at="t", db=None, findings=findings, metadata={},
+                          range_block={}, web=web)  # fmt: skip
+    assert report["coverage"]["exclusions"] == [] and report["verdict"] == "passed"
+    assert "unresolved correlations: orders.id</span>" in render_html(report)
+
+
+def test_a_candidate_never_confirmed_only_when_the_target_changed_it_and_it_was_sent():
+    j = _order_journey(recorded_value="4821", confirmed=False)
+    j.steps[1] = Step(2, "goto", url="/orders/4821",
+                      exchanges=[Exchange("GET", "/api/orders/4821", 200)])  # fmt: skip
+
+    def replayed(target_id, sent_id, status):
+        run = _order_run(_captured("POST", "/api/orders", 201, {"id": target_id}),
+                         _captured("GET", f"/api/orders/{sent_id}", status, {}))  # fmt: skip
+        return _unresolved(_compare(j, run, show_values=True))
+
+    assert replayed(4821, 4821, 200) == []  # the same value on the target: data, not an id
+    assert replayed(5173, 5173, 200) == []  # the page carried the target's own
+    [u] = replayed(5173, 4821, 404)
+    assert (u.kind, u.severity, u.detail["cause"], u.actual) == (
+        Kind.NOT_CHECKED, Severity.MEDIUM, "unconfirmed", "5173")
+    assert "carried a different value" in u.summary and "confirm it" in u.summary
+
+
+def test_the_failure_after_a_stale_value_names_it(monkeypatch):
+    j = _order_journey()
+    j.steps.append(Step(3, "click", locator=None))
+    run = _order_run(_captured("POST", "/api/orders", 201, {}),
+                     _captured("GET", f"/api/orders/{RID}", 404, {}), failed_at=3)  # fmt: skip
+    fakereplay.no_browser(monkeypatch, lambda journey: run)
+    findings = []
+    [r] = _replay([j], findings.append).journeys
+    [failure] = [f for f in findings if f.summary.startswith("element the journey uses")]
+    assert failure.detail["unresolved_correlations"] == ["orders.id"]
+    [u] = _unresolved(findings)
+    assert u.summary.endswith("; the journey then failed at step 3")
+    assert r.status == "different"
+    # a crash is not the page's doing
+    run.failure_kind = "browser_crash"
+    findings = []
+    _replay([j], findings.append)
+    [u] = _unresolved(findings)
+    assert "failed" not in u.summary
+    assert not [f for f in findings if "unresolved_correlations" in f.detail
+                and f.kind == Kind.ERROR]  # fmt: skip

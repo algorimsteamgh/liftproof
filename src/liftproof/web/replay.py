@@ -30,6 +30,7 @@ from urllib.parse import urljoin
 from liftproof.web import correlate
 from liftproof.web.browser import (
     POLL_S,
+    REDACTED,
     Captured,
     NetworkLog,
     Write,
@@ -523,7 +524,7 @@ class Replayer:
                     headers=cap.exchange.response_headers,
                 )
                 new = correlate.apply(c.transforms, new)
-                if new:
+                if new and new != REDACTED:  # a rule on a redacted header finds nothing
                     for recorded_form, encoding in correlate.forms(c, c.recorded_value).items():
                         if encoding != "source":  # what the server sent is not reused
                             run.values[recorded_form] = (

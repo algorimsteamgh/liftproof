@@ -29,6 +29,7 @@ REDACTED_HEADERS = {
     "x-csrf-token",
     "x-xsrf-token",
 }
+REDACTED = "@@REDACTED"  # what a redacted header reads, at recording and at replay
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 ID_SEGMENT = re.compile(
@@ -74,7 +75,7 @@ def normalise_path(path: str, values: dict[str, str] | None = None) -> str:
 
 def redact_headers(headers: dict[str, str]) -> dict[str, str]:
     return {
-        k.lower(): ("@@REDACTED" if k.lower() in REDACTED_HEADERS else v)
+        k.lower(): (REDACTED if k.lower() in REDACTED_HEADERS else v)
         for k, v in sorted(headers.items())
     }
 

@@ -224,9 +224,14 @@ def _journey_done(
                     detail={"flakes": n},
                 )
             )
-    differences = compare_journey(j, run, options, emit, assets)
+    comparison = compare_journey(j, run, options, emit, assets)
+    differences = comparison.differences
     if run.status != "completed":
-        emit(_failure_finding(j, run))
+        failure = _failure_finding(j, run)
+        if comparison.stale_at_failure:
+            # a correlation left unresolved sent its recorded value before the step failed
+            failure.detail["unresolved_correlations"] = comparison.stale_at_failure
+        emit(failure)
         differences += run.failure_kind == "not_found"
     for step, sr in zip(j.steps, run.steps, strict=False):
         for e in step.exchanges:
