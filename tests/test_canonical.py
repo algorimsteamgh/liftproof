@@ -117,6 +117,10 @@ def test_binary_uuid_json():
 XSI = 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
 
 
+def _typed_items(*uris: str) -> str:
+    return f"<r {XSI}>" + "".join(f'<i xmlns:q1="{u}" xsi:type="q1:T"/>' for u in uris) + "</r>"
+
+
 @pytest.mark.parametrize(
     "a, b",
     [
@@ -124,6 +128,9 @@ XSI = 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
         ("<a b='2' a=\"1\"/>", '<a a="1" b="2"></a>'),
         ("<a><x/><y /></a>", "<a><x></x><y></y></a>"),
         ('<p:a xmlns:q="v" xmlns:p="u"><p:b xmlns:p="u"/></p:a>', '<p:a xmlns:p="u"><p:b/></p:a>'),
+        # a declaration is in scope to the end of its element, not for its later siblings
+        ('<r xmlns:p="u"><a xmlns:q="u"/><p:b/></r>', '<r xmlns:p="u"><a/><p:b/></r>'),
+        ('<r><a xmlns:q="u"/><p:b xmlns:p="u"/></r>', '<r><a/><p:b xmlns:p="u"/></r>'),
         ("<a><![CDATA[<x & y>]]></a>", "<a>&lt;x &amp; y&gt;</a>"),
         ("<a>&#x41;&#66;</a>", "<a>AB</a>"),
         ("<a><!-- generated --><b/></a>", "<a><b/></a>"),
@@ -155,6 +162,8 @@ def test_equivalent_xml_renders_alike(a, b):
             f'<a {XSI} xmlns:t="urn:one" xsi:type="t:T"/>',
             f'<a {XSI} xmlns:t="urn:two" xsi:type="t:T"/>',
         ),
+        # each item binds its own q1, as .NET's XmlSerializer writes it
+        (_typed_items("urn:car", "urn:boat"), _typed_items("urn:car", "urn:jet")),
     ],
 )
 def test_xml_differences_survive(a, b):
@@ -180,6 +189,7 @@ def test_xml_fragments_and_empty_values():
         ("<a>&nbsp;</a>", "undefined entity"),
         ("<x:a>secret-value</x:a>", "unbound prefix"),
         (f'<a {XSI} xsi:type="zz:secret_value"/>', "an xsi:type value names an undeclared"),
+        (f'<r {XSI}><a xmlns:zz="u"/><b xsi:type="zz:secret_value"/></r>', "an undeclared"),
         (b"\xffsecret-value", r"XML is not UTF-8 \(byte 0\)"),
     ],
 )

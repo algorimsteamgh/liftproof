@@ -12,6 +12,7 @@ import re
 import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -79,13 +80,38 @@ def _nfc(text: str) -> str:
     return unicodedata.normalize("NFC", text)
 
 
+class _C14NWriter(ET.C14NWriterTarget):
+    """ElementTree's C14N 2.0 writer, with an element's namespace declarations going out of
+    scope at its end tag. The writer keeps them in its parent's scope (to Python 3.13 at
+    least), where a later sibling would resolve an xsi:type prefix or pick a prefix by them."""
+
+    def __init__(self, write: Callable[[str], object]) -> None:
+        super().__init__(write, qname_aware_attrs={XSI_TYPE})
+        self._declared = 0
+        self._scopes: list[int] = []
+
+    def start_ns(self, prefix: str, uri: str) -> None:
+        super().start_ns(prefix, uri)
+        self._declared += 1
+
+    def start(self, tag: str, attrs: dict[str, str]) -> None:
+        super().start(tag, attrs)
+        self._scopes.append(self._declared)
+        self._declared = 0
+
+    def end(self, tag: str) -> None:
+        super().end(tag)
+        if declared := self._scopes.pop():
+            del self._ns_stack[-1][-declared:]
+
+
 class _C14NFilter:
     """Parser target in front of ElementTree's C14N 2.0 writer: drops comments and text
     that is only XML whitespace (outside xml:space="preserve"), and normalises each text
     run, attribute value and processing instruction to NFC on its own (NFC over written
     markup would fold a '>' and a following U+0338 into one character)."""
 
-    def __init__(self, out: ET.C14NWriterTarget, document: bool) -> None:
+    def __init__(self, out: _C14NWriter, document: bool) -> None:
         self._out = out
         self._text: list[str] = []
         self._preserve = [False]
@@ -129,7 +155,7 @@ class _C14NFilter:
 
 def _c14n(text: str, document: bool) -> str:
     out: list[str] = []
-    writer = ET.C14NWriterTarget(out.append, qname_aware_attrs={XSI_TYPE})
+    writer = _C14NWriter(out.append)
     # expat never fetches an external entity or DTD for ElementTree, and from 2.4.1 refuses
     # entity expansion out of proportion to its input (a test pins the version)
     parser = ET.XMLParser(target=_C14NFilter(writer, document))  # noqa: S314

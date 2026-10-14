@@ -77,15 +77,16 @@ document written by two engines, or by a migration tool, hashes alike:
    quoted and sorted by `{namespace URI}local name`, those in no namespace first;
    character and entity references expanded and CDATA written as escaped text; line ends
    as `\n`; each namespace declared on the first element whose name or attributes use it,
-   with the prefix already written for that URI, or else the innermost prefix the value
-   bound to it. Unused declarations are dropped.
+   with the prefix already written for that URI on it or an ancestor, or else the
+   innermost prefix the value bound to it there (a declaration is in scope to the end of
+   its element, never for a sibling). Unused declarations are dropped.
 4. Comments are dropped. Text that is only XML whitespace (space, tab, CR, LF) is dropped,
    except inside `xml:space="preserve"` (until a descendant sets `default`); any other
    text is kept exactly, leading and trailing whitespace included.
 5. Each text run, attribute value and processing instruction's data is normalised to NFC
    on its own.
 6. An `xsi:type` value of the form `prefix:name` (word characters only) is a qualified
-   name: its prefix is resolved and declared as in 3. A prefix declared nowhere is
+   name: its prefix is resolved and declared as in 3. A prefix not in scope there is
    resolved only when it is one of ElementTree's well known prefixes (`xs`, `xsi`, `xml`,
    `html`, `rdf`, `wsdl`, `dc`).
 
