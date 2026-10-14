@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import shutil
 from collections import Counter
 
@@ -24,6 +25,7 @@ from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_RUN_FAILED
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, read_findings
 from liftproof.reconcile import baseline as baseline_mod
 from liftproof.reconcile.engine import REASON_STOPPED, Reconciler
+from liftproof.report.builder import who_ran_it
 from liftproof.store import S3Store
 from liftproof.web import run as webrun
 from liftproof.web.run import JourneyResult, WebResult
@@ -352,9 +354,12 @@ def test_a_lost_replay_reports_what_it_finished_on_a_replacement(tmp_path, web_p
     _journeys_on(first, "j1", "j2", "j3", "j4")
     _checkpoint_times(monkeypatch, True, True)  # after j1 and after j2
     _stop_replay_at(monkeypatch, "j3", InstanceLost())
+    monkeypatch.setenv("LIFTPROOF_INVOKED_BY", "ui:Hema")
     with pytest.raises(InstanceLost):
-        _main("replay", "--project", str(web_project), "--workdir", str(first), "--run-id", "r1")
+        _main("replay", "--project", str(web_project), "--workdir", str(first), "--run-id", "r1",
+              "--show-values", "--scheduled", "nightly")  # fmt: skip
     shutil.rmtree(first)
+    monkeypatch.delenv("LIFTPROOF_INVOKED_BY")
 
     saved = json.loads(s3.get_object(Bucket=BUCKET, Key="acme/runs/r1/web-results.json")["Body"]
                        .read())  # fmt: skip
@@ -377,6 +382,11 @@ def test_a_lost_replay_reports_what_it_finished_on_a_replacement(tmp_path, web_p
     started = json.loads((second / "acme/runs/r1" / ckpt.RUN_INFO).read_text())["started_at"]
     assert report["run"]["started_at"] == started
     assert report["run"]["finished_at"] >= started
+    # as it ran: page text was shown, and the schedule started it, not the rebuild
+    assert report["classification"] == "contains row values" and report["run"]["values_shown"]
+    assert report["run"]["invoked_by"].startswith("ui:Hema@")
+    assert report["run"]["schedule"] == "nightly"
+    assert report["run"]["regenerated"]["by"] == who_ran_it()
     assert report["coverage"]["journeys_coverage_pct"] == 50
     assert [j["status"] for j in report["journeys"]] == ["different"] * 2 + ["not_run"] * 2
     assert report["coverage"]["not_covered"] == [
@@ -384,6 +394,67 @@ def test_a_lost_replay_reports_what_it_finished_on_a_replacement(tmp_path, web_p
         {"object": "journey j4", "reason": webrun.REASON_STOPPED}]
     assert {f["journey"] for f in report["findings"] if f["kind"] == "difference"} == {"j1", "j2"}
     assert "acme/runs/r1/report.json" in _keys(s3, "acme/runs/r1/")
+
+
+def test_a_report_waits_for_its_run_to_end(tmp_path, web_project, monkeypatch, capsys, s3):
+    here, there = tmp_path / "here", tmp_path / "there"
+    _journeys_on(here, "j1", "j2", "j3", "j4")
+    report = ["report", "--project", str(web_project), "--workdir", str(there), "--run", "r1"]
+    asked: list[tuple[int, bool]] = []  # its exit code, and whether a report was stored
+
+    def replay_one(j):
+        if j.journey_id == "j3":  # another instance asks for the report while the run goes
+            code = _main(*report)
+            asked.append((code, "acme/runs/r1/report.json" in _keys(s3, "acme/runs/r1/")))
+        return fakereplay.replayed(j)
+
+    fakereplay.no_browser(monkeypatch, replay_one)
+    assert _main("replay", "--project", str(web_project), "--workdir", str(here),
+                 "--run-id", "r1") == EXIT_DIFFERENCES  # fmt: skip
+    assert asked == [(EXIT_RUN_FAILED, False)]
+    assert "run r1 is in progress" in capsys.readouterr().err
+    assert not (there / "acme/runs/r1").exists()
+
+    # once it has ended, the other instance regenerates the run's own report
+    assert _main(*report) == EXIT_DIFFERENCES
+    stored = json.loads(s3.get_object(Bucket=BUCKET, Key="acme/runs/r1/report.json")["Body"]
+                        .read())  # fmt: skip
+    assert stored["failure"] is None and "regenerated" in stored["run"]
+    assert [j["status"] for j in stored["journeys"]] == ["different"] * 4
+
+
+def test_a_report_follows_a_run_resumed_elsewhere(tmp_path, project, monkeypatch, s3):
+    first, second, third = tmp_path / "first", tmp_path / "second", tmp_path / "third"
+    original = Reconciler._table
+    _checkpoint_times(monkeypatch, True, True, False)
+    _lose_instance_at(monkeypatch, "t3", [])
+    with pytest.raises(InstanceLost):
+        _main("reconcile", "--project", str(project), "--workdir", str(first), "--run-id", "r1")
+    shutil.rmtree(first)
+    argv = ["--project", str(project), "--workdir", str(second)]
+    assert _main("report", *argv, "--run", "r1") == EXIT_RUN_FAILED  # what the run left
+    listed = tmp_path / "listing" / "acme" / "runs"  # an instance listing the run history
+    store = cli._store(cli.load_project(project), second)
+    cli.sync_reports(store, listed)
+    an_hour_ago = dt.datetime.now(dt.UTC).timestamp() - 3600
+    for f in [*(second / "acme/runs/r1").iterdir(), listed / "r1/report.json"]:
+        os.utime(f, (an_hour_ago, an_hour_ago))
+
+    # resumed elsewhere: the copies those two instances hold are now older than the store's
+    monkeypatch.setattr(Reconciler, "_table", original)
+    assert _main("reconcile", "--project", str(project), "--workdir", str(third),
+                 "--resume") == EXIT_DIFFERENCES  # fmt: skip
+    cli.sync_reports(store, listed)
+    assert json.loads((listed / "r1/report.json").read_text())["failure"] is None
+    assert _main("report", *argv, "--run", "r1") == EXIT_DIFFERENCES
+    report = json.loads((second / "acme/runs/r1/report.json").read_text())
+    assert report["failure"] is None
+    assert [t["status"] for t in report["tables"]] == ["different"] * 4
+    ids = [f["finding_id"] for f in report["findings"]]
+    assert len(ids) == len(set(ids))  # the segment the resume voided is read empty
+    stored = json.loads(s3.get_object(Bucket=BUCKET, Key="acme/runs/r1/report.json")["Body"]
+                        .read())  # fmt: skip
+    assert stored["failure"] is None
 
 
 @pytest.mark.usefixtures("s3")

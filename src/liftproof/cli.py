@@ -688,9 +688,20 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     )  # fmt: skip
     if progress is not None:
         _void_later_segments(store, run_dir, run_id, progress.segments)
+    values_shown = bool(
+        getattr(args, "show_values", False)
+        or project.database.show_values
+        or (files and any(c.show_content for c in project.files))
+    )
     # what the run is, for a report rebuilt after it stopped, on any instance
+    run_info = {"mode": mode, "started_at": started, "invoked_by": who_ran_it(),
+                "values_shown": values_shown}  # fmt: skip
+    if getattr(args, "scheduled", None):
+        run_info["schedule"] = args.scheduled
+    if progress is not None:
+        run_info["resumed_at"] = progress.resumed_at
     info = run_dir / ckpt.RUN_INFO
-    info.write_text(json.dumps({"mode": mode, "started_at": started}), encoding="utf-8")
+    info.write_text(json.dumps(run_info), encoding="utf-8")
     ckpt.keep(store, f"runs/{run_id}/{ckpt.RUN_INFO}", info)
     checkpoint = None
     if mode == "reconcile":
@@ -780,11 +791,8 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
         scheduled=getattr(args, "scheduled", None),
         not_reached=not_reached,
         resumed_at=progress.resumed_at if progress is not None else None,
-        values_shown=bool(
-            getattr(args, "show_values", False)
-            or project.database.show_values
-            or (files and any(c.show_content for c in project.files))
-        ),
+        invoked_by=run_info["invoked_by"],
+        values_shown=values_shown,
     )
     for f in sorted(run_dir.iterdir()):
         if f.name not in uploads.done:  # segments went up as they closed
@@ -1043,13 +1051,16 @@ def _report(
     scheduled=None,
     not_reached=None,
     resumed_at=None,
+    invoked_by=None,
     values_shown=None,
     finished_at=None,
     prior=None,
+    regenerated=False,
 ) -> dict[str, Any]:
     """`prior` is the run's own report when one is regenerated: what the run was (its
     reference, window, schedule, who ran it, versions) is taken from it as recorded,
-    never restated from today's project file."""
+    never restated from today's project file. A run that wrote no report is
+    `regenerated` from what it recorded as it started."""
     findings = list(read_findings(run_dir))
     o = project.database
     finished_at = finished_at or _now()
@@ -1058,9 +1069,11 @@ def _report(
                                web_result, files_result, failure, template, prior)  # fmt: skip
     range_block: dict[str, Any] = {"run_window": f"{started} to {finished_at}"}
     metadata: dict[str, Any] = {
-        "invoked_by": who_ran_it(),
+        "invoked_by": invoked_by or who_ran_it(),
         "values_shown": bool(o.show_values if values_shown is None else values_shown),
     }
+    if regenerated:
+        metadata["regenerated"] = _regenerated()
     if scheduled:
         metadata["schedule"] = scheduled
     if resumed_at:
@@ -1140,7 +1153,7 @@ def _rewrite_report(project, run_id, mode, run_dir, findings, result, started, w
     run = dict(prior.get("run", {}))
     finished = run.pop("finished_at", None) or _now()
     run.pop("started_at", None)
-    run["regenerated"] = {"at": _now(), "by": who_ran_it(), "product_version": __version__}
+    run["regenerated"] = _regenerated()
     not_reached = [
         c for c in prior.get("coverage", {}).get("not_covered", [])
         if c.get("reason") == STOPPED
@@ -1163,6 +1176,10 @@ def _rewrite_report(project, run_id, mode, run_dir, findings, result, started, w
     )
     write_reports(report, run_dir, Path(template) if template else None)
     return report
+
+
+def _regenerated() -> dict[str, str]:
+    return {"at": _now(), "by": who_ran_it(), "product_version": __version__}
 
 
 def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
@@ -1225,13 +1242,11 @@ def cmd_runs(args: argparse.Namespace) -> int:
 
 def sync_reports(store: Store, runs_dir: Path) -> None:
     """Copy the reports of runs this instance does not hold (another instance's, or a
-    replaced one's) from the store."""
-    for key in store.list_keys("runs/"):
+    replaced one's), or holds an older copy of, from the store."""
+    for key, written in store.modified("runs/").items():
         parts = key.split("/")
         if len(parts) == 3 and parts[2] == "report.json":
-            local = runs_dir / parts[1] / "report.json"
-            if not local.exists():
-                store.get_file(key, local)
+            _copy_if_newer(store, key, runs_dir / parts[1] / "report.json", written)
 
 
 def run_history(runs_dir: Path) -> list[dict[str, Any]]:
@@ -1330,6 +1345,13 @@ def cmd_report(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir) / project.name
     run_dir = workdir / "runs" / args.run
     store = _store(project, Path(args.workdir))
+    holder = store.run_lock(args.run, "report").holder()
+    if holder and holder.get("run_id") == args.run:
+        raise RunFailed(
+            f"run {args.run} is in progress on {holder.get('host', '?')} since "
+            f"{holder.get('acquired_at', '?')} and writes its report as it ends; a run whose "
+            f"instance was lost is reported once its lock expires ({holder.get('expires_at')})"
+        )
     _fetch_run(store, run_dir, args.run)
     if not run_dir.exists():
         raise ConfigError(f"run {args.run} not found under {workdir / 'runs'} or in the store")
@@ -1374,6 +1396,12 @@ def cmd_report(args: argparse.Namespace) -> int:
         ),
         failure=prior.get("failure") if prior else UNFINISHED,
         template=args.template,
+        # what a run that wrote no report recorded as it started
+        scheduled=info.get("schedule"),
+        resumed_at=info.get("resumed_at"),
+        invoked_by=info.get("invoked_by"),
+        values_shown=info.get("values_shown"),
+        regenerated=not prior,
     )
     for name in ("report.html", "report.json"):
         store.put_file(f"runs/{args.run}/{name}", run_dir / name)
@@ -1381,12 +1409,19 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def _fetch_run(store: Store, run_dir: Path, run_id: str) -> None:
-    """The run's files this instance does not hold, from the store: the run may have
-    stopped on an instance that is gone."""
-    for key in store.list_keys(f"runs/{run_id}/"):
+    """The run's files this instance does not hold, or holds an older copy of, from the
+    store: the run may have stopped, or been resumed, on another instance."""
+    for key, written in store.modified(f"runs/{run_id}/").items():
         parts = key.split("/")
-        if len(parts) == 3 and not (run_dir / parts[2]).exists():
-            store.get_file(key, run_dir / parts[2])
+        if len(parts) == 3:
+            _copy_if_newer(store, key, run_dir / parts[2], written)
+
+
+def _copy_if_newer(store: Store, key: str, local: Path, written: float) -> None:
+    """A copy from the store takes the object's time, so it is copied again only once
+    the object has been written since."""
+    if not local.exists() or local.stat().st_mtime < written:
+        store.get_file(key, local)
 
 
 def _last_activity(run_dir: Path) -> str:

@@ -109,7 +109,10 @@ table, file set and journey it never reached as not checked.
 A replay is never resumed, as its journeys created data on the target. The journeys it
 finished keep their findings and results; those it had not finished are listed as not
 run. `liftproof report --run ID` builds the report of a run that stopped, on any instance,
-from what reached the bucket, and that report reads as failed.
+from what reached the bucket, and that report reads as failed; it keeps who started the
+run, its schedule and whether it showed row values, and adds when it was rebuilt. A run
+still going is not reported (exit code 2): it writes its own report as it ends, and a lost
+run can be reported once its lock expires.
 
 ## Exit codes
 
@@ -137,9 +140,9 @@ and the earliest and latest value of each date and time column of the rows compa
 (`data_ranges`). Those are aggregates of integer keys and dates only; a text key's ends
 appear only with `show_values`. `database.ranges: false` turns them off, saving one
 MIN/MAX statement per table and side. `liftproof report --run ID` rebuilds the HTML and
-JSON from the run's findings (copying from the bucket what this instance does not hold)
-and keeps what the run was (its reference, window, schedule and who ran it), adding when
-it was regenerated.
+JSON from the run's findings (copying from the bucket what this instance does not hold,
+or holds an older copy of) and keeps what the run was (its reference, window, schedule
+and who ran it), adding when it was regenerated.
 
 ## Tests
 
