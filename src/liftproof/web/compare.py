@@ -70,15 +70,54 @@ class Unresolved:
     # not_in_response | empty_value | transform_failed | header_redacted |
     # source_not_requested | unconfirmed
     cause: str
-    source_step: int | None
+    source_step: int | None  # the step whose answer to the source request was read
+    since: int | None = None  # the first step to make the source request at recording
     status: int | None = None  # the target's answer to the source request
     found: str | None = None  # what the rule found there: undecodable, or not confirmed
     sent_in: list[int] = field(default_factory=list)
     caused: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _alone(value: str, written: str | None = None) -> re.Pattern[str]:
+    """written (value itself by default) where it does not continue a run of digits or of
+    letters that value starts or ends: 120 is not in 1760001203, but 4821 is in %3A4821."""
+
+    def run(ch: str) -> str:
+        if not ch.isascii():
+            return ""
+        return "0-9" if ch.isdigit() else "A-Za-z" if ch.isalpha() else ""
+
+    before, after = run(value[:1]), run(value[-1:])
+    return re.compile(
+        (f"(?<![{before}])" if before else "")
+        + re.escape(value if written is None else written)
+        + (f"(?![{after}])" if after else "")
+    )
+
+
 def _carries(c: Correlation, text: str) -> bool:
-    return any(form in text for form in correlate.forms(c, c.recorded_value))
+    return any(_alone(form).search(text) for form in correlate.forms(c, c.recorded_value))
+
+
+# what a rule found in one response, best first: replay takes the first value found
+READS = ("found", "transform_failed", "empty_value", "header_redacted", "not_in_response")
+
+
+def _read(c: Correlation, cap: Captured) -> tuple[str, str | None]:
+    """What the rule finds in one response, as replay reads it: (found, the value), or
+    why it finds none, with what it found when that did not decode."""
+    headers = cap.exchange.response_headers
+    raw = correlate.extract(c.extractor, c.expression, json=cap.json, body=cap.body,
+                            headers=headers)  # fmt: skip
+    header = c.expression.partition(":")[0].lower()
+    if c.extractor in ("header", "header_segment") and headers.get(header) == REDACTED:
+        return "header_redacted", None
+    if raw is None:
+        return "not_in_response", None
+    if raw == "":
+        return "empty_value", None
+    new = correlate.apply(c.transforms, raw)
+    return ("found", new) if new else ("transform_failed", raw)
 
 
 def _steps(ns: list[int]) -> str:
@@ -134,71 +173,71 @@ class Comparison:
 
     def _diagnose(self, c: Correlation) -> Unresolved | None:
         """Why a correlation was not carried forward, worked out from what the target
-        answered. None when it was; when the journey stopped before its value existed
-        (that stop is reported); and for a candidate never confirmed, unless the target
-        sent a different value and a later request the recorded one."""
+        answered: every response to the rule's request, read as replay reads them, and
+        the one replay would take the value from or the one that came closest. None when
+        it was carried; when the journey stopped before its value existed (that stop is
+        reported); and for a candidate never confirmed, unless the target sent a
+        different value and a request where recording saw it reused the recorded one."""
         if c.recorded_value in self.run.values:
             return None
-        source_step = next((s.n for s in self.j.steps if c.source in endpoints(s.exchanges)), None)
-        u = Unresolved(c, "source_not_requested", source_step)
-        source = next(
-            (
-                cap
-                for s in self.run.steps
-                if s.status == "ok"
-                for cap in s.exchanges
-                if f"{cap.exchange.method} {normalise_path(cap.exchange.url)}" == c.source
-            ),
-            None,
-        )
-        if source is None:
+        recorded = next((s.n for s in self.j.steps if c.source in endpoints(s.exchanges)), None)
+        u = Unresolved(c, "source_not_requested", recorded, since=recorded)
+        reads = [
+            (_read(c, cap), s.n, cap.exchange.status)
+            for s in self.run.steps
+            if s.status == "ok"
+            for cap in s.exchanges
+            if f"{cap.exchange.method} {normalise_path(cap.exchange.url)}" == c.source
+        ]
+        if reads:
+            (cause, value), u.source_step, u.status = min(reads, key=lambda r: READS.index(r[0][0]))
+            if cause != "found":
+                u.cause, u.found = cause, value
+            elif c.confirmed or value == c.recorded_value:
+                return None
+            else:
+                u.cause, u.found = "unconfirmed", value
+        else:
             # never requested: the step that made the request at recording ran, or, for a
             # rule whose source no recorded step names, the whole journey did
             reached = (
                 self.run.status == "completed"
-                if source_step is None
-                else any(s.n == source_step and s.status == "ok" for s in self.run.steps)
+                if recorded is None
+                else any(s.n == recorded and s.status == "ok" for s in self.run.steps)
             )
             if not reached:
                 return None
-        else:
-            headers = source.exchange.response_headers
-            u.status = source.exchange.status
-            raw = correlate.extract(c.extractor, c.expression, json=source.json,
-                                    body=source.body, headers=headers)  # fmt: skip
-            new = correlate.apply(c.transforms, raw)
-            header = c.expression.partition(":")[0].lower()
-            if c.extractor in ("header", "header_segment") and headers.get(header) == REDACTED:
-                u.cause = "header_redacted"
-            elif raw is None:
-                u.cause = "not_in_response"
-            elif raw == "":
-                u.cause = "empty_value"
-            elif not new:
-                u.cause, u.found = "transform_failed", raw
-            elif c.confirmed or new == c.recorded_value:
-                return None
-            else:
-                u.cause, u.found = "unconfirmed", new
         if not c.confirmed and u.cause != "unconfirmed":
             return None
-        u.sent_in = [
-            s.n
-            for s in self.run.steps
-            if source_step is None or s.n >= source_step
-            if any(_carries(c, f"{x.exchange.url}\n{x.request_body or ''}") for x in s.exchanges)
-        ]
+        u.sent_in = [s.n for s in self.run.steps if any(self._sent(u, s.n, x) for x in s.exchanges)]
         if not c.confirmed and not u.sent_in:
             return None
         return u
 
-    def _carrying(self, text: str) -> list[str]:
-        """The unresolved correlations whose recorded value the text carries."""
-        return [n for n, u in self.unresolved.items() if _carries(u.correlation, text)]
+    def _sent(self, u: Unresolved, n: int, cap: Captured) -> bool:
+        """Whether a request of step n sent the recorded value: not before its source was
+        requested at recording, and for a candidate never confirmed, only where recording
+        saw it reused (an endpoint, or the step the engineer typed it in)."""
+        c, ex = u.correlation, cap.exchange
+        if u.since is not None and n < u.since:
+            return False
+        reused = {f"{ex.method} {normalise_path(ex.url)}", f"step {n}"}
+        if not c.confirmed and not reused & set(c.used_in):
+            return False
+        return _carries(c, f"{ex.url}\n{cap.request_body or ''}")
+
+    def _carrying(self, cap: Captured, step: int) -> list[str]:
+        """The unresolved correlations whose recorded value the request sent."""
+        return [n for n, u in self.unresolved.items() if self._sent(u, step, cap)]
 
     def _named(self, *masked: str) -> list[str]:
-        """The unresolved correlations these masked texts name."""
-        return [n for n in self.unresolved if any("{" + n + "}" in t for t in masked)]
+        """The unresolved correlations these masked texts name, where the value masked
+        stood on its own."""
+        return [
+            n
+            for n, u in self.unresolved.items()
+            if any(_alone(u.correlation.recorded_value, "{" + n + "}").search(t) for t in masked)
+        ]
 
     def emit(
         self,
@@ -424,7 +463,7 @@ class Comparison:
                 key,
                 "status code differs",
                 step,
-                blame=self._carrying(f"{ex.url}\n{rep.request_body or ''}"),
+                blame=self._carrying(rep, step),
                 expected=str(rec.status),
                 actual=str(ex.status),
                 detail={"expected": rec.status, "actual": ex.status},

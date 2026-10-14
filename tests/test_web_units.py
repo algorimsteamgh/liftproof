@@ -396,10 +396,10 @@ def _order_journey(**rule):
                    correlations=[c])  # fmt: skip
 
 
-def _captured(method, url, status, json_body=None, headers=None):
+def _captured(method, url, status, json_body=None, headers=None, sent=None):
     body = json.dumps(json_body).encode() if json_body is not None else None
     ex = Exchange(method, url, status, response_headers=headers or {})
-    return Captured(ex, 0.0, body, json_body, None)
+    return Captured(ex, 0.0, body, json_body, sent)
 
 
 def _order_run(placed, *opened, region=None, failed_at=None, failure_kind="not_found"):
@@ -549,6 +549,87 @@ def test_a_candidate_never_confirmed_only_when_the_target_changed_it_and_it_was_
     assert (u.kind, u.severity, u.detail["cause"], u.actual) == (
         Kind.NOT_CHECKED, Severity.MEDIUM, "unconfirmed", "5173")
     assert "carried a different value" in u.summary and "confirm it" in u.summary
+
+
+@pytest.mark.parametrize(("rid", "rule", "line_id", "cause", "found"), [
+    ("4821", {"confirmed": False}, 5173, "unconfirmed", "5173"),
+    (RID, {"transforms": ["base64_decode"]}, "not-encoded", "transform_failed", "not-encoded"),
+])  # fmt: skip
+def test_every_answer_to_the_source_request_is_read(rid, rule, line_id, cause, found):
+    """The cart is read before the line exists, as replay reads every answer to it: the
+    answer the value comes from is judged, not the first one."""
+    c = Correlation("cart.line_id", "json_path", "GET /api/cart", "$.items[0].line_id", rid,
+                    used_in=["DELETE /api/cart/items/{id}"], **rule)  # fmt: skip
+    j = Journey("cart", "http://source.invalid", correlations=[c], steps=[
+        Step(1, "goto", url="/cart", exchanges=[Exchange("GET", "/api/cart", 200)]),
+        Step(2, "click", exchanges=[Exchange("POST", "/api/cart/items", 201),
+                                    Exchange("GET", "/api/cart", 200)]),
+        Step(3, "click", exchanges=[Exchange("DELETE", f"/api/cart/items/{rid}", 204)]),
+    ])  # fmt: skip
+    run = JourneyRun("cart", status="completed", attempts=1, steps=[
+        StepRun(1, "goto", "ok", exchanges=[_captured("GET", "/api/cart", 200, {"items": []})]),
+        StepRun(2, "click", "ok", exchanges=[
+            _captured("POST", "/api/cart/items", 201, {}),
+            _captured("GET", "/api/cart", 200, {"items": [{"line_id": line_id}]})]),
+        StepRun(3, "click", "ok", exchanges=[
+            _captured("DELETE", f"/api/cart/items/{rid}", 404, {})]),
+    ])  # fmt: skip
+    for sr in run.steps:
+        Replayer._correlate(None, j, sr, run)
+    assert run.values == {}
+    findings = _compare(j, run, show_values=True)
+    [status] = [f for f in findings if f.summary == "status code differs"]
+    assert status.detail["unresolved_correlations"] == ["cart.line_id"]
+    [u] = _unresolved(findings)
+    assert (u.kind, u.severity, u.locator, u.actual) == (
+        Kind.NOT_CHECKED, Severity.MEDIUM, "step 2", found)
+    assert {k: u.detail[k] for k in ("cause", "source_step", "source_status", "sent_in")} == {
+        "cause": cause, "source_step": 2, "source_status": 200, "sent_in": [3]}
+
+
+def _total_run(checkout, beacon, ts):
+    """Step 1 reads the cart, whose short total is a candidate never confirmed that
+    recording saw reused in the checkout; step 2 checks out and sends an analytics beacon
+    whose timestamp happens to hold the total's digits."""
+    return JourneyRun("checkout", status="completed", attempts=1, steps=[
+        StepRun(1, "goto", "ok", exchanges=[
+            _captured("GET", "/api/cart", 200, {"total": "125", "ts": ts})]),
+        StepRun(2, "click", "ok", exchanges=[
+            _captured("POST", "/api/checkout", checkout[0], {}, sent=checkout[1]),
+            _captured("POST", "/api/events", beacon, None, sent='{"ts":1760001203}')]),
+    ])  # fmt: skip
+
+
+def test_a_value_sent_only_by_coincidence_is_not_named(tmp_path):
+    c = Correlation("total", "json_path", "GET /api/cart", "$.total", "120",
+                    used_in=["POST /api/checkout"], confirmed=False)  # fmt: skip
+    (tmp_path / "cart").write_bytes(json.dumps({"total": "120", "ts": 1760001203}).encode())
+    j = Journey("checkout", "http://source.invalid", correlations=[c], steps=[
+        Step(1, "goto", url="/cart",
+             exchanges=[Exchange("GET", "/api/cart", 200, body_asset="assets/cart")]),
+        Step(2, "click", exchanges=[Exchange("POST", "/api/checkout", 201),
+                                    Exchange("POST", "/api/events", 204)]),
+    ])  # fmt: skip
+
+    def compared(run):
+        findings = []
+        compare_journey(j, run, WebOptions(), findings.append, tmp_path)
+        return findings
+
+    # the page checked out with the target's own total: nothing sent the recorded one
+    findings = compared(_total_run((201, '{"amount":"125"}'), 503, 1760001203))
+    assert _unresolved(findings) == []
+    assert not [f for f in findings if "unresolved_correlations" in f.detail]
+    # the checkout sent the recorded total, and the failures with nothing of it are not its
+    findings = compared(_total_run((422, '{"amount":"120"}'), 503, 1760001299))
+    blamed = {f.object: f.detail.get("unresolved_correlations") for f in findings
+              if f.summary in ("status code differs", "value of $.ts differs")}  # fmt: skip
+    assert blamed == {"POST /api/checkout": ["total"], "POST /api/events": None,
+                      "GET /api/cart": None}  # fmt: skip
+    [u] = _unresolved(findings)
+    assert (u.detail["cause"], u.detail["sent_in"], u.severity) == (
+        "unconfirmed", [2], Severity.MEDIUM)
+    assert u.summary.count("it explains 1 finding in step 2") == 1
 
 
 def test_the_failure_after_a_stale_value_names_it(monkeypatch):

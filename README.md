@@ -52,14 +52,15 @@ replay, and never reported as differences. A correlation the replay could not ca
 forward (its rule found nothing in the target's response, the value would not decode, the
 request that returns it never came) is named in the report with why, and each difference
 it explains says so, so you know which rule to fix. A candidate nobody confirmed is named
-once the target sent a different value and a later request the recorded one. A header
-rule cannot read a redacted header (`x-csrf-token`, `authorization`): take the value from
-the body. A journey that fails to replay is a finding and the replay goes on with the
-next. If the browser crashes, the journey it was running is retried once in a new
-browser, then recorded as an error; the report's journey table says which journeys hit a
-crash. A retry never submits a write twice: once a journey has sent one (a sign in, an
-order), only a transport or timing failure or a crash runs it again, and not even that
-after the target answered one of its writes with an error.
+once the target sent a different value and a request where recording saw it reused sent
+the recorded one. A header rule cannot read a redacted header (`x-csrf-token`,
+`authorization`): take the value from the body. A journey that fails to replay is a
+finding and the replay goes on with the next. If the browser crashes, the journey it was
+running is retried once in a new browser, then recorded as an error; the report's journey
+table says which journeys hit a crash. A retry never submits a write twice: once a
+journey has sent one (a sign in, an order), only a transport or timing failure or a crash
+runs it again, and not even that after the target answered one of its writes with an
+error.
 
 ## Files
 
