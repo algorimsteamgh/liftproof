@@ -13,6 +13,7 @@ from liftproof.findings import FindingWriter, Kind, read_findings
 from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import REASON_INFINITY, ReconcileOptions, Reconciler
 from liftproof.reconcile.plan import IgnoreRule
+from liftproof.report.builder import verdict
 
 pytestmark = pytest.mark.postgres
 
@@ -309,3 +310,148 @@ def test_bucket_rows_one_pass_matches_one_query_per_bucket(make_db, adapter_for)
     assert one_pass == per_bucket
     assert [b for b, _ in one_pass] == sorted(wanted)
     assert sum(len(r) for _, r in one_pass) == 300 and one_pass[-1][1] == {}
+
+
+# ------------------------------------------------------------------------------ XML
+DOCS = """
+CREATE TABLE docs (id int PRIMARY KEY, doc xml, note text);
+CREATE TABLE notes (id int PRIMARY KEY, v text);
+INSERT INTO notes SELECT g, 'v' || g FROM generate_series(1, 50) g;
+"""
+# the same documents, written as two engines or tools might write them
+COMPACT = """INSERT INTO docs SELECT g, xmlelement(name "order", xmlattributes(g AS id, 'EUR' AS
+  currency), xmlelement(name line, xmlattributes('A-' || g AS sku), g % 7)), 'n' || g
+  FROM generate_series(1, 200) g"""
+PRETTY = """INSERT INTO docs SELECT g, format(E'<?xml version="1.0"?>\\n<order currency=''EUR''
+  id="%s">\\n  <!-- exported -->\\n  <line sku="A-%s">%s</line>\\n</order>\\n', g, g, g % 7)::xml,
+  'n' || g FROM generate_series(1, 200) g"""
+XHTML = (
+    '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" '
+    '"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html>&nbsp;</html>'
+)
+
+
+@pytest.fixture
+def documents(make_db, adapter_for):
+    s, sc = make_db("src")
+    t, tc = make_db("tgt")
+    sc.execute(DOCS + COMPACT)
+    tc.execute(DOCS + PRETTY)
+    return adapter_for(s), adapter_for(t), sc, tc
+
+
+def _by_table(result):
+    return {t.table: t for t in result.tables}
+
+
+def test_xml_documents_compare_semantically(tmp_path, documents):
+    src, tgt, _, tc = documents
+    result, findings = _run(tmp_path / "a", src, tgt, ignore=[])
+    docs = _by_table(result)["public.docs"]
+    assert docs.status == "matched" and not docs.partial, [f.summary for f in findings]
+    assert docs.excluded_columns == [] and docs.key == "id"
+    [notice] = [f for f in findings if f.detail.get("xml_columns")]
+    assert notice.kind == Kind.NOTICE and notice.detail["xml_columns"] == ["doc"]
+    assert verdict(findings) == "passed"
+
+    tc.execute("UPDATE docs SET doc = replace(doc::text, 'EUR', 'USD')::xml WHERE id = 42")
+    result, findings = _run(tmp_path / "b", src, tgt, ignore=[], show_values=True)
+    docs = _by_table(result)["public.docs"]
+    assert docs.status == "different" and docs.changed_rows == 1
+    [changed] = [f for f in findings if f.summary == "value differs in column doc"]
+    assert changed.locator == "id = 42"
+    assert changed.expected == '<order currency="EUR" id="42"><line sku="A-42">0</line></order>'
+    assert changed.actual == '<order currency="USD" id="42"><line sku="A-42">0</line></order>'
+    assert verdict(findings) == "failed"
+
+
+def test_a_value_that_cannot_be_canonicalised_leaves_its_column_out(tmp_path, documents):
+    """PostgreSQL accepts an XHTML document whose entities its external DTD declares;
+    expat cannot read that DTD. The column is not checked, with the reason, and the rest of
+    the table and the run are compared (spec 9.6)."""
+    src, tgt, _, tc = documents
+    tc.execute("UPDATE docs SET doc = %s WHERE id = 7", (XHTML,))
+    tc.execute("UPDATE docs SET note = 'changed' WHERE id = 8")
+    result, findings = _run(tmp_path, src, tgt, ignore=[])
+    tables = _by_table(result)
+    docs = tables["public.docs"]
+    assert docs.partial and docs.excluded_columns == ["doc"]
+    assert docs.status == "different" and docs.changed_rows == 1  # the note, found by key
+    [f] = [f for f in findings if f.column == "doc" and f.kind == Kind.NOT_CHECKED]
+    assert f.detail["issue"] == "not_canonicalisable" and f.severity == 3
+    assert f.summary.startswith("column not canonicalisable: not well-formed XML")
+    assert "nbsp" in f.summary and "html" not in f.summary  # the reason, not the value
+    assert [x.summary for x in findings if x.column == "note"] == ["value differs in column note"]
+    assert tables["public.notes"].status == "matched"
+
+
+def test_baselines_and_xml(tmp_path, documents):
+    src, tgt, sc, tc = documents
+
+    def baseline(name, adapter, **kw):
+        manifest = tmp_path / name / "manifest.json"
+        take_baseline(adapter, manifest, baseline_id=name, schemas=["public"], tables=None,
+                      business_keys={}, rows_per_bucket=1000, precision=6,
+                      **{"ignore": [], **kw})  # fmt: skip
+        return manifest
+
+    def compare(name, manifest, source=None):
+        writer = FindingWriter(tmp_path / name, name)
+        b = Baseline.load(manifest)
+        result = Reconciler(tgt, writer, ReconcileOptions(), baseline=b, source=source).run()
+        writer.close()
+        return _by_table(result), list(read_findings(tmp_path / name))
+
+    # a baseline from before XML was compared: the column stays not checked, as it was,
+    # until the baseline is taken again; it is no type change, and the baseline still holds
+    old = baseline("old", src, ignore=[IgnoreRule("docs", "before canonical revision 2", "doc")])
+    manifest = json.loads(old.read_text())
+    for entry in manifest["tables"].values():
+        entry["canonical_revision"] = 1
+        entry.pop("unhashed")
+    [doc] = [c for c in manifest["tables"]["public.docs"]["columns"] if c[0] == "doc"]
+    doc[2] = "unsupported"
+    old.write_text(json.dumps(manifest))
+    tables, findings = compare("f1", old)
+    assert tables["public.docs"].status == "matched", [f.summary for f in findings]
+    assert tables["public.docs"].excluded_columns == ["doc"]
+    [f] = [f for f in findings if f.column == "doc"]
+    assert (f.kind, f.severity, f.detail["issue"]) == (Kind.NOT_CHECKED, 2, "not_in_baseline")
+    assert "canonical revision 2" in f.summary and (f.expected, f.actual) == ("xml", "xml")
+    assert verdict(findings) == "passed_with_differences"
+
+    # a value that cannot be canonicalised: the baseline is taken without its column
+    sc.execute("UPDATE docs SET doc = %s WHERE id = 7", (XHTML,))
+    seen = baseline("b1", src)
+    entry = Baseline.load(seen).tables["public.docs"]
+    assert entry.canonical_revision == CANONICAL_REVISION
+    assert [n for n, _ in entry.plan.columns] == ["id", "note"]
+    assert entry.unhashed["doc"][0] == "not_canonicalisable"
+    tables, findings = compare("f2", seen)
+    assert tables["public.docs"].status == "matched" and tables["public.docs"].partial
+    [f] = [f for f in findings if f.column == "doc"]
+    assert f.detail["issue"] == "not_canonicalisable"
+    assert "when the baseline was taken, not well-formed XML" in f.summary
+
+    # baselines in which every document canonicalised (the target's equal the source's)
+    as_source = baseline("b2", tgt)
+    as_target = baseline("t1", tgt, side="target")
+
+    # the live source's documents are first rendered in the drill-down: the differences
+    # found stand, the rows cannot be named
+    tc.execute("UPDATE docs SET note = 'changed' WHERE id = 9")
+    tables, findings = compare("f3", as_source, source=src)
+    assert tables["public.docs"].status == "different"
+    assert any(f.summary.startswith("table aggregate differs") for f in findings)
+    [stopped] = [f for f in findings if f.summary.startswith("row level drill-down stopped")]
+    assert stopped.column == "doc" and stopped.detail["issue"] == "not_canonicalisable"
+
+    # the target now holds one: the rest of the table needs a new target baseline
+    tc.execute("UPDATE docs SET note = 'n9', doc = %s WHERE id = 9", (XHTML,))
+    tables, findings = compare("f4", as_target)
+    assert tables["public.docs"].status == "not_checked"
+    assert tables["public.docs"].reason == (
+        "the baseline hashed doc, which cannot be canonicalised now; rebaseline to compare "
+        "the rest of the table"
+    )
+    assert tables["public.notes"].status == "matched"

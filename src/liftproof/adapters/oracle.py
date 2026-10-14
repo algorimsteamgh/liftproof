@@ -15,7 +15,8 @@ fallback (the parity tests hold them to that):
 - TO_CHAR switches to scientific notation for numbers it cannot print in 40 characters,
   so a row holding such a number does too.
 
-Tables with a LOB or JSON column are hashed application side.
+Tables with a LOB, JSON or XMLTYPE column are hashed application side; an XMLTYPE value is
+read as XMLSERIALIZE writes it, unindented.
 
 Oracle stores the empty string as NULL. A text value that is empty on the other engine
 and NULL in Oracle is a real difference and is reported as one; see
@@ -26,6 +27,7 @@ In Oracle a schema is a user, so TableRef.schema is the owner, normally in upper
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import decimal
 import ssl
@@ -45,6 +47,7 @@ from liftproof.adapters.base import (
     TableRef,
     TableSchema,
     all_of,
+    fetch_batch,
     in_list,
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest
@@ -66,6 +69,7 @@ TYPE_MAP: dict[str, CanonicalType] = {
     "RAW": CanonicalType.BINARY,
     "BLOB": CanonicalType.BINARY,
     "JSON": CanonicalType.JSON,
+    "XMLTYPE": CanonicalType.XML,
     "BOOLEAN": CanonicalType.BOOLEAN,  # 23ai
 }
 
@@ -73,6 +77,7 @@ LOB_TYPES = {"CLOB", "NCLOB", "BLOB"}
 TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
 PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {
     CanonicalType.JSON,
+    CanonicalType.XML,
     CanonicalType.UUID,
     CanonicalType.TIME,  # Oracle has no TIME type
 }
@@ -559,8 +564,12 @@ class OracleAdapter(Adapter):
         cols = []
         for n, t in plan.columns:
             c = quote(n)
-            # oracledb drops the zone of TIMESTAMP WITH TIME ZONE: read it as UTC
-            cols.append(_utc(natives.get(n, ""), c) if t is CanonicalType.TIMESTAMPTZ else c)
+            if t is CanonicalType.TIMESTAMPTZ:
+                c = _utc(natives.get(n, ""), c)  # oracledb drops the zone: read it as UTC
+            elif natives.get(n) == "XMLTYPE":
+                # as text, unindented: binary XML storage pretty prints by default
+                c = f"XMLSERIALIZE(CONTENT {c} AS CLOB NO INDENT)"
+            cols.append(c)
         return ", ".join(cols)
 
     def _stream(self, plan: HashPlan, where: str | None = None) -> Iterator[list[Any]]:
@@ -570,7 +579,7 @@ class OracleAdapter(Adapter):
         )
         types = [t for _, t in plan.columns]
         with self.conn.cursor() as cur:
-            cur.arraysize = 1000
+            cur.arraysize = fetch_batch(plan, 1000)
             cur.execute(q)
             for row in self.pacer.each(cur):
                 yield [prepare(v, t) for v, t in zip(row, types, strict=True)]
@@ -584,14 +593,16 @@ class OracleAdapter(Adapter):
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = into if into is not None else {}
         sample = None if plan.sample is None else set(plan.sample)
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            b = _value64(kh) % plan.buckets
-            if sample is not None and b not in sample:
-                continue
-            agg = out.setdefault(b, BucketAggregate(0, 0))
-            agg.count += 1
-            agg.total += _value64(rh)
+        # closed at once when a value cannot be hashed, so the connection reads on
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, sample)
+                if placed is None:
+                    continue
+                b, rh = placed
+                agg = out.setdefault(b, BucketAggregate(0, 0))
+                agg.count += 1
+                agg.total += _value64(rh)
         return out
 
     def _fallback_row_hashes(
@@ -599,11 +610,11 @@ class OracleAdapter(Adapter):
     ) -> list[tuple[tuple[Any, ...], str]]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = []
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            if _value64(kh) % plan.buckets in wanted:
-                rendered = hasher.rendered(row)
-                out.append((tuple(rendered[i] for i in plan.key_positions), rh))
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, wanted)
+                if placed is not None:
+                    out.append((hasher.key_values(row), placed[1]))
         return out
 
     def row_hashes(

@@ -26,11 +26,19 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from liftproof.adapters.base import Adapter, BucketAggregate, HashPlan, TableRef, TableSchema
-from liftproof.canonical import RowHasher, column_digest, reduce_total
+from liftproof.canonical import CanonicalType, RenderError, RowHasher, column_digest, reduce_total
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity
 from liftproof.reconcile import ranges
 from liftproof.reconcile.baseline import Baseline, hashed_infinity_as_null
-from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table, row_filter
+from liftproof.reconcile.plan import (
+    NOT_CANONICALISABLE,
+    NOT_CHECKED_ISSUES,
+    NOT_IN_BASELINE,
+    IgnoreRule,
+    TablePlan,
+    plan_table,
+    row_filter,
+)
 from liftproof.reconcile.replication import REASON_BEHIND, ReplicationConfig, check
 
 DB = Comparator.DATABASE
@@ -333,11 +341,21 @@ class Reconciler:
         }
 
     def _one(self, table: TableRef, ttable: TableRef) -> tuple[TableResult, list[Finding]]:
-        self._local.pending = found = []
-        try:
-            return self._table(table, ttable), found
-        finally:
-            self._local.pending = None
+        unhashed: dict[str, tuple[str, str]] = {}
+        self._local.unhashed = unhashed  # columns found to hold a value _table cannot hash
+        while True:
+            self._local.pending = found = []
+            try:
+                return self._table(table, ttable), found
+            except RenderError as exc:
+                # A value that cannot be canonicalised: its column is not compared, with the
+                # reason, and the table is compared again without it (spec 9.6). The
+                # findings of the attempt were not written.
+                if exc.column is None or exc.column.lower() in unhashed:
+                    raise
+                unhashed[exc.column.lower()] = (NOT_CANONICALISABLE, exc.reason)
+            finally:
+                self._local.pending = None
 
     def _each(
         self, work: list[tuple[TableRef, TableRef]]
@@ -426,6 +444,7 @@ class Reconciler:
 
     # -------------------------------------------------------------------- table
     def _table(self, table: TableRef, ttable: TableRef) -> TableResult:
+        unhashed: dict[str, tuple[str, str]] = getattr(self._local, "unhashed", {})
         q = table.qualified
         tschema = self.target.describe(ttable)
         base_entry = self.baseline.tables.get(q) if self.baseline else None
@@ -446,6 +465,7 @@ class Reconciler:
             ignore=self.o.ignore,
             business_key=self.o.business_keys.get(q) or self.o.business_keys.get(table.name),
             side="target" if self.against_target else "source",
+            unhashed={**(base_entry.unhashed if base_entry else {}), **unhashed},
         )
         plan = tp.plan
         if base_entry is not None:
@@ -464,10 +484,10 @@ class Reconciler:
         for issue in tp.issues:
             sev = (
                 Severity.LOW
-                if issue.issue in ("added_in_target", "unsupported")
+                if issue.issue in ("added_in_target", "unsupported", NOT_IN_BASELINE)
                 else (Severity.MEDIUM)
             )
-            kind = Kind.NOT_CHECKED if issue.issue == "unsupported" else Kind.DIFFERENCE
+            kind = Kind.NOT_CHECKED if issue.issue in NOT_CHECKED_ISSUES else Kind.DIFFERENCE
             self.emit(
                 kind,
                 sev,
@@ -501,6 +521,16 @@ class Reconciler:
             res.status, res.reason = "not_checked", "no comparable columns"
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, "no comparable columns")
             return res
+        xml = [n for n, t in plan.columns if t is CanonicalType.XML]
+        if xml:  # why the table takes longer than its size suggests
+            self.emit(
+                Kind.NOTICE,
+                Severity.INFO,
+                q,
+                f"XML columns are canonicalised here, so every row is read and hashed here "
+                f"rather than in the database: {', '.join(xml)}",
+                detail={"xml_columns": xml},
+            )
 
         # Row ignore rules: each side leaves out its own rows, in its own dialect.
         tfilter = row_filter(self.o.ignore, q, "target")
@@ -567,6 +597,13 @@ class Reconciler:
                 if self.against_target
                 else "schema changed since the baseline; the live source is needed to re-hash"
             )
+            if base_entry is not None and unhashed:
+                res.reason = (
+                    f"the baseline hashed {', '.join(sorted(unhashed))}, which cannot be "
+                    "canonicalised now; "
+                    + ("rebaseline" if self.against_target else "the live source is needed")
+                    + " to compare the rest of the table"
+                )
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, res.reason)
             return res
 
@@ -666,10 +703,22 @@ class Reconciler:
             and len(bad) / compared > self.o.breaker_bucket_ratio
         )
         drill = bad[:1] if systemic else bad
-        if plan.key_columns:
-            self._keyed(q, plan, tplan, set(drill), res, systemic, scan)
-        else:
-            self._keyless(q, plan, tplan, set(drill), res, scan)
+        try:
+            if plan.key_columns:
+                self._keyed(q, plan, tplan, set(drill), res, systemic, scan)
+            else:
+                self._keyless(q, plan, tplan, set(drill), res, scan)
+        except RenderError as exc:
+            # the source's values are first rendered here when the baseline was the
+            # reference: the differences above stand, the rows cannot be named
+            self.emit(
+                Kind.NOT_CHECKED,
+                Severity.MEDIUM,
+                q,
+                f"row level drill-down stopped: {exc}",
+                column=exc.column,
+                detail={"issue": NOT_CANONICALISABLE},
+            )
         return res
 
     def _sample(self, q: str, plan: HashPlan, rows: int) -> HashPlan:
@@ -831,6 +880,7 @@ class Reconciler:
             "time": "time precision",
             "decimal": "numeric scale or rounding",
             "json": "JSON normalisation",
+            "xml": "XML serialisation (namespace prefixes, typed XML or whitespace)",
         }
         # PostgreSQL infinity on one side: an open ended date mapped to or from NULL or a
         # sentinel date in the move, not a time zone or type mapping

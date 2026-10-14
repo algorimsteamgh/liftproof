@@ -82,6 +82,15 @@ class HashPlan:
         return [names.index(k) for k in self.key_columns]
 
 
+XML_BATCH = 25  # rows fetched at once to hash here from a table with an XML column
+
+
+def fetch_batch(plan: HashPlan, rows: int) -> int:
+    """Rows a stream fetches at once: fewer from a table with an XML column, whose
+    documents can run to megabytes each (spec 17: nothing loads a table)."""
+    return XML_BATCH if any(t is CanonicalType.XML for _, t in plan.columns) else rows
+
+
 @dataclass
 class BucketAggregate:
     count: int
@@ -199,7 +208,10 @@ class Pacer:
     def each(self, rows: Iterable[Any], batch: int = 1000) -> Iterator[Any]:
         """Rows streamed here to be hashed, charged a batch at a time as they arrive."""
         if not self.rate:
-            yield from rows
+            # not yield from: stopped early, that would close the cursor, which the
+            # stream's own with block closes (oracledb refuses a second close)
+            for row in rows:
+                yield row
             return
         start, n = self.clock(), 0
         try:

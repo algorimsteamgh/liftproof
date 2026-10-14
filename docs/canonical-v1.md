@@ -9,19 +9,22 @@ under a different version.
 
 Changing the rendering of a value that already had one changes the golden vectors in
 `tests/test_canonical.py` and requires a new `CANONICAL_VERSION`. A rule that only gives a
-rendering to values that had none (they failed to load, or hashed as NULL) keeps the
-version, adds golden vectors, and raises `CANONICAL_REVISION`, a whole number. Each
+rendering to values that had none (they failed to load, hashed as NULL, or their columns
+were not compared) keeps the version, adds golden vectors, and raises `CANONICAL_REVISION`,
+a whole number. Each
 baseline table records the revision it was hashed under (`canonical_revision`; absent
 means 0), and so do the report's run block and a run's checkpoint. A build refuses a
 baseline holding a table of a newer revision than its own, and refuses to resume a run
 started under another revision. A baseline table of an older revision is compared only
 when nothing in it can render differently under the newer rules; otherwise it is reported
-not checked, naming the baseline to take again. Builds from before revisions do not read
-the field.
+not checked, naming the baseline to take again. A column the older revision did not compare
+at all is reported not checked on its own (`not_in_baseline`), and the rest of the table is
+compared. Builds from before revisions do not read the field.
 
 | Revision | Rule | An older baseline table is still compared when |
 |---|---|---|
 | 1 | PostgreSQL `infinity` and `-infinity` dates and timestamps (below) | it is not PostgreSQL, it has no date or timestamp column, its data ranges cover every one (reading the range of a column holding infinity failed then), or it has a JSON column (it was hashed application side, and loading infinity failed then) |
+| 2 | XML columns: PostgreSQL `xml`, Oracle `XMLTYPE`, SQL Server `xml` (below) | always; its XML columns, which it recorded as unsupported, are reported not checked (`not_in_baseline`) until the baseline is taken again |
 
 ## 1. Columns
 
@@ -49,12 +52,61 @@ the field.
 | binary | lower case hex |
 | uuid | lower case, hyphenated |
 | json | keys sorted, no insignificant whitespace, NFC |
+| xml | C14N 2.0 of the parsed value, less comments and whitespace only text, NFC (below) |
 
 Every connection pins its session settings (PostgreSQL: `TimeZone=UTC`,
 `DateStyle=ISO, YMD`, `extra_float_digits=3`, UTF-8 client encoding) and the manifest
 records them.
 MySQL sessions pin `time_zone='+00:00'`, `sql_mode='NO_ENGINE_SUBSTITUTION'` (so no
 `ANSI_QUOTES`, `PIPES_AS_CONCAT` or `PAD_CHAR_TO_FULL_LENGTH`) and `utf8mb4`.
+
+### XML
+
+XML columns are compared from revision 2. A value is rendered by the reference
+implementation (`render.py`, ElementTree's C14N 2.0 writer behind expat) so that the same
+document written by two engines, or by a migration tool, hashes alike:
+
+1. Bytes are read as UTF-8. One leading XML declaration (`<?xml ...?>`, after an optional
+   byte order mark and whitespace) is removed.
+2. The value is parsed as content: any mix of elements, text, CDATA sections, processing
+   instructions and comments at the top level, as PostgreSQL and SQL Server hold it. Only
+   if that fails is it parsed as a document, which allows a DOCTYPE: entities declared in
+   its internal subset are expanded and the DOCTYPE itself is not written. An external
+   entity or DTD is never fetched.
+3. It is written as C14N 2.0: elements as start and end tag pairs; attributes double
+   quoted and sorted by `{namespace URI}local name`, those in no namespace first;
+   character and entity references expanded and CDATA written as escaped text; line ends
+   as `\n`; each namespace declared on the first element whose name or attributes use it,
+   with the prefix already written for that URI, or else the innermost prefix the value
+   bound to it. Unused declarations are dropped.
+4. Comments are dropped. Text that is only XML whitespace (space, tab, CR, LF) is dropped,
+   except inside `xml:space="preserve"` (until a descendant sets `default`); any other
+   text is kept exactly, leading and trailing whitespace included.
+5. Each text run, attribute value and processing instruction's data is normalised to NFC
+   on its own.
+6. An `xsi:type` value of the form `prefix:name` (word characters only) is a qualified
+   name: its prefix is resolved and declared as in 3. A prefix declared nowhere is
+   resolved only when it is one of ElementTree's well known prefixes (`xs`, `xsi`, `xml`,
+   `html`, `rdf`, `wsdl`, `dc`).
+
+So attribute order, quote style, `<x/>` against `<x></x>`, CDATA, indentation, comments,
+where a namespace is declared and decomposed characters make no difference. A different
+prefix for the same namespace, a default namespace against a prefix, an `xsi:type` naming
+a different type, and any change of text or attribute value are differences.
+
+A value that cannot be rendered under these rules (not well formed either way, not UTF-8,
+an entity declared only in an external DTD such as XHTML's `&nbsp;`, an undeclared
+`xsi:type` prefix, or entity expansion out of proportion to its size, which expat 2.4.1
+and later refuses) takes its column out of the comparison for that table: the column is
+reported not checked (`not_canonicalisable`) with the parser's reason, which names a line
+and column (and an undefined entity's name) but never the text, and the rest of the table
+is compared. A baseline taken
+over such a value records the column as not hashed, with the reason. PostgreSQL stores
+the XHTML entity in an `xml` column, and all three engines store the undeclared prefix.
+
+No engine has a C14N function, so every table with an XML column is hashed application
+side, fetching 25 rows at a time to bound memory (docs/kpis.md). An `xml` column against a
+text column is a type change, as for json; MySQL has no XML type.
 
 ### PostgreSQL engine specific rules
 
@@ -117,7 +169,8 @@ rendering uses an explicit format, so no other NLS setting matters.
 | RAW, BLOB | binary | |
 | JSON (21c and later) | json | always hashed application side |
 | BOOLEAN (23ai) | boolean | |
-| LONG, LONG RAW, INTERVAL, ROWID, XMLTYPE, spatial and the rest | unsupported | reported as not checked |
+| XMLTYPE | xml | read as `XMLSERIALIZE(CONTENT c AS CLOB NO INDENT)`, always hashed application side |
+| LONG, LONG RAW, INTERVAL, ROWID, spatial and the rest | unsupported | reported as not checked |
 
 An integer column on one side and a decimal column on the other (the common Oracle
 `NUMBER` to PostgreSQL `bigint` move) are both rendered as decimal: a whole number renders
@@ -154,7 +207,8 @@ every rendering uses an explicit `CONVERT` style, so no other setting matters.
 | binary, varbinary, image, rowversion | binary | rowversion values are never preserved by a migration; ignore the column |
 | uniqueidentifier | uuid | |
 | json (SQL Server 2025, Azure SQL) | json | always hashed application side |
-| xml, sql_variant, geography, geometry, hierarchyid | unsupported | reported as not checked |
+| xml | xml | always hashed application side; SQL Server stores a parsed form, without the declaration or whitespace only text |
+| sql_variant, geography, geometry, hierarchyid | unsupported | reported as not checked |
 
 SQL Server has no NFC function and hashes `nvarchar` as UTF-16, so a row is hashed in the
 database only when its text values are all characters U+0001 to U+007F (tested with a

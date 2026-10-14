@@ -39,13 +39,20 @@ from liftproof.canonical import (
     CANONICAL_VERSION,
     HASH_ALGORITHM,
     CanonicalType,
+    RenderError,
     reduce_total,
 )
 from liftproof.errors import ConfigError
 from liftproof.reconcile import ranges
-from liftproof.reconcile.plan import IgnoreRule, plan_table
+from liftproof.reconcile.plan import NOT_CANONICALISABLE, NOT_IN_BASELINE, IgnoreRule, plan_table
 
 SIDES = ("source", "target")
+# native types the adapters map to xml since canonical revision 2 (MySQL has none)
+XML_NATIVE = {"xml", "xmltype"}
+REASON_XML = (
+    "the baseline was taken before XML was compared (canonical revision 2); "
+    "take it again to compare this column"
+)
 
 
 @dataclass
@@ -59,6 +66,8 @@ class BaselineTable:
     ranges: dict[str, list[Any]] = field(default_factory=dict)
     # the canonical revision it was hashed under; 0 for entries from before revisions
     canonical_revision: int = CANONICAL_REVISION
+    # columns of a compared type it did not hash: lower cased name -> (issue, why)
+    unhashed: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     @property
     def aggregate(self) -> str:
@@ -88,16 +97,24 @@ class BaselineTable:
             "completed_at": self.completed_at,
             "ranges": self.ranges,
             "canonical_revision": self.canonical_revision,
+            "unhashed": {c: list(v) for c, v in sorted(self.unhashed.items())},
         }
 
     @classmethod
     def from_dict(cls, qualified: str, d: dict[str, Any]) -> BaselineTable:
         ref = TableRef(*qualified.split(".", 1))
-        schema = TableSchema(
-            ref,
-            [Column(n, nt, CanonicalType(ct), fw) for n, nt, ct, fw in d["columns"]],
-            list(d["primary_key"]),
-        )
+        revision = int(d.get("canonical_revision", 0))
+        unhashed = {c: (i, why) for c, (i, why) in d.get("unhashed", {}).items()}
+        columns = []
+        for n, nt, ct, fw in d["columns"]:
+            ctype = CanonicalType(ct)
+            if revision < 2 and ctype is CanonicalType.UNSUPPORTED and nt.lower() in XML_NATIVE:
+                # typed as this build types it, so a target that retyped it is still told
+                # apart; it was never hashed, so it is not compared until taken again
+                ctype = CanonicalType.XML
+                unhashed[n.lower()] = (NOT_IN_BASELINE, REASON_XML)
+            columns.append(Column(n, nt, ctype, fw))
+        schema = TableSchema(ref, columns, list(d["primary_key"]))
         p = d["plan"]
         plan = HashPlan(
             ref,
@@ -118,7 +135,8 @@ class BaselineTable:
             buckets,
             d["completed_at"],
             d.get("ranges", {}),
-            int(d.get("canonical_revision", 0)),
+            revision,
+            unhashed,
         )
 
 
@@ -281,22 +299,37 @@ def take_baseline(
             schema = a.describe(ref)
             with a.pacer.statement() as scan:  # each read of the table is charged (9.15)
                 rows = scan.rows = a.row_count(ref)
-            tp = plan_table(
-                schema,
-                None,
-                rows=rows,
-                rows_per_bucket=rows_per_bucket,
-                precision=precision,
-                ignore=ignore,
-                business_key=business_keys.get(ref.qualified) or business_keys.get(ref.name),
-                side=side,
-            )
-            if tp.plan.filter and not a.supports_row_filters:
-                raise ConfigError(f"{ref}: row ignore rules are not supported for {a.engine}")
-            buckets: dict[int, BucketAggregate] = {}
-            if tp.plan.columns:
-                with a.pacer.statement(scan.rows):
-                    buckets = a.bucket_aggregates(tp.plan)
+            unhashed: dict[str, tuple[str, str]] = {}
+            while True:
+                tp = plan_table(
+                    schema,
+                    None,
+                    rows=rows,
+                    rows_per_bucket=rows_per_bucket,
+                    precision=precision,
+                    ignore=ignore,
+                    business_key=business_keys.get(ref.qualified) or business_keys.get(ref.name),
+                    side=side,
+                    unhashed=unhashed,
+                )
+                if tp.plan.filter and not a.supports_row_filters:
+                    raise ConfigError(f"{ref}: row ignore rules are not supported for {a.engine}")
+                buckets: dict[int, BucketAggregate] = {}
+                try:
+                    if tp.plan.columns:
+                        with a.pacer.statement(scan.rows):
+                            buckets = a.bucket_aggregates(tp.plan)
+                    break
+                except RenderError as exc:
+                    # a value that cannot be canonicalised: the table is hashed again without
+                    # its column, which runs against this baseline report as not checked
+                    if exc.column is None or exc.column.lower() in unhashed:
+                        raise
+                    progress(f"{ref}: column {exc.column} is not hashed: {exc.reason}")
+                    unhashed[exc.column.lower()] = (
+                        NOT_CANONICALISABLE,
+                        f"when the baseline was taken, {exc.reason}",
+                    )
             if tp.plan.filter:  # the rows the baseline holds, not the table's
                 rows = sum(b.count for b in buckets.values())
             spans = {}
@@ -311,6 +344,7 @@ def take_baseline(
                 buckets,
                 dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
                 spans,
+                unhashed=unhashed,
             )
 
         n = min(workers, len(todo))

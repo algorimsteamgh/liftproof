@@ -257,6 +257,48 @@ def test_lob_and_json_columns_hash_like_their_short_forms(make_oracle_db, oracle
     assert agg("J", T.JSON) == agg("JT", T.JSON)
 
 
+def test_xmltype_hashes_like_its_canonical_text(make_oracle_db, oracle_adapter_for):
+    """An XMLTYPE value is read through XMLSERIALIZE, unindented, whatever its storage
+    pretty prints; it hashes as the canonical text does, pretty printed or not."""
+    schema, cur = make_oracle_db()
+    cur.execute(
+        "CREATE TABLE docs (id NUMBER(9) PRIMARY KEY, doc XMLTYPE, pretty XMLTYPE, "
+        "canon VARCHAR2(400))"
+    )
+    cur.executemany(
+        "INSERT INTO docs VALUES (:i, CASE WHEN :d IS NULL THEN NULL ELSE XMLTYPE(:d) END, "
+        "CASE WHEN :p IS NULL THEN NULL ELSE XMLTYPE(:p) END, :c)",
+        [
+            {"i": 1, "d": '<a b="2" a="1"><x/><y>t</y></a>',
+             "p": "<a a='1' b='2'>\n  <x></x>\n  <y>t</y>\n</a>\n",
+             "c": '<a a="1" b="2"><x></x><y>t</y></a>'},
+            {"i": 2, "d": None, "p": None, "c": None},
+            {"i": 3, "d": "<?xml version='1.0'?><a><!-- c --><b>caf\u00e9</b></a>",
+             "p": "<a>\n  <b>cafe\u0301</b>\n</a>", "c": "<a><b>caf\u00e9</b></a>"},
+            {"i": 4, "d": '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>',
+             "p": '<p:a xmlns:p="urn:p">\n<p:b xml:space="preserve">  </p:b></p:a>',
+             "c": '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>'},
+        ],
+    )  # fmt: skip
+    a = oracle_adapter_for()
+    docs = TableRef(schema, "DOCS")
+    described = a.describe(docs)
+    assert {c.name: c.canonical for c in described.columns} == {
+        "ID": T.INTEGER, "DOC": T.XML, "PRETTY": T.XML, "CANON": T.TEXT,
+    }  # fmt: skip
+    assert {c.name: c.native_type for c in described.columns}["DOC"] == "XMLTYPE"
+
+    def plan(col):
+        return HashPlan(docs, [(col, T.XML), ("ID", T.INTEGER)], ["ID"], 2)
+
+    aggregates = a.bucket_aggregates(plan("DOC"))
+    assert aggregates == a.bucket_aggregates(plan("PRETTY")) == a.bucket_aggregates(plan("CANON"))
+    assert sum(b.count for b in aggregates.values()) == 4
+    rows = a.fetch_rows(plan("PRETTY"), [("1",), ("2",)])
+    assert rows[("1",)][0] == '<a a="1" b="2"><x/><y>t</y></a>'  # serialised unindented
+    assert rows[("2",)][0] is None
+
+
 def test_describe_maps_types(loaded):
     a, schema = loaded
     s = a.describe(TableRef(schema, "EVERYTHING"))
@@ -276,6 +318,7 @@ def test_canonical_type_rules():
     assert canonical_type("TIMESTAMP(3) WITH LOCAL TIME ZONE", None, 3) is T.TIMESTAMPTZ
     assert canonical_type("INTERVAL DAY(2) TO SECOND(6)", None, None) is T.UNSUPPORTED
     assert canonical_type("LONG", None, None) is T.UNSUPPORTED
+    assert canonical_type("XMLTYPE", None, None) is T.XML
 
 
 def test_float_stats_counts_nan_and_infinity(loaded):

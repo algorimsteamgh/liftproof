@@ -23,6 +23,7 @@ class CanonicalType(StrEnum):
     BINARY = "binary"
     UUID = "uuid"
     JSON = "json"  # semantically canonicalised
+    XML = "xml"  # semantically canonicalised; C14N 2.0 less comments and whitespace
     UNSUPPORTED = "unsupported"  # compared by nothing; reported not_checked
 
     @property

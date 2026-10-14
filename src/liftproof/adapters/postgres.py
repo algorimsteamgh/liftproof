@@ -2,7 +2,7 @@
 
 Pushdown computes the canonical hashes inside PostgreSQL so only hashes cross the
 network. Tables containing a column that PostgreSQL cannot canonicalise identically
-(json and jsonb, whose text forms reorder keys) are hashed application side by
+(json and jsonb, whose text forms reorder keys, and xml) are hashed application side by
 streaming rows through the reference implementation. Both paths are held to byte
 identical output by the parity tests.
 
@@ -12,6 +12,7 @@ renders as NULL. Both paths render them as PostgreSQL prints them (canonical rev
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import functools
 from collections.abc import Iterator, Sequence
@@ -33,6 +34,7 @@ from liftproof.adapters.base import (
     Pacer,
     TableRef,
     TableSchema,
+    fetch_batch,
 )
 from liftproof.canonical import (
     GROUP_SIZE,
@@ -65,9 +67,10 @@ TYPE_MAP: dict[str, CanonicalType] = {
     "uuid": CanonicalType.UUID,
     "json": CanonicalType.JSON,
     "jsonb": CanonicalType.JSON,
+    "xml": CanonicalType.XML,
 }
 
-PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON}
+PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON, CanonicalType.XML}
 INFINITE_TYPES = {CanonicalType.DATE, CanonicalType.TIMESTAMP, CanonicalType.TIMESTAMPTZ}
 INFINITE = {b"infinity": Verbatim("infinity"), b"-infinity": Verbatim("-infinity")}
 
@@ -480,21 +483,24 @@ class PostgresAdapter(Adapter):
             cols, self._ident(plan.table), _excluding(plan.filter)
         )
         with self.conn.transaction(), self.conn.cursor(name="liftproof_stream") as cur:
-            cur.itersize = 5000
+            cur.itersize = fetch_batch(plan, 5000)
             cur.execute(q)
             yield from self.pacer.each(cur)
 
     def _bucket_aggregates_fallback(self, plan: HashPlan) -> dict[int, BucketAggregate]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
+        sample = None if plan.sample is None else set(plan.sample)
         out: dict[int, BucketAggregate] = {}
-        for row in self._stream(plan):
-            rh, kh = hasher.hash_row(row)
-            b = value64(kh) % plan.buckets
-            if plan.sample is not None and b not in plan.sample:
-                continue
-            agg = out.setdefault(b, BucketAggregate(0, 0))
-            agg.count += 1
-            agg.total += value64(rh)
+        # closed at once when a value cannot be hashed, so the connection reads on
+        with contextlib.closing(self._stream(plan)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, sample)
+                if placed is None:
+                    continue
+                b, rh = placed
+                agg = out.setdefault(b, BucketAggregate(0, 0))
+                agg.count += 1
+                agg.total += value64(rh)
         return out
 
     def row_hashes(
@@ -505,11 +511,11 @@ class PostgresAdapter(Adapter):
         wanted = set(buckets)
         if not self._pushdown(plan):
             hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
-            for row in self._stream(plan):
-                rh, kh = hasher.hash_row(row)
-                if value64(kh) % plan.buckets in wanted:
-                    rendered = hasher.rendered(row)
-                    yield tuple(rendered[i] for i in plan.key_positions), rh
+            with contextlib.closing(self._stream(plan)) as rows:
+                for row in rows:
+                    placed = hasher.placed(row, plan.buckets, wanted)
+                    if placed is not None:
+                        yield hasher.key_values(row), placed[1]
             return
         q = sql.SQL("SELECT * FROM ({inner}) h WHERE mod({kh}, {n})::int = ANY(%s)").format(
             inner=self._hash_query(plan),

@@ -11,7 +11,7 @@ import pytest
 from liftproof.adapters.base import HashPlan, TableRef
 from liftproof.adapters.postgres import PostgresAdapter
 from liftproof.canonical import CanonicalType as T
-from liftproof.canonical import Verbatim
+from liftproof.canonical import RenderError, Verbatim
 from liftproof.reconcile import ranges
 
 pytestmark = pytest.mark.postgres
@@ -121,3 +121,46 @@ def test_infinity_is_not_null(make_db, adapter_for):
     amounts = TableRef("public", "amounts")
     assert ranges.read(a, amounts, a.describe(amounts), ["n"], None) == {"n": [1, "Infinity"]}
     assert a.value_ranges(amounts, ["n"])["n"][1] == Decimal("Infinity")
+
+
+XHTML = (
+    '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" '
+    '"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html>&nbsp;</html>'
+)
+
+
+def test_xml_is_hashed_here_like_its_canonical_text(make_db, adapter_for):
+    """xml values reach the reference implementation as PostgreSQL stores them: content
+    (fragments) as well as documents, and hash like the canonical text they render to."""
+    db, conn = make_db()
+    conn.execute("CREATE TABLE docs (id int PRIMARY KEY, doc xml, canon text)")
+    with conn.cursor() as cur:
+        cur.executemany("INSERT INTO docs VALUES (%s, %s, %s)", [
+            (1, "<a b='2' a=\"1\">\n  <x/>\n  <y>t</y></a>", '<a a="1" b="2"><x></x><y>t</y></a>'),
+            (2, "<a/><b/>text", "<a></a><b></b>text"),
+            (3, None, None),
+            (4, '<!DOCTYPE a [<!ENTITY e "hi">]><a>&e;<!-- c --></a>', "<a>hi</a>"),
+            (5, "", ""),
+            (6, '<p xmlns="urn:p"><![CDATA[<&>]]></p>', '<p xmlns="urn:p">&lt;&amp;&gt;</p>'),
+        ])  # fmt: skip
+    a = adapter_for(db)
+    table = TableRef("public", "docs")
+    assert {c.name: c.canonical for c in a.describe(table).columns} == {
+        "id": T.INTEGER, "doc": T.XML, "canon": T.TEXT,
+    }  # fmt: skip
+    as_xml = HashPlan(table, [("doc", T.XML), ("id", T.INTEGER)], ["id"], 4)
+    as_text = HashPlan(table, [("canon", T.TEXT), ("id", T.INTEGER)], ["id"], 4)
+    aggregates = a.bucket_aggregates(as_xml)
+    assert aggregates == a.bucket_aggregates(as_text)  # the text pushed down, xml here
+    assert sorted(a.row_hashes(as_xml, {0, 1, 2, 3})) == sorted(a.row_hashes(as_text, {0, 1, 2, 3}))
+    sampled = HashPlan(table, as_xml.columns, ["id"], 4, sample=(1, 3))
+    assert a.bucket_aggregates(sampled) == {b: aggregates[b] for b in (1, 3) if b in aggregates}
+    assert a.fetch_rows(as_xml, [("2",)]) == {("2",): ["<a/><b/>text", 2]}
+
+    # a value expat cannot parse: an external DTD's entity, which PostgreSQL accepts
+    conn.execute("INSERT INTO docs VALUES (7, %s, NULL)", (XHTML,))
+    with pytest.raises(RenderError, match="^column doc: not well-formed XML") as caught:
+        a.bucket_aggregates(as_xml)
+    assert caught.value.column == "doc" and "nbsp" in caught.value.reason
+    # the stream was closed: the connection reads on
+    assert a.bucket_aggregates(as_text) == a.bucket_aggregates(as_text)

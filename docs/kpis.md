@@ -15,7 +15,19 @@ Each release's numbers are kept in `perf-results.json` with the release evidence
 
 The suite also holds the streaming design in place (spec 17): drilling into differences
 spread over 13 buckets of a 1,000,000 row table must not grow the process by 200 MB or
-more (`test_large_table_drill_down_streams`).
+more (`test_large_table_drill_down_streams`). XML is canonicalised here (no engine has
+C14N, docs/canonical-v1.md), so its documents cross the network: reconciling 400 documents
+of about 210 KB, about 85 MB a side, must not grow the process by 200 MB or more either
+(`test_xml_documents_stream`, which also records the XML read in MB a second as a figure,
+not a threshold). A table with an XML column is fetched 25 rows at a time on each side;
+5,000, the PostgreSQL fallback's batch, grew the process by 328 MB on that table.
+
+XML tables fall short of the throughput KPI, which is stated for a table hashed in the
+database. Canonicalising runs under the interpreter lock, so source, target and every
+worker (`database.workers` are threads) share one core. Measured on the development container with the source
+as shipped: 200,000 rows of a 110 byte document each went through at 262,000 rows a minute
+(319,000 fetching 5,000 rows at a time), against 1.34 million for the same table with the
+column as text, hashed in the database.
 
 ## First results (development container, 4 vCPU)
 
@@ -26,6 +38,7 @@ more (`test_large_table_drill_down_streams`).
 | Report generation, 500 journeys | 0.31 s | 60 s |
 | Tool failure rate | 0 of 60 | under 2 % |
 | Large table drill-down memory | 52 MB | under 200 MB |
+| XML table memory, 400 documents of about 210 KB a side | 33 MB (15.9 MB of XML a second, source and target together) | under 200 MB |
 
 Building the suite found four problems, fixed with it: replay sat out the whole step
 timeout after a page load (about 10 s per journey); recording snapshotted a step before

@@ -56,8 +56,8 @@ aggregate (the whole table, whatever row rules or a sample keep), the data range
 float column's statistics, each pass of a drill-down and the fetch of changed rows'
 values. A connection pays before its next statement, so nothing waits after the last one,
 and idle time earns no credit. The database runs each statement at its own speed, which
-`statement_timeout_ms` bounds; rows Liftproof hashes itself (JSON columns, and rows with
-non-ASCII text outside PostgreSQL) are charged as they stream, which slows the read
+`statement_timeout_ms` bounds; rows Liftproof hashes itself (JSON and XML columns, and rows
+with non-ASCII text outside PostgreSQL) are charged as they stream, which slows the read
 itself. On MySQL, SQL Server and Oracle a table with text (on Oracle also exact numbers or
 binary) is hashed in two statements, each a read of the table: the rows the database
 renders exactly, then the rest, streamed here. Its aggregate and each drill-down pass are
@@ -204,7 +204,14 @@ and the earliest and latest value of each date and time column of the rows compa
 appear only with `show_values`. `database.ranges: false` turns them off, saving one
 MIN/MAX statement per table and side. A PostgreSQL date or timestamp can be `infinity` or
 `-infinity`, shown and compared as those words: never equal to NULL or to a sentinel date
-on the other side. The run block records the canonical version and revision the run
+on the other side. XML columns (PostgreSQL `xml`, Oracle `XMLTYPE`, SQL Server `xml`) are
+compared as documents: attribute order, where namespaces are declared, comments and
+indentation are not differences. A value that cannot be read as XML (an XHTML `&nbsp;`, an
+undeclared `xsi:type` prefix) takes its column out of that table's comparison, reported as
+not checked with the parser's reason, and a baseline taken before XML was compared reports
+its XML columns as not checked until it is taken again. A table with an XML column is
+hashed here, about a fifth as fast as in the database for small documents
+(docs/kpis.md). The run block records the canonical version and revision the run
 hashed under. `liftproof report --run ID` rebuilds the HTML and JSON from the run's
 findings and keeps what the run was (its reference, window, schedule and who ran it),
 adding when it was regenerated.

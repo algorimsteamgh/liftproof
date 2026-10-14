@@ -199,13 +199,48 @@ def test_describe_maps_types(loaded):
 
 
 def test_type_rules():
-    assert canonical_type("xml") is T.UNSUPPORTED
+    assert canonical_type("xml") is T.XML
     assert canonical_type("geography") is T.UNSUPPORTED
     assert canonical_type("sql_variant") is T.UNSUPPORTED
     assert canonical_type("timestamp") is T.BINARY  # rowversion
     assert canonical_type("NVARCHAR") is T.TEXT
     assert native_name("varbinary", -1, 0, 0) == "varbinary(max)"
     assert native_name("time", 5, 16, 7) == "time(7)"
+
+
+XML_ROWS = [
+    (1, "<a b='2' a=\"1\">\n  <x></x>\n  <y>t</y>\n</a>", '<a a="1" b="2"><x></x><y>t</y></a>'),
+    (2, "<a/><b/>caf\u00e9", "<a></a><b></b>caf\u00e9"),
+    (3, None, None),
+    (4, "<?xml version='1.0'?><a><!-- c --><![CDATA[x < y]]></a>", "<a>x &lt; y</a>"),
+    (5, '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>',
+     '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>'),
+]  # fmt: skip
+
+
+def test_xml_hashes_like_its_canonical_text(make_sqlserver_db, sqlserver_adapter_for):
+    """SQL Server rewrites xml as it stores it (no declaration, <x/>, whitespace only
+    text dropped, a preserved space as a character reference); it still hashes as the
+    canonical text does."""
+    db, cur = make_sqlserver_db()
+    cur.execute("CREATE TABLE docs (id int PRIMARY KEY, doc xml, canon nvarchar(max))")
+    for row in XML_ROWS:
+        cur.execute("INSERT INTO docs VALUES (%s, %s, %s)", row)
+    a = sqlserver_adapter_for(db)
+    docs = TableRef("dbo", "docs")
+    assert {c.name: c.canonical for c in a.describe(docs).columns} == {
+        "id": T.INTEGER, "doc": T.XML, "canon": T.TEXT,
+    }  # fmt: skip
+
+    def plan(col, **kw):
+        return HashPlan(docs, [(col, T.XML), ("id", T.INTEGER)], ["id"], 3, **kw)
+
+    assert a.bucket_aggregates(plan("doc")) == a.bucket_aggregates(plan("canon"))
+    assert sorted(a.row_hashes(plan("doc"), {0, 1, 2})) == sorted(
+        a.row_hashes(plan("canon"), {0, 1, 2})
+    )
+    [stored] = a.fetch_rows(plan("doc"), [("1",)]).values()
+    assert stored[0] == '<a b="2" a="1"><x/><y>t</y></a>'  # as SQL Server wrote it
 
 
 def test_tls_settings():

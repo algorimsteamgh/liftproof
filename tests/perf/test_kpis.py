@@ -210,6 +210,39 @@ def test_kpi_database_throughput(tmp_path, adapter_for, big_pair, kpi):
     assert per_minute >= ROWS_PER_MINUTE_MIN
 
 
+# Large documents: 400 of about 210 KB, one table of about 85 MB on each side.
+XML_ROWS = 400
+DOCS = """
+CREATE TABLE docs (id int PRIMARY KEY, doc xml);
+INSERT INTO docs SELECT g, xmlelement(name "order", xmlattributes(g AS id),
+  (SELECT xmlagg(xmlelement(name line, xmlattributes(i AS n), repeat(md5((g * i)::text), 6)))
+   FROM generate_series(1, 1000) i)) FROM generate_series(1, {rows}) g;
+"""
+
+
+def test_xml_documents_stream(tmp_path, make_db, adapter_for, kpi):
+    """XML is canonicalised here, so its documents cross the network; they are fetched a
+    few at a time (spec 17), and the process grows by less than 200 MB. The throughput is
+    a figure, not a threshold: canonicalising runs under the interpreter lock, so source
+    and target share one core (docs/kpis.md)."""
+    names = []
+    for side in ("s", "t"):
+        name, conn = make_db(side)
+        conn.execute(DOCS.format(rows=XML_ROWS))
+        names.append(name)
+    megabytes = conn.execute("SELECT sum(octet_length(doc::text)) FROM docs").fetchone()[0] / 1e6
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    result, elapsed, _ = _reconcile(tmp_path, adapter_for, names, SHIPPED, ("docs",))
+    grown_mb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) / 1024
+    assert [t.status for t in result.tables] == ["matched"]
+    kpi("xml_table_memory", value=round(grown_mb, 1), threshold=200, unit="MB peak growth",
+        rows=XML_ROWS, megabytes_per_side=round(megabytes, 1), passed=grown_mb < 200)  # fmt: skip
+    kpi("xml_throughput", value=round(2 * megabytes / elapsed, 2), threshold=None,
+        unit="MB of XML a second, source and target together", seconds=round(elapsed, 2),
+        rows_per_minute=round(XML_ROWS / elapsed * 60), passed=None)  # fmt: skip
+    assert grown_mb < 200
+
+
 def test_large_table_drill_down_streams(tmp_path, adapter_for, big_pair, kpi):
     """Nothing loads a table into memory (spec 17): drilling into differences spread over
     many buckets of a large table keeps the process's memory nearly flat."""

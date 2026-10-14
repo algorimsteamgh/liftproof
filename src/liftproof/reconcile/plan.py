@@ -47,10 +47,19 @@ def row_filter(ignore: list[IgnoreRule], qualified: str, side: str) -> str | Non
     return " OR ".join(f"({p})" for p in preds) or None
 
 
+# A column that is not compared, with the reason, rather than guessed at (spec 9.6): its
+# values cannot be canonicalised, or the baseline it is compared with did not hash it.
+NOT_CANONICALISABLE = "not_canonicalisable"
+NOT_IN_BASELINE = "not_in_baseline"
+NOT_CHECKED_ISSUES = ("unsupported", NOT_CANONICALISABLE, NOT_IN_BASELINE)
+
+
 @dataclass
 class ColumnIssue:
     column: str
-    issue: str  # missing_in_target | added_in_target | type_changed | unsupported | ignored
+    # missing_in_target | added_in_target | type_changed | unsupported | not_canonicalisable
+    # | not_in_baseline
+    issue: str
     detail: str
     source_type: str | None = None
     target_type: str | None = None
@@ -93,12 +102,16 @@ def plan_table(
     ignore: list[IgnoreRule],
     business_key: list[str] | None = None,
     side: str = "source",
+    unhashed: dict[str, tuple[str, str]] | None = None,
 ) -> TablePlan:
     """Plan the comparison of one table over the intersection of mapped columns.
 
     target may be None when planning a baseline before the target exists; the plan is
-    then over every source column.
+    then over every source column. unhashed: columns left out though both sides have them
+    alike, lower cased name -> (issue, why): a baseline that did not hash them, or values
+    that cannot be canonicalised.
     """
+    unhashed = unhashed or {}
     ignored = {
         r.column.lower(): r.reason
         for r in ignore
@@ -144,6 +157,18 @@ def plan_table(
                         )
                     )
                     continue
+        if key in unhashed:
+            issue, why = unhashed[key]
+            issues.append(
+                ColumnIssue(
+                    col.name,
+                    issue,
+                    why,
+                    col.native_type,
+                    tcol.native_type if target is not None else None,
+                )
+            )
+            continue
         if ctype is CanonicalType.UNSUPPORTED:
             issues.append(
                 ColumnIssue(
@@ -185,6 +210,10 @@ def plan_table(
         )
     if not key_ok:
         key, key_source = [], "none (bucketed on the whole row)"
+    elif any(types[k] is CanonicalType.XML for k in key):
+        # keys are matched on their rendering in SQL, which XML has none of; no engine
+        # allows one in a primary key, so only a declared business key gets here
+        key, key_source = [], "none (an xml column cannot be a key; bucketed on the whole row)"
 
     return TablePlan(
         plan=HashPlan(

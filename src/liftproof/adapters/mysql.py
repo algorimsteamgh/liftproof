@@ -13,6 +13,7 @@ In MySQL a schema is a database, so TableRef.schema is the database name.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import math
@@ -72,7 +73,11 @@ TYPE_MAP: dict[str, CanonicalType] = {
 }
 
 TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
-PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON, CanonicalType.UUID}
+PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {
+    CanonicalType.JSON,
+    CanonicalType.XML,  # no MySQL type maps to it
+    CanonicalType.UUID,
+}
 
 NULL_DIGEST = column_digest(None)
 
@@ -544,14 +549,16 @@ class MySQLAdapter(Adapter):
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = into if into is not None else {}
         sample = None if plan.sample is None else set(plan.sample)
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            b = _value64(kh) % plan.buckets
-            if sample is not None and b not in sample:
-                continue
-            agg = out.setdefault(b, BucketAggregate(0, 0))
-            agg.count += 1
-            agg.total += _value64(rh)
+        # closed at once when a value cannot be hashed, so the connection reads on
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, sample)
+                if placed is None:
+                    continue
+                b, rh = placed
+                agg = out.setdefault(b, BucketAggregate(0, 0))
+                agg.count += 1
+                agg.total += _value64(rh)
         return out
 
     def _fallback_row_hashes(
@@ -559,11 +566,11 @@ class MySQLAdapter(Adapter):
     ) -> list[tuple[tuple[Any, ...], str]]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = []
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            if _value64(kh) % plan.buckets in wanted:
-                rendered = hasher.rendered(row)
-                out.append((tuple(rendered[i] for i in plan.key_positions), rh))
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, wanted)
+                if placed is not None:
+                    out.append((hasher.key_values(row), placed[1]))
         return out
 
     def row_hashes(
