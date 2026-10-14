@@ -225,6 +225,7 @@ class Recorder:
             else:
                 session.wait_until_closed()
             result = session.finish()
+            session.net.close()  # a write still being fetched would reach the source twice
             context.close()
             browser.close()
         journey.recorded_at = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

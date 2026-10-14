@@ -189,9 +189,13 @@ def test_a_slow_order_is_submitted_once(recorded, missing_step):
         assert "POST /api/orders (201)" in missing.detail["not_repeated"]
 
 
-@pytest.mark.parametrize(("status", "attempts"), [(None, 2), (500, 1)])
+@pytest.mark.parametrize(("status", "delay", "attempts"), [
+    (None, 0, 2),
+    (500, 0, 1),
+    (500, 5000, 1),  # answered after the page had navigated away from it
+])  # fmt: skip
 def test_a_transport_failure_after_the_order_repeats_it_only_when_it_succeeded(
-    recorded, status, attempts
+    recorded, status, delay, attempts
 ):
     """Spec 6: a transport failure is retried, the whole journey being the unit, but never
     after a write the target answered with an error, which may have gone through."""
@@ -199,12 +203,40 @@ def test_a_transport_failure_after_the_order_repeats_it_only_when_it_succeeded(
     j = with_step(journey, "goto", url="/dropped")
     posts = Counter()
     result, findings = replay(j, assets, "same", timeout=3000, posts=posts,
-                              post_status={"/api/orders": status} if status else None)  # fmt: skip
+                              post_status={"/api/orders": status} if status else None,
+                              post_delay_ms={"/api/orders": delay})  # fmt: skip
     [r] = result.journeys
     assert (r.status, r.attempts) == ("failed", attempts)
     assert posts["/api/orders"] == attempts  # one order an attempt, never two in one
     [error] = [f for f in findings if f.kind == Kind.ERROR]
     assert ("not_repeated" in error.detail) == (status is not None)
+    if status:
+        assert "POST /api/orders (500)" in error.detail["not_repeated"]
+
+
+def test_a_long_poll_left_open_does_not_hold_up_the_journey(browser_available):
+    """Only a write still being fetched is waited for as the journey's page closes: the
+    long poll the server holds open held every attempt for the fetch's 30 s timeout."""
+    inbox = Journey("inbox", "http://source", steps=[Step(1, "goto", url="/inbox")])
+    runs = []
+    with ShopApp() as target:
+        began = time.monotonic()
+        Replayer(target.url, secret_values=lambda j: {}, step_timeout_ms=5000).run(
+            [inbox, copy.deepcopy(inbox)], lambda i, j, run: runs.append(run)
+        )
+        took = time.monotonic() - began
+    assert [r.status for r in runs] == ["completed", "completed"]
+    assert target.polls >= 2  # each page's was in flight as it closed
+    assert took < 20  # the browser starting, and two short journeys
+
+
+def test_recording_a_slow_order_submits_it_once(browser_available):
+    """The order is answered after the recorder stopped waiting for the step to settle.
+    Closing the window while it was still being fetched sent it to the source again."""
+    with ShopApp(post_delay_ms={"/api/orders": 3000}) as source:
+        Recorder(source.url, policy=BodyPolicy(["/api/*"]), headless=True,
+                 settle_ms=1500).record("checkout", start="/login", drive=drive)  # fmt: skip
+    assert source.posts == Counter({"/login": 1, "/api/orders": 1})
 
 
 def test_ambiguous_locator_is_never_acted_on(recorded):

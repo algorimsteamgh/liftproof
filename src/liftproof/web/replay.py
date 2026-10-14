@@ -357,7 +357,7 @@ class Replayer:
             if not retry_journey or attempt >= last:
                 return run
             if not may_repeat(run.failure_kind, run.writes):
-                # judged once the page's routed requests finished, so with their answers
+                # judged once the page's routed writes finished, so with their answers
                 run.not_repeated = not_repeated("journey", run.writes)
                 return run
             failed_step = next((s.n for s in run.steps if s.status == "failed"), None)

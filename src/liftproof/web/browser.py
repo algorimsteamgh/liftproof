@@ -122,6 +122,7 @@ class NetworkLog:
         self._fetched: dict[int, tuple[bytes | None, float]] = {}
         self._open: set[int] = set()
         self._writes: dict[int, Write] = {}
+        self._writing: set[int] = set()  # writes being fetched through the route
         self.started = 0  # requests begun so far: a change means the page did more
         self.writes: list[Write] = []  # every one sent, in order; drain() leaves them
         page.route("**/*", self._route)
@@ -148,14 +149,27 @@ class NetworkLog:
         if req.resource_type not in ("xhr", "fetch"):
             route.fallback()
             return
+        write = self._writes.get(id(req))
+        if write is not None:
+            self._writing.add(id(req))
+        try:
+            self._fetch(route, write)
+        finally:
+            self._writing.discard(id(req))
+
+    def _fetch(self, route: Any, write: Write | None) -> None:
         t0 = time.perf_counter()
         try:
             resp = route.fetch()
         except Exception:  # noqa: BLE001 - let the browser see the same failure
             route.abort("failed")
             return
+        if write is not None:
+            # the answer is known here even when the page has given up on the request (it
+            # navigated away), and failed it without one
+            write.status = resp.status
         body = resp.body()
-        self._fetched[id(req)] = (body, round((time.perf_counter() - t0) * 1000, 1))
+        self._fetched[id(route.request)] = (body, round((time.perf_counter() - t0) * 1000, 1))
         route.fulfill(response=resp)
 
     def _add(self, req: Any) -> None:
@@ -175,10 +189,12 @@ class NetworkLog:
         self._pending.append((req, resp, body))
 
     def close(self) -> None:
-        """Let the requests being fetched through the route finish: closing the page, or
-        its context, while one is in flight sends it to the server a second time."""
+        """Let the writes being fetched through the route finish: closing the page, or its
+        context, while one is in flight sends it to the server a second time. Reads are
+        waited for only alongside a write, since a page may hold a long poll open until the
+        fetch times out (30 s): a read in flight is sent again, which repeats no write."""
         try:
-            self.page.unroute_all(behavior="wait")
+            self.page.unroute_all(behavior="wait" if self._writing else "ignoreErrors")
         except Exception:  # noqa: BLE001, S110 - the page or its browser has gone
             pass
 

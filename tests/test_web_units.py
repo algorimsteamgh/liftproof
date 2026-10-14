@@ -272,7 +272,7 @@ class _Page:
     """Enough of a page for the network log and the step loop."""
 
     def __init__(self) -> None:
-        self.handlers = {}
+        self.handlers, self.unrouted = {}, []
 
     def route(self, *a) -> None:
         pass
@@ -280,8 +280,8 @@ class _Page:
     def on(self, event, handler) -> None:
         self.handlers[event] = handler
 
-    def unroute_all(self, **kw) -> None:
-        pass
+    def unroute_all(self, behavior=None) -> None:
+        self.unrouted.append(behavior)
 
     def is_closed(self) -> bool:
         return False
@@ -306,6 +306,41 @@ def test_a_write_counts_from_when_it_is_sent():
     page.handlers["requestfailed"](failed)
     net.drain()  # the writes are kept apart from what a step drains
     assert net.writes == [Write("POST /api/orders", 201), Write("DELETE /api/cart/{id}")]
+
+
+def _route(req, meanwhile):
+    """The route an API call is fetched through: the target answers it 500 once meanwhile
+    has run."""
+
+    def fetch():
+        meanwhile()
+        return SimpleNamespace(status=500, headers={}, body=lambda: b"{}")
+
+    return SimpleNamespace(request=req, fetch=fetch, fulfill=lambda response: None)
+
+
+def test_a_write_the_page_gave_up_on_keeps_its_answer():
+    """The page navigated away while its order was being fetched, so the request failed
+    in the page before the target answered it 500 (spec 19)."""
+    page = _Page()
+    net = NetworkLog(page)
+    order = _request("POST", "/api/orders")
+    page.handlers["request"](order)
+    net._route(_route(order, lambda: page.handlers["requestfailed"](order)))
+    assert net.writes == [Write("POST /api/orders", 500)]
+
+
+@pytest.mark.parametrize(("method", "behavior"), [("POST", "wait"), ("GET", "ignoreErrors")])
+def test_a_page_closes_waiting_only_for_the_writes_being_fetched(method, behavior):
+    """Closing under a write sends it again. A read is not waited for: it may be a long
+    poll the server holds open, which held every journey for the fetch's 30 s timeout."""
+    page = _Page()
+    net = NetworkLog(page)
+    req = _request(method, "/api/updates")
+    page.handlers["request"](req)
+    net._route(_route(req, net.close))  # closed while it is being fetched
+    net.close()  # and once it has been answered
+    assert page.unrouted == [behavior, "ignoreErrors"]
 
 
 @pytest.mark.parametrize(("status", "error", "repeated"), [

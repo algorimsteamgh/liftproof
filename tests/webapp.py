@@ -56,6 +56,10 @@ fetch('/api/orders/{oid}').then(r => r.json()).then(o => {{
 }});
 </script></main></body></html>"""
 
+INBOX = """<!doctype html><html><head><title>Shop</title></head><body><main>
+<h1>Inbox</h1>
+<script>fetch('/api/updates');</script></main></body></html>"""
+
 
 class ShopApp:
     """variant: same | changed. changed renames a status, adds an API field, drops the
@@ -65,7 +69,8 @@ class ShopApp:
 
     posts counts the POSTs that reach it, by path. post_status and post_delay_ms (by path)
     change the answer to a write it has already stored: its status, and how long it takes.
-    GET /dropped closes the connection without an answer."""
+    GET /dropped closes the connection without an answer. GET /inbox long polls
+    /api/updates, which is held open until the app closes; polls counts those requests."""
 
     def __init__(
         self,
@@ -80,6 +85,8 @@ class ShopApp:
         self.post_status = post_status or {}
         self.post_delay_ms = post_delay_ms or {}
         self.posts: Counter[str] = Counter()
+        self.polls = 0
+        self._closing = threading.Event()
         self.orders: dict[str, dict] = {}
         self.sessions: set[str] = set()
         self.csrf: set[str] = set()
@@ -131,6 +138,13 @@ class ShopApp:
                 path = self.path.split("?")[0]
                 if path == "/dropped":
                     return  # the connection closes with nothing sent
+                if path == "/inbox":
+                    return self._send(200, INBOX)
+                if path == "/api/updates":
+                    with app._lock:
+                        app.polls += 1
+                    app._closing.wait()  # no news, ever
+                    return
                 if path in ("/", "/login"):
                     token = secrets.token_hex(16)
                     app.csrf.add(token)
@@ -189,5 +203,6 @@ class ShopApp:
         return self
 
     def __exit__(self, *exc) -> None:
+        self._closing.set()
         self.server.shutdown()
         self.server.server_close()
