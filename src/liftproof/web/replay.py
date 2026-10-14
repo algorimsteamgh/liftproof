@@ -151,14 +151,24 @@ class _Browser:
     def gone(self) -> bool:
         return not self.browser.is_connected()
 
-    def new_context(self) -> Any:
-        if self.gone:
+    def new_context(self) -> tuple[Any, bool]:
+        """A context, and whether the browser was started again for it after an exit no
+        journey was charged with."""
+        if not self.gone:
             try:
-                self.browser.close()
-            except Exception:  # noqa: BLE001, S110 - it has already exited
-                pass
-            self.browser, self.crashed = self._launch(), False
-        return self.browser.new_context()
+                return self.browser.new_context(), False
+            except Exception:
+                # Playwright hears of an exit only during a call, so one while no journey
+                # ran (its run compared and written, the next one's secrets fetched) shows here
+                if not self.gone:
+                    raise
+        restarted = not self.crashed
+        try:
+            self.browser.close()
+        except Exception:  # noqa: BLE001, S110 - it has already exited
+            pass
+        self.browser, self.crashed = self._launch(), False
+        return self.browser.new_context(), restarted
 
     def close(self) -> None:
         self.browser.close()
@@ -290,16 +300,16 @@ class Replayer:
         except Exception as exc:  # noqa: BLE001 - reported, the run continues
             run.status, run.failure_kind, run.error = "failed", "secret", str(exc)
             return run
-        for attempt in range(1, JOURNEY_ATTEMPTS + 1):
+        for attempt in range(1, JOURNEY_ATTEMPTS + 2):
             run = JourneyRun(journey.journey_id, attempts=attempt, flakes=run.flakes,
                              browser_crashes=run.browser_crashes,
                              browser_restarted=run.browser_restarted)  # fmt: skip
-            if browser.gone and not browser.crashed:
+            context, restarted = browser.new_context()
+            if restarted:
                 # it exited while no journey was running: not this journey's failure
-                log.warning("the browser had exited before journey %s; starting it again",
+                log.warning("the browser had exited before journey %s; it was started again",
                             journey.journey_id)  # fmt: skip
                 run.browser_restarted = True
-            context = browser.new_context()
             try:
                 retry_journey = self._steps(context, journey, run, secrets)
             except Exception as exc:  # noqa: BLE001 - a crashed context is retried once
@@ -310,7 +320,8 @@ class Replayer:
                     context.close()
                 except Exception:  # noqa: BLE001, S110 - the browser may already be gone
                     pass
-            if run.status != "completed" and browser.gone:
+            crashed = run.status != "completed" and browser.gone
+            if crashed:
                 # the browser process exited during this attempt: charged to this journey,
                 # which is retried once in a new browser (spec 18)
                 log.warning("journey %s attempt %d: the browser crashed", journey.journey_id,
@@ -319,7 +330,9 @@ class Replayer:
                 first = (run.error or "").splitlines()[:1]
                 run.failure_kind, run.browser_crashes = "browser_crash", run.browser_crashes + 1
                 run.error = "the browser process crashed" + (f": {first[0][:300]}" if first else "")
-            if not retry_journey or attempt == JOURNEY_ATTEMPTS:
+            # the first crash keeps its retry when an ordinary failure used the other attempt
+            last = JOURNEY_ATTEMPTS + (crashed and run.browser_crashes == 1)
+            if not retry_journey or attempt >= last:
                 return run
             failed_step = next((s.n for s in run.steps if s.status == "failed"), None)
             flake = {"step": failed_step, "attempt": attempt, "error": run.error, "unit": "journey"}

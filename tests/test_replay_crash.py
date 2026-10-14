@@ -2,7 +2,9 @@
 is retried once in a new browser, then recorded as an error, and the run goes on.
 
 No browser: the fakes stand in for Playwright with only what its oldest supported version
-has, Browser.is_connected and Page.is_closed. A browser that exits closes its pages.
+has, Browser.is_connected and Page.is_closed. A browser that exits closes its pages. As in
+Playwright, the client hears of the exit only during a call: one running when it exits,
+or else the next one made to the browser.
 """
 
 import contextlib
@@ -24,20 +26,26 @@ class Browser:
     version = "0-test"
 
     def __init__(self, launched: list) -> None:
-        self.alive, self.contexts = True, []
+        self.alive, self.connected, self.contexts = True, True, []
         launched.append(self)
 
     def is_connected(self) -> bool:
-        return self.alive
+        return self.connected
+
+    def exit(self, *, heard: bool = True) -> None:
+        self.alive = False
+        if heard:
+            self.connected = False
 
     def new_context(self):
+        self.connected = self.alive
         if not self.alive:
-            raise RuntimeError(CLOSED)
+            raise RuntimeError(f"Browser.new_context: {CLOSED}")
         self.contexts.append(Context(self))
         return self.contexts[-1]
 
     def close(self) -> None:
-        self.alive = False
+        self.exit()
 
 
 class Context:
@@ -65,7 +73,7 @@ class Page:
         pass
 
     def is_closed(self) -> bool:
-        return self.closed or not self.browser.alive
+        return self.closed or not self.browser.connected
 
 
 @pytest.fixture
@@ -109,7 +117,7 @@ def scripted(monkeypatch, act):
 
 
 def crash(page: Page) -> None:
-    page.browser.alive = False
+    page.browser.exit()
     raise RuntimeError(f"Page.goto: {CLOSED}")
 
 
@@ -177,7 +185,7 @@ def test_a_browser_that_exits_during_a_step_fails_that_step(monkeypatch, launche
 
     def act(j, n, attempt, page):
         if (j, n) == ("a", 3) and attempt in on_attempts:
-            page.browser.alive = False
+            page.browser.exit()
 
     scripted(monkeypatch, act)
     result, findings = replay_all([journey("a"), journey("b")])
@@ -203,6 +211,58 @@ def test_a_browser_that_exits_between_journeys_is_charged_to_none(monkeypatch, l
     [notice] = findings
     assert (notice.kind, notice.journey) == (Kind.NOTICE, "b")
     assert notice.summary.startswith("the browser had exited before this journey started")
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_a_browser_that_exits_while_no_call_runs_is_found_at_the_next(
+    monkeypatch, launched, workers
+):
+    """No Playwright call runs while a finished journey is compared and written, so the
+    exit is heard only when the next journey asks for a context."""
+    scripted(monkeypatch, lambda j, n, attempt, page: None)
+    journey_once = Replayer._journey
+
+    def then_exit(self, browser, j):
+        run = journey_once(self, browser, j)
+        browser.browser.exit(heard=False)
+        return run
+
+    monkeypatch.setattr(Replayer, "_journey", then_exit)
+    result, findings = replay_all([journey("a"), journey("b"), journey("c")], workers=workers)
+    assert result.complete
+    assert [(r.status, r.attempts, r.browser_crashes) for r in result.journeys] == [
+        ("passed", 1, 0)] * 3
+    # each worker's first journey has the browser it launched; every later one restarts it
+    notices = [f.journey for f in findings if f.kind == Kind.NOTICE]
+    assert len(notices) == len(launched) - workers >= 1 and "a" not in notices
+    assert all(f.kind == Kind.NOTICE for f in findings)
+
+
+@pytest.mark.parametrize("crash_on", [{2}, {2, 3}])
+def test_a_crash_on_the_last_attempt_is_retried_in_a_new_browser(monkeypatch, launched, crash_on):
+    """Spec 18: a crash gets its retry in a new browser even when an ordinary failure has
+    used the journey's other attempt, and only one."""
+
+    def act(j, n, attempt, page):
+        if (n, attempt) == (2, 1):
+            raise RuntimeError("Page.goto: Timeout 15000ms exceeded.")  # the browser lives
+        if n == 2 and attempt in crash_on:
+            crash(page)
+
+    scripted(monkeypatch, act)
+    result, findings = replay_all([journey("b", writes=True)])
+    [b] = result.journeys
+    assert (b.attempts, b.browser_crashes) == (3, len(crash_on))
+    assert len(launched) == 2 and launched[1].contexts  # the third attempt ran in a new one
+    flakes = [f.detail.get("cause") for f in findings if f.kind == Kind.FLAKE]
+    assert flakes == [None, "browser_crash"]
+    errors = [f for f in findings if f.kind == Kind.ERROR]
+    if crash_on == {2}:
+        assert b.status == "passed" and not errors
+    else:
+        [error] = errors
+        assert b.status == "failed" and error.detail["attempts"] == 3
+        assert error.summary == "the browser process crashed during this journey"
 
 
 def test_a_closed_page_in_a_live_browser_keeps_the_crash_path(monkeypatch, launched):
