@@ -51,7 +51,9 @@ CSRF tokens, ASP.NET view state) are detected as correlations, substituted forwa
 replay, and never reported as differences. A journey that fails to replay is a finding
 and the replay goes on with the next. If the browser crashes, the journey it was running
 is retried once in a new browser, then recorded as an error; the report's journey table
-says which journeys hit a crash.
+says which journeys hit a crash. A retry never submits a write twice: once a journey has
+sent one (a sign in, an order), only a transport or timing failure or a crash runs it
+again, and not even that after the target answered one of its writes with an error.
 
 ## Files
 

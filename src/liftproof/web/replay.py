@@ -8,6 +8,8 @@ per journey, and captures the same evidence again. The rules that keep replay ho
 - a locator must resolve to exactly one element; a weaker fallback is reported;
 - retry only transport and timing failures, never an HTTP status or a comparison;
 - a journey containing a state changing step is retried as a whole, never per step;
+- once an attempt has sent a write, only a transport or timing failure or a crash runs it
+  again, and not after the target answered a write with an error (spec 6 and 19);
 - every retry is counted as a flake, and a step that flakes repeatedly is reported;
 - a browser that crashes fails only the journey it was running: that journey is retried
   once in a new browser (spec 18), and the journeys after it run in that browser.
@@ -30,6 +32,7 @@ from liftproof.web.browser import (
     POLL_S,
     Captured,
     NetworkLog,
+    Write,
     dom_settled,
     endpoints,
     launch,
@@ -73,6 +76,23 @@ def transport_failure(exc: BaseException) -> bool:
     return any(m in text for m in TRANSPORT_MARKERS)
 
 
+def may_repeat(kind: str | None, writes: list[Write]) -> bool:
+    """Whether an attempt that failed this way may run again. Once it has sent a write,
+    another attempt submits it a second time, so only a transport or timing failure or a
+    crash repeats it, and not when a write was answered with an error: it may have gone
+    through all the same (an order stored, then a 500)."""
+    if not writes:
+        return True
+    repeatable = kind in ("transport", "crash", "browser_crash")
+    return repeatable and all((w.status or 0) < 400 for w in writes)
+
+
+def not_repeated(unit: str, writes: list[Write]) -> str:
+    sent = ", ".join(f"{w.endpoint} ({w.status or 'no answer'})" for w in writes)
+    them = "it" if len(writes) == 1 else "them"
+    return f"the {unit} sent {sent}; running it again would submit {them} a second time"
+
+
 @dataclass
 class StepRun:
     n: int
@@ -102,6 +122,8 @@ class JourneyRun:
     wall_ms: float | None = None  # this attempt, first step to last settled step
     browser_crashes: int = 0  # attempts the browser process exited during
     browser_restarted: bool = False  # it had exited before this journey, charged to none
+    writes: list[Write] = field(default_factory=list)  # this attempt's, as the page sent them
+    not_repeated: str | None = None  # why a failed attempt was not run again
 
     @property
     def total_ms(self) -> float:
@@ -334,6 +356,10 @@ class Replayer:
             last = JOURNEY_ATTEMPTS + (crashed and run.browser_crashes == 1)
             if not retry_journey or attempt >= last:
                 return run
+            if not may_repeat(run.failure_kind, run.writes):
+                # judged once the page's routed requests finished, so with their answers
+                run.not_repeated = not_repeated("journey", run.writes)
+                return run
             failed_step = next((s.n for s in run.steps if s.status == "failed"), None)
             flake = {"step": failed_step, "attempt": attempt, "error": run.error, "unit": "journey"}
             if run.failure_kind == "browser_crash":
@@ -355,42 +381,51 @@ class Replayer:
         """Run every step. Returns True when the whole journey should be retried."""
         page = context.new_page()
         net = NetworkLog(page)
+        run.writes = net.writes
         whole = journey.non_idempotent
         began = time.perf_counter()
-        for step in journey.steps:
-            sr = StepRun(step.n, step.action)
-            run.steps.append(sr)
-            for attempt in range(1, STEP_ATTEMPTS + 1):
-                sr.attempts = attempt
-                try:
-                    self._step(page, net, step, sr, journey, run, secrets)
-                    if page.is_closed():
-                        # the step's waits and its snapshot do not fail on a closed page
-                        raise RuntimeError("the page crashed or was closed during the step")
-                    sr.status = "ok"
-                    break
-                except AmbiguousLocator as exc:
-                    sr.status, sr.error = "failed", str(exc)
-                    run.status, run.failure_kind, run.error = "failed", "ambiguous", str(exc)
-                    return False
-                except Exception as exc:
-                    sr.status, sr.error = "failed", str(exc).splitlines()[0][:300]
-                    if not context.browser.is_connected():
-                        raise BrowserCrashed(sr.error) from exc  # no step retries in it
-                    if not transport_failure(exc) and not isinstance(exc, ElementNotFound):
-                        raise
-                    kind = "not_found" if isinstance(exc, ElementNotFound) else "transport"
-                    if whole or attempt == STEP_ATTEMPTS:
-                        # a journey that changes state is never repeated one step at a
-                        # time; the journey is the retry unit (spec 6)
-                        run.status, run.failure_kind, run.error = "failed", kind, sr.error
-                        return whole
-                    run.flakes.append(
-                        {"step": step.n, "attempt": attempt, "error": sr.error, "unit": "step"}
-                    )
-        run.status = "completed"
-        run.wall_ms = round((time.perf_counter() - began) * 1000, 1)
-        return False
+        try:
+            for step in journey.steps:
+                sr = StepRun(step.n, step.action)
+                run.steps.append(sr)
+                for attempt in range(1, STEP_ATTEMPTS + 1):
+                    sr.attempts, sent = attempt, len(net.writes)
+                    try:
+                        self._step(page, net, step, sr, journey, run, secrets)
+                        if page.is_closed():
+                            # the step's waits and its snapshot do not fail on a closed page
+                            raise RuntimeError("the page crashed or was closed during the step")
+                        sr.status = "ok"
+                        break
+                    except AmbiguousLocator as exc:
+                        sr.status, sr.error = "failed", str(exc)
+                        run.status, run.failure_kind, run.error = "failed", "ambiguous", str(exc)
+                        return False
+                    except Exception as exc:
+                        sr.status, sr.error = "failed", str(exc).splitlines()[0][:300]
+                        if not context.browser.is_connected():
+                            raise BrowserCrashed(sr.error) from exc  # no step retries in it
+                        if not transport_failure(exc) and not isinstance(exc, ElementNotFound):
+                            raise
+                        kind = "not_found" if isinstance(exc, ElementNotFound) else "transport"
+                        if whole or attempt == STEP_ATTEMPTS:
+                            # a journey that changes state is never repeated one step at a
+                            # time; the journey is the retry unit (spec 6)
+                            run.status, run.failure_kind, run.error = "failed", kind, sr.error
+                            return whole
+                        if not may_repeat(kind, net.writes[sent:]):
+                            # the target wrote where the recording did not
+                            run.status, run.failure_kind, run.error = "failed", kind, sr.error
+                            run.not_repeated = not_repeated("step", net.writes[sent:])
+                            return False
+                        run.flakes.append(
+                            {"step": step.n, "attempt": attempt, "error": sr.error, "unit": "step"}
+                        )
+            run.status = "completed"
+            run.wall_ms = round((time.perf_counter() - began) * 1000, 1)
+            return False
+        finally:
+            net.close()  # before the context is, and not part of the journey's time
 
     def _step(
         self,

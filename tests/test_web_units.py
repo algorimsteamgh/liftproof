@@ -4,15 +4,16 @@ that need no browser."""
 import gc
 import threading
 import weakref
+from types import SimpleNamespace
 
 import pytest
 
 from liftproof.findings import Kind, Severity
 from liftproof.web import correlate, replay
 from liftproof.web import run as webrun
-from liftproof.web.browser import normalise_path
+from liftproof.web.browser import NetworkLog, Write, normalise_path
 from liftproof.web.compare import Comparison, WebOptions
-from liftproof.web.journey import Correlation, Journey, shape
+from liftproof.web.journey import Correlation, Journey, Step, shape
 from liftproof.web.replay import JourneyRun, Replayer
 from liftproof.web.run import REASON_STOPPED, WebResult, run_journeys
 from tests import fakereplay
@@ -247,3 +248,94 @@ def test_a_step_that_flakes_repeatedly_is_reported_with_its_journey(monkeypatch)
 def test_web_results_written_before_this_read_as_complete():
     assert WebResult.from_dict({"target_url": "http://t", "journeys": []}).complete
     assert not WebResult.from_dict(WebResult(complete=False).to_dict()).complete
+
+
+# ------------------------------------------- a failed attempt that sent a write (spec 6, 19)
+@pytest.mark.parametrize(("kind", "writes", "repeat"), [
+    ("not_found", [], True),
+    ("transport", [], True),
+    ("not_found", [("POST /login", 302)], False),
+    ("not_found", [("POST /api/orders", None)], False),  # sent, not answered yet
+    ("transport", [("POST /login", 302), ("POST /api/orders", 201)], True),
+    ("transport", [("POST /api/orders", None)], True),
+    ("transport", [("POST /login", 302), ("POST /api/orders", 500)], False),
+    ("crash", [("PUT /api/cart", 409)], False),
+    ("browser_crash", [("POST /api/orders", 201)], True),
+])  # fmt: skip
+def test_an_attempt_that_sent_a_write_repeats_only_after_a_transport_failure(
+    kind, writes, repeat
+):
+    assert replay.may_repeat(kind, [Write(e, s) for e, s in writes]) is repeat
+
+
+class _Page:
+    """Enough of a page for the network log and the step loop."""
+
+    def __init__(self) -> None:
+        self.handlers = {}
+
+    def route(self, *a) -> None:
+        pass
+
+    def on(self, event, handler) -> None:
+        self.handlers[event] = handler
+
+    def unroute_all(self, **kw) -> None:
+        pass
+
+    def is_closed(self) -> bool:
+        return False
+
+
+def _request(method, path, resource_type="fetch", status=None):
+    """A request the page sends; with a status, the target answers it."""
+    resp = SimpleNamespace(status=status, headers={}, body=lambda: b"") if status else None
+    return SimpleNamespace(method=method, url=f"http://t{path}", resource_type=resource_type,
+                           response=lambda: resp, headers={}, timing={}, post_data=None)
+
+
+def test_a_write_counts_from_when_it_is_sent():
+    """One still unanswered may yet go through; one that failed may have gone through."""
+    page = _Page()
+    net = NetworkLog(page)
+    order, failed = _request("POST", "/api/orders", status=201), _request("DELETE", "/api/cart/42")
+    for req in (order, failed, _request("GET", "/api/orders"), _request("POST", "/b", "ping")):
+        page.handlers["request"](req)
+    assert net.writes == [Write("POST /api/orders"), Write("DELETE /api/cart/{id}")]
+    page.handlers["requestfinished"](order)
+    page.handlers["requestfailed"](failed)
+    net.drain()  # the writes are kept apart from what a step drains
+    assert net.writes == [Write("POST /api/orders", 201), Write("DELETE /api/cart/{id}")]
+
+
+@pytest.mark.parametrize(("status", "error", "repeated"), [
+    (201, RuntimeError("Locator.click: Timeout 15000ms exceeded."), True),
+    (409, RuntimeError("Locator.click: Timeout 15000ms exceeded."), False),
+    (201, replay.ElementNotFound("Confirm"), False),
+])  # fmt: skip
+def test_a_step_that_sent_a_write_repeats_only_as_a_journey_would(
+    monkeypatch, status, error, repeated
+):
+    """A journey recorded without a write is retried a step at a time. When the target
+    writes in that step all the same, what the step sent decides as it would for a
+    journey."""
+    tries = []
+
+    def step(self, page, net, s, sr, j, run, secrets):
+        tries.append(s.n)
+        if len(tries) == 1:
+            net.writes.append(Write("POST /api/cart", status))
+            raise error
+
+    monkeypatch.setattr(Replayer, "_step", step)
+    context = SimpleNamespace(new_page=_Page, browser=SimpleNamespace(is_connected=lambda: True))
+    j = Journey("j", "http://x", steps=[Step(1, "goto", url="/a"), Step(2, "goto", url="/b")])
+    run = JourneyRun("j", attempts=1)
+    assert Replayer("http://t", secret_values=lambda j: {})._steps(context, j, run, {}) is False
+    if repeated:
+        assert (run.status, tries, len(run.flakes), run.not_repeated) == (
+            "completed", [1, 1, 2], 1, None)
+    else:
+        assert (run.status, tries, run.flakes) == ("failed", [1], [])
+        assert run.not_repeated == (f"the step sent POST /api/cart ({status}); running it "
+                                    "again would submit it a second time")

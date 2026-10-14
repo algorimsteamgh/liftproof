@@ -12,6 +12,7 @@ import json
 import secrets
 import threading
 import time
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
@@ -60,11 +61,25 @@ class ShopApp:
     """variant: same | changed. changed renames a status, adds an API field, drops the
     order button's test id (so replay falls back to a weaker locator) and returns 500 for
     a missing order instead of 404. latency_ms delays every response, as a real
-    application across a network does (the performance suite uses it)."""
+    application across a network does (the performance suite uses it).
 
-    def __init__(self, variant: str = "same", latency_ms: int = 0) -> None:
+    posts counts the POSTs that reach it, by path. post_status and post_delay_ms (by path)
+    change the answer to a write it has already stored: its status, and how long it takes.
+    GET /dropped closes the connection without an answer."""
+
+    def __init__(
+        self,
+        variant: str = "same",
+        latency_ms: int = 0,
+        *,
+        post_status: dict[str, int] | None = None,
+        post_delay_ms: dict[str, int] | None = None,
+    ) -> None:
         self.variant = variant
         self.latency_ms = latency_ms
+        self.post_status = post_status or {}
+        self.post_delay_ms = post_delay_ms or {}
+        self.posts: Counter[str] = Counter()
         self.orders: dict[str, dict] = {}
         self.sessions: set[str] = set()
         self.csrf: set[str] = set()
@@ -97,6 +112,8 @@ class ShopApp:
             def _respond(self, status, body, ctype, headers):
                 if app.latency_ms:
                     time.sleep(app.latency_ms / 1000)
+                if self.command == "POST" and self.path in app.post_delay_ms:
+                    time.sleep(app.post_delay_ms[self.path] / 1000)
                 data = body.encode() if isinstance(body, str) else body
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)
@@ -112,6 +129,8 @@ class ShopApp:
 
             def do_GET(self):
                 path = self.path.split("?")[0]
+                if path == "/dropped":
+                    return  # the connection closes with nothing sent
                 if path in ("/", "/login"):
                     token = secrets.token_hex(16)
                     app.csrf.add(token)
@@ -134,6 +153,8 @@ class ShopApp:
                 return self._send(404, "not found")
 
             def do_POST(self):
+                with app._lock:
+                    app.posts[self.path] += 1
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length).decode()
                 if self.path == "/login":
@@ -155,7 +176,8 @@ class ShopApp:
                         body = (f'{{"id": {oid}, "item": "{item}", "status": "OPEN", '
                                 f'"total": 10.50, "placed_at": "{placed}"}}')
                     app.orders[oid] = body
-                    return self._send(201, body, "application/json")
+                    return self._send(app.post_status.get(self.path, 201), body,
+                                      "application/json")
                 return self._send(403, "{}", "application/json")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

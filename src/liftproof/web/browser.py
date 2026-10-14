@@ -99,6 +99,15 @@ class Captured:
     request_body: str | None
 
 
+@dataclass
+class Write:
+    """A state changing request the page sent, and the status it was answered with: None
+    while it is in flight, and for one that failed."""
+
+    endpoint: str
+    status: int | None = None
+
+
 class NetworkLog:
     """Collects requests as they finish.
 
@@ -108,10 +117,13 @@ class NetworkLog:
     """
 
     def __init__(self, page: Any) -> None:
+        self.page = page
         self._pending: list[tuple[Any, Any, bytes | None]] = []
         self._fetched: dict[int, tuple[bytes | None, float]] = {}
         self._open: set[int] = set()
+        self._writes: dict[int, Write] = {}
         self.started = 0  # requests begun so far: a change means the page did more
+        self.writes: list[Write] = []  # every one sent, in order; drain() leaves them
         page.route("**/*", self._route)
         page.on("request", self._begin)
         page.on("requestfinished", self._add)
@@ -125,6 +137,11 @@ class NetworkLog:
         if req.resource_type in CAPTURED_TYPES:
             self._open.add(id(req))
             self.started += 1
+            if req.method in WRITE_METHODS:
+                # counted as it is sent: one still unanswered may yet go through
+                write = Write(f"{req.method} {normalise_path(path_of(req.url))}")
+                self._writes[id(req)] = write
+                self.writes.append(write)
 
     def _route(self, route: Any) -> None:
         req = route.request
@@ -152,7 +169,18 @@ class NetworkLog:
                 body = resp.body()
         except Exception:  # noqa: BLE001, S110 - failed requests and redirects have no body
             pass
+        write = self._writes.pop(id(req), None)
+        if write is not None and resp is not None:
+            write.status = resp.status
         self._pending.append((req, resp, body))
+
+    def close(self) -> None:
+        """Let the requests being fetched through the route finish: closing the page, or
+        its context, while one is in flight sends it to the server a second time."""
+        try:
+            self.page.unroute_all(behavior="wait")
+        except Exception:  # noqa: BLE001, S110 - the page or its browser has gone
+            pass
 
     def drain(self) -> list[Captured]:
         pending, self._pending[:] = list(self._pending), []

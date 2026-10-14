@@ -8,6 +8,7 @@ or else the next one made to the browser.
 """
 
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,13 +65,24 @@ class Context:
 
 class Page:
     def __init__(self, browser: Browser) -> None:
-        self.browser, self.closed = browser, False
+        self.browser, self.closed, self.handlers = browser, False, {}
 
     def route(self, *a) -> None:
         pass
 
-    def on(self, *a) -> None:
+    def unroute_all(self, **kw) -> None:
         pass
+
+    def on(self, event, handler) -> None:
+        self.handlers[event] = handler
+
+    def send(self, method: str, path: str, status: int) -> None:
+        """The page sends a request, which the target answers."""
+        resp = SimpleNamespace(status=status, headers={}, body=lambda: b"")
+        req = SimpleNamespace(resource_type="fetch", method=method, response=lambda: resp,
+                              url=f"http://target.invalid{path}")  # fmt: skip
+        self.handlers["request"](req)
+        self.handlers["requestfinished"](req)
 
     def is_closed(self) -> bool:
         return self.closed or not self.browser.connected
@@ -263,6 +275,34 @@ def test_a_crash_on_the_last_attempt_is_retried_in_a_new_browser(monkeypatch, la
         [error] = errors
         assert b.status == "failed" and error.detail["attempts"] == 3
         assert error.summary == "the browser process crashed during this journey"
+
+
+@pytest.mark.parametrize("dies", ["page", "browser"])
+@pytest.mark.parametrize(("status", "attempts"), [(201, 2), (503, 1)])
+def test_a_crash_after_a_write_answered_with_an_error_is_not_repeated(
+    monkeypatch, launched, dies, status, attempts
+):
+    """Spec 6 and 19: the write may have gone through all the same, so not even a crash,
+    otherwise retried (spec 18), runs the journey again."""
+
+    def act(j, n, attempt, page):
+        if n == 2:
+            page.send("POST", "/api/orders", status)
+            if dies == "browser":
+                crash(page)
+            raise RuntimeError("Page.click: Target crashed")
+
+    scripted(monkeypatch, act)
+    result, findings = replay_all([journey("b", writes=True)])
+    [b] = result.journeys
+    assert (b.status, b.attempts) == ("failed", attempts)
+    assert b.browser_crashes == (attempts if dies == "browser" else 0)
+    [error] = [f for f in findings if f.kind == Kind.ERROR]
+    if status < 400:
+        assert "not_repeated" not in error.detail
+    else:
+        assert error.detail["not_repeated"] == ("the journey sent POST /api/orders (503); "
+                                                "running it again would submit it a second time")
 
 
 def test_a_closed_page_in_a_live_browser_keeps_the_crash_path(monkeypatch, launched):

@@ -1,4 +1,4 @@
-"""Record and replay end to end (PRD F1, F3, F4, F5; Technical Spec 5 to 8 and 18).
+"""Record and replay end to end (PRD F1, F3, F4, F5; Technical Spec 5 to 8, 18 and 19).
 
 A journey is recorded against the sample shop, then replayed against a second copy of
 the shop: unchanged, and deliberately changed. Ids, CSRF tokens and timestamps differ
@@ -12,6 +12,7 @@ import signal
 import sys
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,7 @@ from liftproof.errors import ConfigError
 from liftproof.findings import Comparator, Kind
 from liftproof.web.browser import BodyPolicy, launch
 from liftproof.web.compare import WebOptions
-from liftproof.web.journey import Journey
+from liftproof.web.journey import Journey, Locator, Step
 from liftproof.web.recorder import Recorder
 from liftproof.web.replay import JourneyRun, Replayer
 from liftproof.web.run import run_journeys
@@ -49,9 +50,10 @@ def recorded(browser_available, tmp_path_factory):
     return journey, assets_dir
 
 
-def replay(journey, assets_dir, variant, *, secrets=None, timeout=10_000):
+def replay(journey, assets_dir, variant, *, secrets=None, timeout=10_000, posts=None, **app):
+    """posts, when given, gets the POSTs that reached the target, by path."""
     findings = []
-    with ShopApp(variant) as target:
+    with ShopApp(variant, **app) as target:
         result = run_journeys(
             [journey],
             target_url=target.url,
@@ -61,7 +63,16 @@ def replay(journey, assets_dir, variant, *, secrets=None, timeout=10_000):
             secret_values=secrets or (lambda j: {t: PASSWORD for t in j.secrets}),
             step_timeout_ms=timeout,
         )
+    if posts is not None:
+        posts.update(target.posts)
     return result, findings
+
+
+def with_step(journey, action, **step):
+    """The journey with one more step after the order is placed."""
+    j = copy.deepcopy(journey)
+    j.steps.append(Step(len(j.steps) + 1, action, **step))
+    return j
 
 
 def test_recording_redacts_and_correlates(recorded):
@@ -121,14 +132,79 @@ def test_unbound_secret_means_not_run(recorded):
 def test_missing_element_is_a_difference_and_the_journey_is_the_retry_unit(recorded):
     journey, assets = recorded
     j = copy.deepcopy(journey)
-    j.steps[4].locator.candidates = [{"kind": "label", "value": "Product code"}]
-    result, findings = replay(j, assets, "same", timeout=1500)
+    j.steps[1].locator.candidates = [{"kind": "label", "value": "Login name"}]  # before a write
+    posts = Counter()
+    result, findings = replay(j, assets, "same", timeout=1500, posts=posts)
     [r] = result.journeys
     assert r.status == "different" and r.attempts == 2  # non idempotent: whole journey
     assert any(f.kind == Kind.FLAKE and f.detail.get("unit") == "journey" for f in findings)
     assert any(
         f.summary == "element the journey uses was not found on the target" for f in findings
     )
+    assert posts == Counter()
+
+
+# Spec 19: a failed assertion never triggers a retry that submits a second transaction.
+def test_a_failed_comparison_never_submits_the_order_twice(recorded):
+    journey, assets = recorded
+    posts = Counter()
+    result, findings = replay(journey, assets, "changed", posts=posts)
+    [r] = result.journeys
+    assert (r.status, r.attempts, r.flakes) == ("different", 1, 0)
+    got = {(f.object, f.summary) for f in findings if f.kind == Kind.DIFFERENCE}
+    assert ("POST /api/orders", "value of $.status differs") in got
+    assert posts["/api/orders"] == 1 and not [f for f in findings if f.kind == Kind.FLAKE]
+
+
+def test_a_missing_element_after_the_order_never_submits_it_twice(recorded):
+    journey, assets = recorded
+    confirmed = Locator([{"kind": "text", "value": "Order confirmed"}], "Order confirmed")
+    j = with_step(journey, "click", locator=confirmed)
+    posts = Counter()
+    result, findings = replay(j, assets, "same", timeout=1500, posts=posts)
+    [r] = result.journeys
+    assert (r.status, r.attempts, r.flakes) == ("different", 1, 0)
+    assert posts["/api/orders"] == 1
+    [missing] = [f for f in findings if f.summary.startswith("element the journey uses")]
+    assert missing.locator == "step 7"
+    assert "POST /login (302), POST /api/orders (201)" in missing.detail["not_repeated"]
+
+
+@pytest.mark.parametrize("missing_step", [False, True])
+def test_a_slow_order_is_submitted_once(recorded, missing_step):
+    """The order is answered seconds after the step that placed it has timed out. Closing
+    the journey's page while it was still being fetched sent it to the target again."""
+    journey, assets = recorded
+    if missing_step:
+        confirmed = Locator([{"kind": "text", "value": "Order confirmed"}], "Order confirmed")
+        journey = with_step(journey, "click", locator=confirmed)
+    posts = Counter()
+    result, findings = replay(journey, assets, "same", timeout=1500, posts=posts,
+                              post_delay_ms={"/api/orders": 5000})  # fmt: skip
+    [r] = result.journeys
+    assert (r.status, r.attempts) == ("different", 1)
+    assert posts == Counter({"/login": 1, "/api/orders": 1})
+    if missing_step:  # decided once the order was answered
+        [missing] = [f for f in findings if f.summary.startswith("element the journey uses")]
+        assert "POST /api/orders (201)" in missing.detail["not_repeated"]
+
+
+@pytest.mark.parametrize(("status", "attempts"), [(None, 2), (500, 1)])
+def test_a_transport_failure_after_the_order_repeats_it_only_when_it_succeeded(
+    recorded, status, attempts
+):
+    """Spec 6: a transport failure is retried, the whole journey being the unit, but never
+    after a write the target answered with an error, which may have gone through."""
+    journey, assets = recorded
+    j = with_step(journey, "goto", url="/dropped")
+    posts = Counter()
+    result, findings = replay(j, assets, "same", timeout=3000, posts=posts,
+                              post_status={"/api/orders": status} if status else None)  # fmt: skip
+    [r] = result.journeys
+    assert (r.status, r.attempts) == ("failed", attempts)
+    assert posts["/api/orders"] == attempts  # one order an attempt, never two in one
+    [error] = [f for f in findings if f.kind == Kind.ERROR]
+    assert ("not_repeated" in error.detail) == (status is not None)
 
 
 def test_ambiguous_locator_is_never_acted_on(recorded):

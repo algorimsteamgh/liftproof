@@ -77,6 +77,9 @@ def _failure_finding(j: Journey, run: JourneyRun) -> Finding:
     obj = j.journey_id
     failed = next((s for s in run.steps if s.status == "failed"), None)
     where = f"step {failed.n}" if failed else None
+    detail: dict[str, Any] = {"error": run.error, "attempts": run.attempts}
+    if run.not_repeated:
+        detail["not_repeated"] = run.not_repeated  # it sent a write (spec 6 and 19)
     match run.failure_kind:
         case "not_found":
             return Finding(
@@ -88,7 +91,7 @@ def _failure_finding(j: Journey, run: JourneyRun) -> Finding:
                 locator=where,
                 journey=obj,
                 story=j.story,
-                detail={"error": run.error, "attempts": run.attempts},
+                detail=detail,
             )
         case "ambiguous":
             return Finding(
@@ -122,11 +125,7 @@ def _failure_finding(j: Journey, run: JourneyRun) -> Finding:
                 locator=where,
                 journey=obj,
                 story=j.story,
-                detail={
-                    "error": run.error,
-                    "attempts": run.attempts,
-                    "browser_crashes": run.browser_crashes,
-                },
+                detail={**detail, "browser_crashes": run.browser_crashes},
             )
         case _:
             return Finding(
@@ -138,7 +137,7 @@ def _failure_finding(j: Journey, run: JourneyRun) -> Finding:
                 locator=where,
                 journey=obj,
                 story=j.story,
-                detail={"error": run.error, "attempts": run.attempts},
+                detail=detail,
             )
 
 
