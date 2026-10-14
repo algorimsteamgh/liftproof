@@ -14,6 +14,7 @@ from liftproof.errors import ConfigError
 from liftproof.findings import FindingWriter
 from liftproof.reconcile.baseline import take_baseline
 from liftproof.reconcile.engine import ReconcileOptions, Reconciler
+from liftproof.reconcile.plan import plan_table
 from tests.conftest import PG, _ms_connect, _my_connect
 
 
@@ -108,6 +109,21 @@ def test_a_statement_learns_how_much_it_read():
     with p.statement(100) as s:
         s.rows = 3000
     assert p.charged == 3000
+
+
+def test_a_statement_that_reads_the_table_again_pays_for_each_read():
+    p, c = _pacer(1000, pause_ms=50)
+    with p.statement(2000):
+        c.now += 0.5
+        p.again()  # the rows the database cannot hash, streamed here
+        assert c.slept == [1.5]  # the first read is paid for before the second starts
+        list(p.each(range(10)))
+    assert p.charged == 4000
+    with p.statement(0):
+        pass
+    assert c.slept == [1.5, 2.0]
+    p.again()  # no statement running: nothing to charge
+    assert p.charged == 4000
 
 
 # ---------------------------------------------------------------------- the settings
@@ -297,6 +313,67 @@ def test_a_capped_postgresql_connection_reads_on_one_core(pg_pair, adapter_for):
 
 
 # ------------------------------------------------------------------- other engines
+OTHER_TABLES = {
+    "mysql": "CREATE TABLE t (id int PRIMARY KEY, name varchar(20))",
+    "oracle": "CREATE TABLE t (id NUMBER(10) PRIMARY KEY, name VARCHAR2(20))",
+    "sqlserver": "CREATE TABLE t (id int PRIMARY KEY, name nvarchar(20))",
+}
+
+
+@pytest.fixture(params=list(OTHER_TABLES))
+def other(request):
+    """A database of another engine holding t, ROWS rows with text, one not ASCII:
+    (the engine, limits -> an adapter on it, t's schema)."""
+    name = request.param
+    request.applymarker(getattr(pytest.mark, name))
+    where, cur = request.getfixturevalue(f"make_{name}_db")("pace")
+    cur.execute(OTHER_TABLES[name])
+    marks = ":1, :2" if name == "oracle" else "%s, %s"
+    rows = [(i, "café" if i == 7 else f"n{i}") for i in range(1, ROWS + 1)]
+    cur.executemany(f"INSERT INTO t VALUES ({marks})", rows)
+    factory = request.getfixturevalue(f"{name}_adapter_for")
+    if name == "oracle":  # one database: the adapter reads every schema
+        return name, factory, where
+    return name, lambda **kw: factory(where, **kw), "dbo" if name == "sqlserver" else where
+
+
+def test_each_connection_is_paced_and_reported_as_it_applies_the_limits(other):
+    name, connect, _ = other
+    a = connect(rows_per_second=1000, pause_ms=20, lock_timeout_ms=200)
+    b = a.fork()
+    try:
+        assert b.pacer is not a.pacer
+        assert (a.pacer.rate, a.pacer.pause) == (b.pacer.rate, b.pacer.pause) == (1000, 0.02)
+        # MySQL waits whole seconds; Oracle queries take no locks
+        lock = {"mysql": 1000, "oracle": "not applicable", "sqlserver": 200}[name]
+        assert a.protection() == b.protection() == {
+            "rows_per_second": 1000, "pause_ms": 20, "statement_timeout_ms": 0,
+            "lock_timeout_ms": lock,
+        }  # fmt: skip
+    finally:
+        b.close()
+
+
+def test_rows_hashed_here_are_another_read_of_the_table(other):
+    """Outside PostgreSQL a table with text is hashed in two statements: the rows the
+    database renders exactly, then the rest streamed here, which is another scan."""
+    _, connect, schema = other
+    a = connect(rows_per_second=1000, pause_ms=20)
+    c = _paced(a, 1000, 20)
+    [t] = a.list_tables([schema])
+    plan = plan_table(a.describe(t), None, rows=ROWS, rows_per_bucket=500, precision=6,
+                      ignore=[], business_key=None, side="source").plan  # fmt: skip
+    with a.pacer.statement(ROWS):  # as the engine reads the aggregate
+        aggs = a.bucket_aggregates(plan)
+    assert sum(x.count for x in aggs.values()) == ROWS
+    assert a.pacer.charged == 2 * ROWS
+    assert c.slept == [2.0]  # the second read waits for the first one's rows
+    found = dict(a.paced_bucket_rows(plan, set(range(plan.buckets)), ROWS))
+    assert sum(len(rows) for rows in found.values()) == ROWS
+    assert a.pacer.charged == 2 * ROWS * (1 + plan.buckets)  # two reads a drill-down pass
+    assert len(c.slept) == 1 + 2 * plan.buckets
+
+
 @pytest.mark.mysql
 def test_mysql_lock_wait_timeout_and_one_thread(make_mysql_db, mysql_adapter_for):
     import pymysql
@@ -395,4 +472,3 @@ def test_oracle_accepts_the_settings_and_reads_serially(oracle_adapter_for):
     assert (settings["rows_per_second"], settings["pause_ms"]) == ("1000", "20")
     q = "SELECT pq_status FROM v$session WHERE sid = SYS_CONTEXT('USERENV', 'SID')"
     assert a._query(q)[0][0] == "DISABLED"
-

@@ -121,6 +121,8 @@ def in_list(expr: str, values: Sequence[int], chunk: int | None = None) -> str:
 @dataclass
 class Statement:
     rows: int  # rows the statement reads; raised in the block once more is known
+    start: float = 0.0  # when its latest read began
+    before: int = 0  # rows charged before its latest read
 
 
 class Pacer:
@@ -149,6 +151,7 @@ class Pacer:
         self.waited = 0.0  # seconds spent waiting
         self._paid = -math.inf  # when the rows charged so far fit under the cap
         self._ended = -math.inf  # when the last statement ended
+        self._open: Statement | None = None  # the statement running now
 
     def _wait(self, until: float) -> None:
         delay = until - self.clock()
@@ -167,14 +170,31 @@ class Pacer:
     def statement(self, rows: int = 0) -> Iterator[Statement]:
         """Around one statement: waits for the rows before it and the pause, then charges
         what it read, less what a stream inside it already paid."""
-        self._wait(max(self._paid, self._ended + self.pause))
-        s = Statement(rows)
-        start, before = self.clock(), self.charged
+        s, outer = Statement(rows), self._open
+        self._begin(s)
+        self._open = s
         try:
             yield s
         finally:
-            self._ended = self.clock()
-            self._charge(start, s.rows - (self.charged - before))
+            self._open = outer
+            self._end(s)
+
+    def again(self) -> None:
+        """The statement running now reads the table again, as a statement of its own (an
+        adapter that hashes most rows in the database, then streams the rest to hash
+        here): the first read is paid for, and the pause kept, before the second starts,
+        which is charged the same rows."""
+        if self._open is not None:
+            self._end(self._open)
+            self._begin(self._open)
+
+    def _begin(self, s: Statement) -> None:
+        self._wait(max(self._paid, self._ended + self.pause))
+        s.start, s.before = self.clock(), self.charged
+
+    def _end(self, s: Statement) -> None:
+        self._ended = self.clock()
+        self._charge(s.start, s.rows - (self.charged - s.before))
 
     def each(self, rows: Iterable[Any], batch: int = 1000) -> Iterator[Any]:
         """Rows streamed here to be hashed, charged a batch at a time as they arrive."""
@@ -195,7 +215,6 @@ class Pacer:
 
 
 UNPACED = Pacer()  # an adapter that never set its own: no cap, no pause
-PROTECTION = ("rows_per_second", "pause_ms", "statement_timeout_ms", "lock_timeout_ms")
 
 
 class Adapter(abc.ABC):
@@ -207,6 +226,7 @@ class Adapter(abc.ABC):
     version: str = ""
     # spec 9.15: every statement that reads a table goes through this connection's pacer
     pacer: Pacer = UNPACED
+    lock_timeout_ms: int | str = 0  # as the connection applies it; 0: none
 
     def require_version(self, found: str) -> None:
         """Refuse a server older than the oldest supported when connecting, rather than
@@ -299,11 +319,16 @@ class Adapter(abc.ABC):
         """Pinned session parameters, recorded in the manifest."""
         return {}
 
-    def protection(self) -> dict[str, int]:
-        """What limits this connection's load on its database (spec 9.15), for the report;
-        0 is off."""
+    def protection(self) -> dict[str, Any]:
+        """What limits this connection's load on its database (spec 9.15), as applied, for
+        the report; 0 is off."""
         given = getattr(self, "_kwargs", {})
-        return {k: int(given.get(k) or 0) for k in PROTECTION}
+        return {
+            "rows_per_second": self.pacer.rate,
+            "pause_ms": round(self.pacer.pause * 1000),
+            "statement_timeout_ms": int(given.get("statement_timeout_ms") or 0),  # as given
+            "lock_timeout_ms": self.lock_timeout_ms,
+        }
 
     # replication position (spec 9.2) -----------------------------------------------
     # Engines that cannot answer leave these as they are; the check then reports that

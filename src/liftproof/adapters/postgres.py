@@ -199,6 +199,7 @@ class PostgresAdapter(Adapter):
         self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
         self.pacer = Pacer(rows_per_second, pause_ms)
+        self.lock_timeout_ms = lock_timeout_ms
         settings = dict(
             SESSION, statement_timeout=str(statement_timeout_ms), lock_timeout=str(lock_timeout_ms)
         )

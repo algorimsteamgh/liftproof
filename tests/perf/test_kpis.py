@@ -117,6 +117,13 @@ SELECT g, g % 50000, (ARRAY['OPEN','PAID','SHIPPED','CLOSED'])[1 + g % 4],
 FROM generate_series(1, {rows}) g;
 ANALYZE orders;
 """
+# A second table like the first. Each table after the first in a run starts by paying for
+# the last read of the one before it (spec 9.15), so the throughput KPI is timed on it.
+SECOND = """
+CREATE TABLE orders_copy (LIKE orders INCLUDING ALL);
+INSERT INTO orders_copy SELECT * FROM orders;
+ANALYZE orders_copy;
+"""
 
 
 @pytest.fixture(scope="module")
@@ -136,6 +143,7 @@ def big_pair(pg_available):
         conn = psycopg.connect(host=PG["host"], port=PG["port"], user=PG["user"],
                                password=PG["password"], dbname=n, autocommit=True)  # fmt: skip
         conn.execute(TABLE.format(rows=ROWS))
+        conn.execute(SECOND)
         conns.append(conn)
     width = conns[0].execute("SELECT avg(pg_column_size(o.*))::int FROM orders o").fetchone()[0]
     yield names, conns, width
@@ -155,23 +163,36 @@ SHIPPED = (
 )  # fmt: skip
 
 
-def _reconcile(tmp_path, adapter_for, names, settings=({}, {})):
+def _reconcile(tmp_path, adapter_for, names, settings=({}, {}), tables=("orders",)):
+    """The run's result, its seconds, and each table's seconds as the run log times them:
+    from the table's start to the next one's, the last one's to the end of the run."""
     source, target = (adapter_for(n, **kw) for n, kw in zip(names, settings, strict=True))
     writer = FindingWriter(tmp_path / "findings", "r-perf")
+    starts: list[float] = []
+
+    def progress(message: str) -> None:
+        if message.startswith("reconciling"):
+            starts.append(time.perf_counter())
+
     t0 = time.perf_counter()
-    result = Reconciler(target, writer, ReconcileOptions(), source=source).run()
-    elapsed = time.perf_counter() - t0
+    result = Reconciler(
+        target, writer, ReconcileOptions(tables=list(tables)), source=source, progress=progress
+    ).run()
+    end = time.perf_counter()
     writer.close()
-    return result, elapsed
+    return result, end - t0, [b - a for a, b in zip(starts, [*starts[1:], end], strict=True)]
 
 
 def test_kpi_database_throughput(tmp_path, adapter_for, big_pair, kpi):
     """At least 1 million rows per minute per table, stated with its variables
-    (Technical Spec 17): column count, average row width, rows, cores, both sides read."""
+    (Technical Spec 17): column count, average row width, rows, cores, both sides read.
+    The slowest of two tables counts: the second also pays for the first one's last read,
+    as every table after the first does."""
     names, _, width = big_pair
-    result, elapsed = _reconcile(tmp_path, adapter_for, names, SHIPPED)
-    assert [t.status for t in result.tables] == ["matched"]
-    per_minute = ROWS / elapsed * 60
+    tables = ("orders", "orders_copy")
+    result, _, seconds = _reconcile(tmp_path, adapter_for, names, SHIPPED, tables)
+    assert [t.status for t in result.tables] == ["matched", "matched"]
+    per_minute = ROWS / max(seconds) * 60
     kpi(
         "database_throughput",
         value=round(per_minute),
@@ -180,7 +201,7 @@ def test_kpi_database_throughput(tmp_path, adapter_for, big_pair, kpi):
         rows=ROWS,
         columns=10,
         avg_row_bytes=width,
-        seconds=round(elapsed, 2),
+        seconds=[round(x, 2) for x in seconds],
         engine="postgresql, hash pushdown",
         source_rows_per_second=SOURCE_ROWS_PER_SECOND,
         source_pause_ms=SOURCE_PAUSE_MS,
@@ -196,7 +217,7 @@ def test_large_table_drill_down_streams(tmp_path, adapter_for, big_pair, kpi):
     conns[1].execute("UPDATE orders SET status = 'LOST' WHERE id % 50000 = 0")  # 20 rows
     try:
         before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        result, elapsed = _reconcile(tmp_path, adapter_for, names)
+        result, elapsed, _ = _reconcile(tmp_path, adapter_for, names)
         grown_mb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) / 1024
     finally:
         conns[1].execute("UPDATE orders SET status = 'CLOSED' WHERE id % 50000 = 0")

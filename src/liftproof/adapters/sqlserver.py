@@ -330,7 +330,8 @@ class SQLServerAdapter(Adapter):
         self._natives: dict[TableRef, dict[str, str]] = {}
         self._in_snapshot = False  # before anything that can close() the adapter
         # SQL Server's 0 is "never wait"; no limit is -1
-        stmts = [*SESSION, f"SET LOCK_TIMEOUT {int(lock_timeout_ms) or -1}"]
+        self.lock_timeout_ms = int(lock_timeout_ms)
+        stmts = [*SESSION, f"SET LOCK_TIMEOUT {self.lock_timeout_ms or -1}"]
         with self.conn.cursor() as cur:
             for stmt in stmts:
                 cur.execute(stmt)
@@ -569,7 +570,8 @@ class SQLServerAdapter(Adapter):
             f"FROM ({self._hash_query(plan, pushable)}) a{sample} GROUP BY b"
         )
         out = {int(b): BucketAggregate(int(c), int(t)) for b, c, t in self._query(q)}
-        if pushable:
+        if pushable:  # another read of the table (spec 9.15)
+            self.pacer.again()
             self._bucket_aggregates_fallback(plan, where=f"NOT ({pushable})", into=out)
         return out
 
@@ -629,7 +631,8 @@ class SQLServerAdapter(Adapter):
         marks = ", ".join(str(int(b)) for b in sorted(wanted))
         q = f"SELECT rh{keys} FROM ({self._hash_query(plan, pushable)}) a WHERE b IN ({marks})"
         rows = [(tuple(r[1:]), r[0]) for r in self._query(q)]
-        if pushable:
+        if pushable:  # another read of the table (spec 9.15)
+            self.pacer.again()
             rows += self._fallback_row_hashes(plan, wanted, where=f"NOT ({pushable})")
         yield from rows
 

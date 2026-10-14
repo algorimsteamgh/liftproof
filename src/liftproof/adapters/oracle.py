@@ -330,6 +330,7 @@ class OracleAdapter(Adapter):
         # Queries read the version current when they started and take no row or table
         # lock, so no writer makes one wait: lock_timeout_ms has nothing to set.
         self._settings["lock_timeout"] = "not applicable: Oracle queries take no locks"
+        self.lock_timeout_ms = "not applicable"
         if rows_per_second:
             self._settings["parallel_query"] = "disabled"
         self._settings.update(rows_per_second=str(rows_per_second), pause_ms=str(pause_ms))
@@ -548,7 +549,8 @@ class OracleAdapter(Adapter):
             f"FROM ({self._hash_query(plan, pushable)})){sample} GROUP BY b"
         )
         out = {int(b): BucketAggregate(int(c), int(t)) for b, c, t in self._query(q)}
-        if pushable:
+        if pushable:  # another read of the table (spec 9.15)
+            self.pacer.again()
             self._bucket_aggregates_fallback(plan, where=f"NOT ({pushable})", into=out)
         return out
 
@@ -620,7 +622,8 @@ class OracleAdapter(Adapter):
             f"WHERE {in_list(bucket, sorted(wanted), IN_LIST)}"
         )
         rows = [(tuple(r[2:]), r[0]) for r in self._query(q)]
-        if pushable:
+        if pushable:  # another read of the table (spec 9.15)
+            self.pacer.again()
             rows += self._fallback_row_hashes(plan, wanted, where=f"NOT ({pushable})")
         yield from rows
 

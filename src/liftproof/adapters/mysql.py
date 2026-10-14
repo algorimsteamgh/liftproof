@@ -298,6 +298,7 @@ class MySQLAdapter(Adapter):
         protect = {}
         if lock_timeout_ms:  # whole seconds, at least one; it covers metadata locks
             protect["lock_wait_timeout"] = math.ceil(lock_timeout_ms / 1000)
+        self.lock_timeout_ms = protect.get("lock_wait_timeout", 0) * 1000
         if rows_per_second:  # one thread: the cap is per connection
             protect["innodb_parallel_read_threads"] = 1
         with self.conn.cursor() as cur:
@@ -519,7 +520,8 @@ class MySQLAdapter(Adapter):
             f"FROM ({self._hash_query(plan, ascii_rows)}) h{sample} GROUP BY b"
         )
         out = {int(b): BucketAggregate(int(c), int(t)) for b, c, t in self._query(q)}
-        if ascii_rows:
+        if ascii_rows:  # another read of the table (spec 9.15)
+            self.pacer.again()
             self._bucket_aggregates_fallback(plan, where=f"NOT ({ascii_rows})", into=out)
         return out
 
@@ -580,7 +582,8 @@ class MySQLAdapter(Adapter):
             f"WHERE MOD({unsigned64_sql('kh')}, {int(plan.buckets)}) IN ({marks})"
         )
         rows = [(tuple(r[2:]), r[0]) for r in self._query(q)]
-        if ascii_rows:
+        if ascii_rows:  # another read of the table (spec 9.15)
+            self.pacer.again()
             rows += self._fallback_row_hashes(plan, wanted, where=f"NOT ({ascii_rows})")
         yield from rows
 

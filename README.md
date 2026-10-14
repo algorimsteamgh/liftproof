@@ -46,7 +46,7 @@ Each connection has its own limits, whole numbers where 0 turns one off:
 
 | Setting | Source default | Target default | What it limits |
 |---|---|---|---|
-| `rows_per_second` | 50000 | 0 | rows read a second by one connection, over its statements |
+| `rows_per_second` | 75000 | 0 | rows read a second by one connection, over its statements |
 | `pause_ms` | 100 | 0 | the least time between two statements on a connection |
 | `lock_timeout_ms` | 10000 | 10000 | how long a read waits for a lock before the run fails |
 | `statement_timeout_ms` | 0 (`init` writes 600000) | 0 | how long one statement may run |
@@ -58,15 +58,19 @@ values. A connection pays before its next statement, so nothing waits after the 
 and idle time earns no credit. The database runs each statement at its own speed, which
 `statement_timeout_ms` bounds; rows Liftproof hashes itself (JSON columns, and rows with
 non-ASCII text outside PostgreSQL) are charged as they stream, which slows the read
-itself. A capped connection runs each statement on one core (PostgreSQL
-`max_parallel_workers_per_gather = 0`, SQL Server `OPTION (MAXDOP 1)`, Oracle `DISABLE
-PARALLEL QUERY`, MySQL `innodb_parallel_read_threads = 1`), so the load is the cap times
-`database.workers`, each worker being another connection. With the defaults a matched
-table costs three reads (count, aggregate, ranges; `database.ranges: false` saves one), so
-a source connection gets through about a million rows a minute. The pause falls between
-tables, and between the buckets a drill-down reads one pass at a time: on MySQL, Oracle
-and SQL Server, and for tables without a key everywhere. PostgreSQL drills into every
-differing bucket in one pass and is not paused inside it.
+itself. On MySQL, SQL Server and Oracle a table with text (on Oracle also exact numbers or
+binary) is hashed in two statements, each a read of the table: the rows the database
+renders exactly, then the rest, streamed here. Its aggregate and each drill-down pass are
+charged twice, with the pause between. A capped connection runs each statement on one core
+(PostgreSQL `max_parallel_workers_per_gather = 0`, SQL Server `OPTION (MAXDOP 1)`, Oracle
+`DISABLE PARALLEL QUERY`, MySQL `innodb_parallel_read_threads = 1`), so the load is the
+cap times `database.workers`, each worker being another connection. With the defaults a
+matched table costs three reads (count, aggregate, ranges; `database.ranges: false` saves
+one), so a source connection gets through at most 1.5 million rows of table a minute
+(PostgreSQL measured about 1.2 million, docs/kpis.md); one whose aggregate takes two costs
+four. The pause falls between tables, and between the buckets a drill-down reads one pass
+at a time: on MySQL, Oracle and SQL Server, and for tables without a key everywhere.
+PostgreSQL drills into every differing bucket in one pass and is not paused inside it.
 
 The lock timeout is PostgreSQL's `lock_timeout`, SQL Server's `SET LOCK_TIMEOUT` (0 in
 the project file is SQL Server's -1, wait), and MySQL's `lock_wait_timeout` in whole
@@ -95,8 +99,9 @@ PostgreSQL and MySQL have no governor; a replica is how the load stays off the p
 
 After cutover the target is production: give `target` a cap and a pause too, before
 `rebaseline` and scheduled regression runs. The report's run block records the limits of
-each database the run read (`source_protection`; no `source` entry when the source was
-not read).
+each database the run read, as its connections apply them (`source_protection`: MySQL's
+lock timeout rounded up to whole seconds, Oracle's not applicable; no `source` entry when
+the source was not read).
 
 ## Record and replay
 
