@@ -7,6 +7,10 @@ between the two on every run, as they would between a source and its migrated ta
 
 import copy
 import json
+import os
+import signal
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +20,7 @@ from liftproof.web.browser import BodyPolicy
 from liftproof.web.compare import WebOptions
 from liftproof.web.journey import Journey
 from liftproof.web.recorder import Recorder
+from liftproof.web.replay import JourneyRun, Replayer
 from liftproof.web.run import run_journeys
 from tests.webapp import PASSWORD, ShopApp
 
@@ -133,6 +138,80 @@ def test_ambiguous_locator_is_never_acted_on(recorded):
     assert r.status == "failed" and r.attempts == 1
     [err] = [f for f in findings if f.kind == Kind.ERROR]
     assert err.summary.startswith("ambiguous locator")
+
+
+def kill_browser():
+    """SIGKILL the Chromium this process started, as a crash ends it: its main process is
+    the one given the debugging pipe, its helpers carry --type."""
+    parents = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            pid, rest = stat.read_text().split(" ", 1)
+            parents[int(pid)] = int(rest.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    for pid in parents:
+        ancestor = parents[pid]
+        while ancestor > 1 and ancestor != os.getpid():
+            ancestor = parents.get(ancestor, 0)
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if ancestor > 1 and b"--remote-debugging-pipe" in cmd and b"--type=" not in cmd:
+            os.kill(pid, signal.SIGKILL)
+            return
+    raise AssertionError("no browser process to kill")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="finds the browser process in /proc")
+@pytest.mark.parametrize(("method", "step", "kill_on"), [
+    ("_step", 4, {1}),  # before the step acts
+    ("_step", 4, {1, 2}),
+    ("_await_requests", 6, {1}),  # the last step, after it acted: nothing raises
+])  # fmt: skip
+def test_a_browser_crash_fails_that_journey_and_the_run_goes_on(
+    recorded, monkeypatch, method, step, kill_on
+):
+    """Spec 18: the journey is retried once in a new browser, then recorded as an error;
+    the journeys after it run in the new browser."""
+    journey, assets = recorded
+    journeys = []
+    for name in ("before", "crashes", "after"):
+        j = copy.deepcopy(journey)
+        j.journey_id = name
+        journeys.append(j)
+    original, killed = getattr(Replayer, method), set()
+
+    def crashing(self, page, net, s, *rest):
+        run = next(a for a in rest if isinstance(a, JourneyRun))
+        if (run.journey_id, s.n) == ("crashes", step) and run.attempts in kill_on - killed:
+            killed.add(run.attempts)
+            kill_browser()
+        return original(self, page, net, s, *rest)
+
+    monkeypatch.setattr(Replayer, method, crashing)
+    findings = []
+    with ShopApp() as target:
+        result = run_journeys(journeys, target_url=target.url, options=WebOptions(),
+                              emit=findings.append, assets_dir=lambda j: assets,
+                              secret_values=lambda j: {t: PASSWORD for t in j.secrets})  # fmt: skip
+    before, crashes, after = result.journeys
+    assert killed == kill_on and result.complete
+    assert (before.status, after.status) == ("passed", "passed"), [f.summary for f in findings]
+    assert (crashes.attempts, crashes.browser_crashes) == (2, len(kill_on))
+    assert [j["browser_crashes"] for j in result.to_dict()["journeys"]] == [0, len(kill_on), 0]
+    # never a difference made up from the evidence of a dead browser
+    assert not [f for f in findings if f.kind in (Kind.DIFFERENCE, Kind.NOTICE)]
+    ours = [f for f in findings if f.journey == "crashes"]
+    assert [f.detail.get("cause") for f in ours if f.kind == Kind.FLAKE] == ["browser_crash"]
+    errors = [f for f in findings if f.kind == Kind.ERROR]
+    if kill_on == {1}:
+        assert crashes.status == "passed" and not errors
+    else:
+        [error] = errors
+        assert crashes.status == "failed" and error.journey == "crashes"
+        assert error.summary == "the browser process crashed during this journey"
 
 
 @pytest.mark.parametrize(("variant", "exit_code"), [("same", 0), ("changed", 10)])

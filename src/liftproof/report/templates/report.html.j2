@@ -145,7 +145,7 @@
     <tr><th>Journey</th><th>Story</th><th>Status</th><th class="num">Steps run</th><th class="num">Differences</th><th class="num">Attempts</th><th class="num">Flakes</th></tr>
     {% for j in r.journeys %}
     <tr><td><code>{{ j.journey }}</code></td><td>{{ j.story or "" }}</td>
-      <td class="status-{{ j.status }}">{{ j.status|replace("_"," ") }}</td>
+      <td class="status-{{ j.status }}">{{ j.status|replace("_"," ") }}{% if j.browser_crashes %} (browser crashed{% if j.browser_crashes > 1 %} {{ j.browser_crashes }} times{% endif %}){% endif %}</td>
       <td class="num">{{ j.steps_run }} of {{ j.steps }}</td><td class="num">{{ j.differences }}</td>
       <td class="num">{{ j.attempts }}</td><td class="num">{{ j.flakes }}</td></tr>
     {% endfor %}

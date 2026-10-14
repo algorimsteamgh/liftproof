@@ -44,6 +44,7 @@ class JourneyResult:
     # whole journey wall clock, recording and replay (the replay KPI, docs/kpis.md)
     recorded_wall_ms: float | None = None
     replayed_wall_ms: float | None = None
+    browser_crashes: int = 0  # attempts the browser process exited during (spec 18)
 
 
 @dataclass
@@ -111,6 +112,22 @@ def _failure_finding(j: Journey, run: JourneyRun) -> Finding:
                 journey=obj,
                 story=j.story,
             )
+        case "browser_crash":
+            return Finding(
+                Comparator.UI,
+                Kind.ERROR,
+                Severity.HIGH,
+                obj,
+                "the browser process crashed during this journey",
+                locator=where,
+                journey=obj,
+                story=j.story,
+                detail={
+                    "error": run.error,
+                    "attempts": run.attempts,
+                    "browser_crashes": run.browser_crashes,
+                },
+            )
         case _:
             return Finding(
                 Comparator.UI,
@@ -161,21 +178,37 @@ def _journey_done(
     timing: Timing,
 ) -> JourneyResult:
     """Every finding of one replayed journey, and its result."""
+    if run.browser_restarted:
+        emit(
+            Finding(
+                Comparator.UI,
+                Kind.NOTICE,
+                Severity.INFO,
+                j.journey_id,
+                "the browser had exited before this journey started and was started again",
+                journey=j.journey_id,
+                story=j.story,
+            )
+        )
     for f in run.flakes:
+        crash = f.get("cause") == "browser_crash"
         emit(
             Finding(
                 Comparator.UI,
                 Kind.FLAKE,
                 Severity.INFO,
                 j.journey_id,
-                f"retried after a transport or timing failure ({f['unit']})",
+                f"retried in a new browser after the browser process crashed ({f['unit']})"
+                if crash
+                else f"retried after a transport or timing failure ({f['unit']})",
                 locator=f"step {f['step']}" if f["step"] else None,
                 journey=j.journey_id,
                 story=j.story,
                 detail=f,
             )
         )
-    repeated = Counter(f["step"] for f in run.flakes if f["step"] is not None)
+    # a browser crash is the tool's failure, not the step's
+    repeated = Counter(f["step"] for f in run.flakes if f["step"] is not None and "cause" not in f)
     for step, n in sorted(repeated.items()):
         if n >= REPEATED_FLAKE:
             # a defect that fails intermittently must not become a statistic (spec 6)
@@ -228,6 +261,7 @@ def _result(
         reason=reason,
         recorded_wall_ms=j.wall_ms,
         replayed_wall_ms=run.wall_ms,
+        browser_crashes=run.browser_crashes,
     )
 
 

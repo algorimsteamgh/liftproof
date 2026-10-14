@@ -48,7 +48,10 @@ liftproof validate --project acme.yaml                  # reconcile, then replay
 window. Passwords become random tokens before anything is written; `bind` points each
 token at a Secrets Manager secret for replay. Values the server generates (order ids,
 CSRF tokens, ASP.NET view state) are detected as correlations, substituted forward at
-replay, and never reported as differences.
+replay, and never reported as differences. A journey that fails to replay is a finding
+and the replay goes on with the next. If the browser crashes, the journey it was running
+is retried once in a new browser, then recorded as an error; the report's journey table
+says which journeys hit a crash.
 
 ## Files
 
