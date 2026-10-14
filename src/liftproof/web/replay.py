@@ -10,7 +10,8 @@ per journey, and captures the same evidence again. The rules that keep replay ho
 - a journey containing a state changing step is retried as a whole, never per step;
 - every retry is counted as a flake, and a step that flakes repeatedly is reported;
 - a browser that crashes fails only the journey it was running: that journey is retried
-  once in a new browser (spec 18), and the journeys after it run in that browser.
+  once in a new browser (spec 18), a retry of its own besides the one for a transport or
+  timing failure, and the journeys after it run in that browser.
 """
 
 from __future__ import annotations
@@ -151,14 +152,24 @@ class _Browser:
     def gone(self) -> bool:
         return not self.browser.is_connected()
 
-    def new_context(self) -> Any:
-        if self.gone:
+    def new_context(self) -> tuple[Any, bool]:
+        """A context in a live browser, and whether the browser had to be started again
+        after an exit charged to no journey."""
+        if not self.gone:
             try:
-                self.browser.close()
-            except Exception:  # noqa: BLE001, S110 - it has already exited
-                pass
-            self.browser, self.crashed = self._launch(), False
-        return self.browser.new_context()
+                return self.browser.new_context(), False
+            except Exception:
+                # is_connected() changes only when a call handles the browser's exit, so
+                # one that exited while the worker made no call is found here
+                if not self.gone:
+                    raise
+        unnoticed = not self.crashed
+        try:
+            self.browser.close()
+        except Exception:  # noqa: BLE001, S110 - it has already exited
+            pass
+        self.browser, self.crashed = self._launch(), False
+        return self.browser.new_context(), unnoticed
 
     def close(self) -> None:
         self.browser.close()
@@ -290,16 +301,16 @@ class Replayer:
         except Exception as exc:  # noqa: BLE001 - reported, the run continues
             run.status, run.failure_kind, run.error = "failed", "secret", str(exc)
             return run
-        for attempt in range(1, JOURNEY_ATTEMPTS + 1):
+        for attempt in range(1, JOURNEY_ATTEMPTS + 2):  # one more after a browser crash
             run = JourneyRun(journey.journey_id, attempts=attempt, flakes=run.flakes,
                              browser_crashes=run.browser_crashes,
                              browser_restarted=run.browser_restarted)  # fmt: skip
-            if browser.gone and not browser.crashed:
+            context, restarted = browser.new_context()
+            if restarted:
                 # it exited while no journey was running: not this journey's failure
                 log.warning("the browser had exited before journey %s; starting it again",
                             journey.journey_id)  # fmt: skip
                 run.browser_restarted = True
-            context = browser.new_context()
             try:
                 retry_journey = self._steps(context, journey, run, secrets)
             except Exception as exc:  # noqa: BLE001 - a crashed context is retried once
@@ -312,14 +323,17 @@ class Replayer:
                     pass
             if run.status != "completed" and browser.gone:
                 # the browser process exited during this attempt: charged to this journey,
-                # which is retried once in a new browser (spec 18)
+                # which is retried once in a new browser (spec 18), whatever retry it has had
                 log.warning("journey %s attempt %d: the browser crashed", journey.journey_id,
                             attempt)  # fmt: skip
-                browser.crashed, retry_journey = True, True
+                browser.crashed = True
                 first = (run.error or "").splitlines()[:1]
                 run.failure_kind, run.browser_crashes = "browser_crash", run.browser_crashes + 1
                 run.error = "the browser process crashed" + (f": {first[0][:300]}" if first else "")
-            if not retry_journey or attempt == JOURNEY_ATTEMPTS:
+                retry_journey = run.browser_crashes == 1
+            elif attempt - run.browser_crashes == JOURNEY_ATTEMPTS:
+                retry_journey = False  # the attempts no crash ended are used up
+            if not retry_journey:
                 return run
             failed_step = next((s.n for s in run.steps if s.status == "failed"), None)
             flake = {"step": failed_step, "attempt": attempt, "error": run.error, "unit": "journey"}

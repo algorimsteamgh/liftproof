@@ -10,13 +10,14 @@ import json
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 from liftproof.errors import ConfigError
 from liftproof.findings import Comparator, Kind
-from liftproof.web.browser import BodyPolicy
+from liftproof.web.browser import BodyPolicy, launch
 from liftproof.web.compare import WebOptions
 from liftproof.web.journey import Journey
 from liftproof.web.recorder import Recorder
@@ -140,10 +141,10 @@ def test_ambiguous_locator_is_never_acted_on(recorded):
     assert err.summary.startswith("ambiguous locator")
 
 
-def kill_browser():
-    """SIGKILL the Chromium this process started, as a crash ends it: its main process is
-    the one given the debugging pipe, its helpers carry --type."""
-    parents = {}
+def browser_pids() -> list[int]:
+    """The Chromium processes this process started: a browser's main process is the one
+    given the debugging pipe, its helpers carry --type."""
+    parents, found = {}, []
     for stat in Path("/proc").glob("[0-9]*/stat"):
         try:
             pid, rest = stat.read_text().split(" ", 1)
@@ -159,9 +160,15 @@ def kill_browser():
         except OSError:
             continue
         if ancestor > 1 and b"--remote-debugging-pipe" in cmd and b"--type=" not in cmd:
-            os.kill(pid, signal.SIGKILL)
-            return
-    raise AssertionError("no browser process to kill")
+            found.append(pid)
+    return found
+
+
+def kill_browser(pid: int | None = None):
+    """SIGKILL a Chromium this process started, as a crash ends it."""
+    pids = browser_pids()
+    assert pids, "no browser process to kill"
+    os.kill(pid if pid in pids else pids[0], signal.SIGKILL)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="finds the browser process in /proc")
@@ -212,6 +219,54 @@ def test_a_browser_crash_fails_that_journey_and_the_run_goes_on(
         [error] = errors
         assert crashes.status == "failed" and error.journey == "crashes"
         assert error.summary == "the browser process crashed during this journey"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="finds the browser process in /proc")
+@pytest.mark.parametrize("workers", [1, 2])
+def test_a_browser_that_exits_between_journeys_is_started_again(recorded, monkeypatch, workers):
+    """A browser killed after its journey, while the run is compared and written: no
+    Playwright call is made until the next journey asks for its context, so is_connected
+    still says connected, and that is the call that finds the exit."""
+    journey, assets = recorded
+    journeys = []
+    for n in range(4):
+        j = copy.deepcopy(journey)
+        j.journey_id = f"j{n}"
+        journeys.append(j)
+    pids, launching = {}, threading.Lock()
+
+    def launch_one(*args, **kwargs):
+        with launching:  # one at a time, so the new process is this browser's
+            before = set(browser_pids())
+            browser = launch(*args, **kwargs)
+            [pids[id(browser)]] = set(browser_pids()) - before
+        return browser
+
+    journey_once, killed = Replayer._journey, []
+
+    def kill_after(self, browser, j):
+        run = journey_once(self, browser, j)
+        with launching:
+            if not killed:  # the first journey to finish, whichever worker ran it
+                killed.append(j.journey_id)
+                kill_browser(pids[id(browser.browser)])
+        return run
+
+    monkeypatch.setattr("liftproof.web.replay.launch", launch_one)
+    monkeypatch.setattr(Replayer, "_journey", kill_after)
+    findings = []
+    with ShopApp() as target:
+        result = run_journeys(journeys, target_url=target.url, options=WebOptions(),
+                              emit=findings.append, assets_dir=lambda j: assets,
+                              secret_values=lambda j: {t: PASSWORD for t in j.secrets},
+                              workers=workers)  # fmt: skip
+    assert result.complete and len(pids) == workers + 1
+    assert [(r.status, r.browser_crashes) for r in result.journeys] == [("passed", 0)] * 4, [
+        f.summary for f in findings]  # fmt: skip
+    assert not [f for f in findings if f.kind in (Kind.ERROR, Kind.DIFFERENCE)]
+    [notice] = [f for f in findings if f.kind == Kind.NOTICE]
+    assert notice.journey != killed[0]
+    assert notice.summary.startswith("the browser had exited before this journey started")
 
 
 @pytest.mark.parametrize(("variant", "exit_code"), [("same", 0), ("changed", 10)])

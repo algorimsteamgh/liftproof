@@ -2,7 +2,8 @@
 is retried once in a new browser, then recorded as an error, and the run goes on.
 
 No browser: the fakes stand in for Playwright with only what its oldest supported version
-has, Browser.is_connected and Page.is_closed. A browser that exits closes its pages.
+has, Browser.is_connected and Page.is_closed. A browser that exits closes its pages, and,
+as with Playwright's sync API, both change only at the first call made after it exited.
 """
 
 import contextlib
@@ -24,20 +25,25 @@ class Browser:
     version = "0-test"
 
     def __init__(self, launched: list) -> None:
-        self.alive, self.contexts = True, []
+        self.alive, self.connected, self.contexts = True, True, []
         launched.append(self)
 
     def is_connected(self) -> bool:
-        return self.alive
+        return self.connected
+
+    def call(self) -> None:
+        """A round trip, which is what handles the browser's exit."""
+        self.connected = self.alive
 
     def new_context(self):
+        self.call()
         if not self.alive:
-            raise RuntimeError(CLOSED)
+            raise RuntimeError(f"Browser.new_context: {CLOSED}")
         self.contexts.append(Context(self))
         return self.contexts[-1]
 
     def close(self) -> None:
-        self.alive = False
+        self.alive = self.connected = False
 
 
 class Context:
@@ -47,11 +53,13 @@ class Context:
         self.browser = browser
 
     def new_page(self):
+        self.browser.call()
         return Page(self.browser)
 
     def close(self) -> None:
         if self.on_close:
             self.on_close(self.browser)
+        self.browser.call()
 
 
 class Page:
@@ -65,7 +73,7 @@ class Page:
         pass
 
     def is_closed(self) -> bool:
-        return self.closed or not self.browser.alive
+        return self.closed or not self.browser.connected
 
 
 @pytest.fixture
@@ -100,6 +108,7 @@ def scripted(monkeypatch, act):
 
     def step(self, page, net, s, sr, j, run, secrets):
         act(j.journey_id, s.n, attempts[j.journey_id], page)
+        page.browser.call()  # the step's waits, which return normally on a dead page
         # a browser that exited during the step leaves an empty snapshot, not an error
         sr.region = "" if page.is_closed() else s.region
 
@@ -110,6 +119,7 @@ def scripted(monkeypatch, act):
 
 def crash(page: Page) -> None:
     page.browser.alive = False
+    page.browser.call()
     raise RuntimeError(f"Page.goto: {CLOSED}")
 
 
@@ -190,12 +200,24 @@ def test_a_browser_that_exits_during_a_step_fails_that_step(monkeypatch, launche
     assert kinds(findings, "b") == []
 
 
-def test_a_browser_that_exits_between_journeys_is_charged_to_none(monkeypatch, launched):
+@pytest.mark.parametrize("exits", ["closing its context", "while it is handed over"])
+def test_a_browser_that_exits_between_journeys_is_charged_to_none(monkeypatch, launched, exits):
+    """Handed over, the journey is compared and written with no call to the browser, so
+    the next journey finds the exit only when its context is refused."""
+
     def act(j, n, attempt, page):
-        if (j, n) == ("a", 3):
+        if (j, n) == ("a", 3) and exits == "closing its context":
             page.browser.contexts[-1].on_close = Browser.close
 
+    hand_over = Replayer._hand_over
+
+    def exit_after(self, on_done, i, j, run):
+        if j.journey_id == "a" and exits == "while it is handed over":
+            launched[-1].alive = False
+        hand_over(self, on_done, i, j, run)
+
     scripted(monkeypatch, act)
+    monkeypatch.setattr(Replayer, "_hand_over", exit_after)
     result, findings = replay_all([journey("a"), journey("b")])
     assert [(r.status, r.attempts, r.browser_crashes) for r in result.journeys] == [
         ("passed", 1, 0), ("passed", 1, 0)]
@@ -203,6 +225,53 @@ def test_a_browser_that_exits_between_journeys_is_charged_to_none(monkeypatch, l
     [notice] = findings
     assert (notice.kind, notice.journey) == (Kind.NOTICE, "b")
     assert notice.summary.startswith("the browser had exited before this journey started")
+
+
+@pytest.mark.parametrize("first", ["timeout", "crash"])
+def test_a_crash_has_its_own_retry(monkeypatch, launched, first):
+    """A journey retried after a transport or timing failure is still retried in a new
+    browser when the browser crashes, and the other way round: one retry of each."""
+    timeout = RuntimeError("Page.goto: Timeout 15000ms exceeded.")
+
+    def act(j, n, attempt, page):
+        if (n, attempt) == (2, 1):
+            if first == "crash":
+                crash(page)
+            raise timeout
+        if (n, attempt) == (2, 2):
+            if first == "timeout":
+                crash(page)
+            raise timeout
+
+    scripted(monkeypatch, act)
+    result, findings = replay_all([journey("b", writes=True)])
+    [b] = result.journeys
+    assert (b.status, b.attempts, b.browser_crashes, b.flakes) == ("passed", 3, 1, 2)
+    assert len(launched) == 2
+    causes = [f.detail.get("cause") for f in findings if f.kind == Kind.FLAKE]
+    assert causes == (["browser_crash", None] if first == "crash" else [None, "browser_crash"])
+    assert not [f for f in findings if f.kind == Kind.ERROR]
+
+
+@pytest.mark.parametrize("third", ["timeout", "crash"])
+def test_a_journey_has_no_third_retry(monkeypatch, launched, third):
+    def act(j, n, attempt, page):
+        if (j, n) != ("b", 2):
+            return
+        if attempt == 2 or (attempt == 3 and third == "crash"):
+            crash(page)
+        raise RuntimeError("Page.goto: Timeout 15000ms exceeded.")
+
+    scripted(monkeypatch, act)
+    result, findings = replay_all([journey("b", writes=True), journey("c")])
+    b, c = result.journeys
+    crashes = 1 + (third == "crash")
+    assert (b.status, b.attempts, b.browser_crashes, b.flakes) == ("failed", 3, crashes, 2)
+    assert c.status == "passed" and len(launched) == 1 + crashes
+    [error] = [f for f in findings if f.kind == Kind.ERROR]
+    assert error.journey == "b"
+    assert error.detail["error"].startswith("the browser process crashed" if crashes == 2
+                                            else "Page.goto: Timeout")  # fmt: skip
 
 
 def test_a_closed_page_in_a_live_browser_keeps_the_crash_path(monkeypatch, launched):
