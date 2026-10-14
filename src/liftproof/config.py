@@ -443,7 +443,8 @@ web:                            # record and replay; omit for database only proj
   target_url: https://app.example.com
   capture_bodies: ["/api/*"]    # bodies kept for value comparison; others: hash and shape
   compare_headers: []           # only these response headers are compared
-  ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag"
+  ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag";
+                                # [*] is every element: "$.orders[*].updated_at"
   ignore_text: []               # regular expressions masked in page content
   step_timeout_ms: 15000
   parallel_journeys: 1          # 1 = in sequence; more only for journeys that do not interfere

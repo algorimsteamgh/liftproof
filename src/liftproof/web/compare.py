@@ -4,7 +4,8 @@ UI: the accessible tree of the region each step touched, compared as text after
 volatile values (dates, times, generated ids, correlated values) are masked. Never
 pixels.
 
-API: for every request the journey made, status exactly, response shape structurally,
+API: for every request the journey made, status exactly, response shape structurally
+(an array by the union of its elements' shapes, so $.orders[*].total is one field),
 values (only for bodies the project opted in to keep) value by value with numbers
 compared as numbers, and only the headers the project names.
 
@@ -50,7 +51,7 @@ STALE_FAILURES = ("not_found", "ambiguous", "transport")
 @dataclass
 class WebOptions:
     compare_headers: list[str] = field(default_factory=list)
-    ignore_json_paths: list[str] = field(default_factory=list)  # "$.placed_at" or "GET /x $.y"
+    ignore_json_paths: list[str] = field(default_factory=list)  # "$.a[*].b" or "GET /x $.y"
     ignore_text: list[str] = field(default_factory=list)  # regular expressions, UI
     volatile_defaults: bool = True
     float_rel_tolerance: float = 1e-9
@@ -137,6 +138,28 @@ def _number(v: Any) -> Decimal | None:
     return None
 
 
+def _json_path(rule: str) -> re.Pattern[str]:
+    """An ignore rule's JSON path: [*] (or []) stands for every element of an array, so
+    it matches $.orders[2].total and the shape's $.orders[*].total; [2] only itself."""
+    return re.compile(re.sub(r"\\\[(\\\*)?\\\]", lambda m: r"\[(\d+|\*)?\]", re.escape(rule)))
+
+
+def _kind(s: Any) -> str:
+    return "object" if isinstance(s, dict) else "array" if isinstance(s, list) else str(s)
+
+
+def _type_change(a: set[str], b: set[str], in_array: bool) -> int | None:
+    """How much a change between the types a value had on each side counts, None when
+    they agree. null is data, so it goes with any type, except a side only ever null
+    against one never null: medium for a single value, low among an array's elements."""
+    na, nb = a - {"null"}, b - {"null"}
+    if na and nb:
+        return None if na == nb else Severity.LOW if na & nb else Severity.MEDIUM
+    if (not na and not nb) or "null" in (b if not na else a):
+        return None
+    return Severity.LOW if in_array else Severity.MEDIUM
+
+
 class Comparison:
     def __init__(
         self,
@@ -164,6 +187,13 @@ class Comparison:
         self.ignored_at_source = {
             (c.source, c.expression) for c in journey.correlations if c.extractor == "json_path"
         }
+        self.ignore_rules = [
+            (endpoint, _json_path(path))
+            for endpoint, _, path in (
+                rule.rpartition(" ") if " $" in rule else ("", "", rule)
+                for rule in options.ignore_json_paths
+            )
+        ]
         self.unresolved: dict[str, Unresolved] = {}
         for c in journey.correlations:
             u = self._diagnose(c)
@@ -497,52 +527,66 @@ class Comparison:
     def _ignored(self, key: str, path: str) -> bool:
         if (key, path) in self.ignored_at_source:
             return True
-        for rule in self.o.ignore_json_paths:
-            endpoint, _, p = rule.rpartition(" ") if " $" in rule else ("", "", rule)
-            if p == path and (not endpoint or endpoint == key):
-                return True
-        return False
+        return any(
+            p.fullmatch(path) and (not endpoint or endpoint == key)
+            for endpoint, p in self.ignore_rules
+        )
 
     def _shape(self, key: str, a: Any, b: Any, path: str, step: int) -> None:
-        if isinstance(a, dict) and isinstance(b, dict):
-            for k in sorted(set(a) | set(b)):
-                p = f"{path}.{k}"
-                if self._ignored(key, p):
-                    continue
-                if k not in b:
-                    self.emit(
-                        Comparator.API,
-                        Kind.DIFFERENCE,
-                        Severity.MEDIUM,
-                        key,
-                        f"field {p} missing on the target",
-                        step,
-                        column=p,
-                    )
-                elif k not in a:
-                    self.emit(
-                        Comparator.API,
-                        Kind.DIFFERENCE,
-                        Severity.MEDIUM,
-                        key,
-                        f"field {p} added on the target",
-                        step,
-                        column=p,
-                    )
-                else:
-                    self._shape(key, a[k], b[k], p, step)
-        elif a != b and not (isinstance(a, list) and isinstance(b, list)):
+        self._shapes(key, [a], [b], path, step, False)
+
+    def _shapes(
+        self, key: str, a: list[Any], b: list[Any], path: str, step: int, in_array: bool
+    ) -> None:
+        """The shapes a value had on each side: one, or every distinct shape of an array's
+        elements (path $.orders[*]). Medium when the evidence is structural: a field in
+        every element on one side and in none on the other, a type that shares nothing
+        with the recorded one. A field optional on one side, or null against a value, is
+        what different data looks like too, so it is low."""
+        if not a or not b or self._ignored(key, path):
+            return  # an empty array has no element shape; how many elements is a value
+        ka, kb = {_kind(s) for s in a}, {_kind(s) for s in b}
+        severity = _type_change(ka, kb, in_array)
+        if severity is not None:
             self.emit(
                 Comparator.API,
                 Kind.DIFFERENCE,
-                Severity.MEDIUM,
+                severity,
                 key,
                 f"type of {path} differs",
                 step,
                 column=path,
-                expected=str(a),
-                actual=str(b),
+                expected=", ".join(sorted(ka)),
+                actual=", ".join(sorted(kb)),
             )
+        oa = [s for s in a if isinstance(s, dict)]
+        ob = [s for s in b if isinstance(s, dict)]
+        for k in sorted(set().union(*oa, *ob)) if oa and ob else []:
+            p = f"{path}.{k}"
+            if self._ignored(key, p):
+                continue
+            xa, xb = [o[k] for o in oa if k in o], [o[k] for o in ob if k in o]
+            every_a, every_b = len(xa) == len(oa), len(xb) == len(ob)
+            if not xa or not xb:
+                what, strong = ("missing", every_a) if xa else ("added", every_b)
+            elif every_a and not every_b:
+                what, strong = "missing from some elements", False
+            else:
+                what, strong = "", False
+            if what:
+                self.emit(
+                    Comparator.API,
+                    Kind.DIFFERENCE,
+                    Severity.MEDIUM if strong else Severity.LOW,
+                    key,
+                    f"field {p} {what} on the target",
+                    step,
+                    column=p,
+                )
+            self._shapes(key, xa, xb, p, step, in_array)
+        ea = [e for s in a if isinstance(s, list) for e in s]
+        eb = [e for s in b if isinstance(s, list) for e in s]
+        self._shapes(key, ea, eb, f"{path}[*]", step, True)
 
     def _json(self, key: str, a: Any, b: Any, path: str, step: int) -> None:
         if self._ignored(key, path):

@@ -11,7 +11,7 @@ import pytest
 
 from liftproof import support
 from liftproof.findings import Kind, Severity
-from liftproof.report.builder import build_report, render_html
+from liftproof.report.builder import PASSED_WITH_DIFFERENCES, build_report, render_html, verdict
 from liftproof.web import correlate, replay
 from liftproof.web import run as webrun
 from liftproof.web.browser import Captured, NetworkLog, Write, normalise_path
@@ -44,6 +44,116 @@ def test_shape_reports_added_and_missing_fields():
     assert sorted(f.summary for f in out) == [
         "field $.b missing on the target", "field $.c added on the target"]
     assert all(f.kind == Kind.DIFFERENCE for f in out)
+
+
+MEDIUM, LOW = Severity.MEDIUM, Severity.LOW
+
+
+def shapes(recorded, replayed, **opts):
+    c, out = cmp(**opts)
+    c._shape("GET /api/orders", shape(recorded), shape(replayed), "$", 1)
+    return [(f.severity, f.summary) for f in out]
+
+
+def test_shape_compares_array_elements():
+    c, out = cmp()
+    recorded = {"orders": [{"id": 1, "total": 10.5}, {"id": 2, "total": 3}]}
+    c._shape("GET /api/orders", shape(recorded), shape({"orders": [{"id": 1}, {"id": 2}]}), "$", 1)
+    assert [(f.kind, f.severity, f.column, f.summary) for f in out] == [
+        (Kind.DIFFERENCE, MEDIUM, "$.orders[*].total",
+         "field $.orders[*].total missing on the target")]
+    assert shapes({"orders": [{"id": 1}]}, {"orders": [{"id": 1, "tax": 0.5}]}) == [
+        (MEDIUM, "field $.orders[*].tax added on the target")]
+    assert shapes([{"id": 1, "total": 1}], [{"id": 1}]) == [
+        (MEDIUM, "field $[*].total missing on the target")]
+    nested = {"o": [{"lines": [{"sku": "a", "qty": 1}]}, {"lines": []}]}
+    assert shapes(nested, {"o": [{"lines": [{"sku": "b"}]}]}) == [
+        (MEDIUM, "field $.o[*].lines[*].qty missing on the target")]
+
+
+def test_shape_field_missing_from_some_elements_is_low():
+    assert shapes({"orders": [{"total": 1}, {"total": 2}]}, {"orders": [{"total": 1}, {}]}) == [
+        (LOW, "field $.orders[*].total missing from some elements on the target")]
+    # optional on the source: which elements have it is data
+    assert shapes({"orders": [{"total": 1}, {}]}, {"orders": [{"total": 1}, {}]}) == []
+    assert shapes({"orders": [{"total": 1}, {}]}, {"orders": [{"total": 1}]}) == []
+
+
+def test_shape_of_drifted_data_is_low():
+    # an optional field gone, an optional field added, a value where every one was null
+    assert shapes({"orders": [{"id": 1, "shipped_at": "x"}, {"id": 2}]},
+                  {"orders": [{"id": 3}]}) == [
+        (LOW, "field $.orders[*].shipped_at missing on the target")]
+    assert shapes({"orders": [{"id": 1}]}, {"orders": [{"id": 3, "discount": 1}, {"id": 4}]}) == [
+        (LOW, "field $.orders[*].discount added on the target")]
+    assert shapes({"orders": [{"shipped_at": None}]}, {"orders": [{"shipped_at": "x"}]}) == [
+        (LOW, "type of $.orders[*].shipped_at differs")]
+    assert shapes({"o": [{"t": 1}, {"t": "x"}]}, {"o": [{"t": 1}]}) == [
+        (LOW, "type of $.o[*].t differs")]
+
+
+def test_shape_array_element_types():
+    c, out = cmp()
+    c._shape("GET /a", shape({"orders": [{"total": 1}]}), shape({"orders": [{"total": "1"}]}),
+             "$", 1)
+    assert [(f.severity, f.summary, f.expected, f.actual) for f in out] == [
+        (MEDIUM, "type of $.orders[*].total differs", "number", "string")]
+    assert shapes({"o": [{"a": 1}]}, {"o": ["a"]}) == [(MEDIUM, "type of $.o[*] differs")]
+    # null goes with any type
+    assert shapes({"o": [{"t": 1}, {"t": None}]}, {"o": [{"t": 1}]}) == []
+    assert shapes({"o": [{"t": None}]}, {"o": [{"t": None}, {"t": 2}]}) == []
+    # an empty array has no element shape
+    assert shapes({"o": []}, {"o": [{"a": 1}]}) == shapes({"o": [{"a": 1}]}, {"o": []}) == []
+
+
+def test_shape_of_single_values_is_unchanged():
+    assert shapes({"t": None}, {"t": 1}) == [(MEDIUM, "type of $.t differs")]
+    assert shapes({"t": 1}, {"t": None}) == [(MEDIUM, "type of $.t differs")]
+    assert shapes({"a": {"b": 1}, "c": [1]}, {"a": {"d": 1}, "c": "x"}) == [
+        (MEDIUM, "field $.a.b missing on the target"), (MEDIUM, "field $.a.d added on the target"),
+        (MEDIUM, "type of $.c differs")]
+
+
+def test_ignore_json_paths_every_element():
+    recorded, replayed = {"orders": [{"id": 1, "total": 1}]}, {"orders": [{"id": 1}]}
+    for rule in ("GET /api/orders $.orders[*].total", "$.orders[].total", "$.orders[*]"):
+        assert shapes(recorded, replayed, ignore_json_paths=[rule]) == [], rule
+    for rule in ("$.orders[0].total", "GET /api/other $.orders[*].total"):
+        assert shapes(recorded, replayed, ignore_json_paths=[rule]) != [], rule
+    a, b = {"orders": [{"total": 1}, {"total": 2}]}, {"orders": [{"total": 5}, {"total": 6}]}
+    for rule in ("$.orders[*].total", "$.orders[].total"):
+        c, out = cmp(ignore_json_paths=[rule])
+        c._json("GET /api/orders", a, b, "$", 1)
+        assert out == [], rule
+    c, out = cmp(ignore_json_paths=["$.orders[0].total"])
+    c._json("GET /api/orders", a, b, "$", 1)
+    assert [f.column for f in out] == ["$.orders[1].total"]
+
+
+def test_unkept_body_array_field_reported_through_api():
+    c, out = cmp()
+    rec = Exchange("GET", "/api/orders", 200, body_shape=shape({"orders": [{"id": 1, "total": 2}]}))
+    got = Captured(Exchange("GET", "/api/orders", 200), 0.0, None, {"orders": [{"id": 1}]}, None)
+    c.api([rec], [got], 3)
+    assert [(f.object, f.column, f.locator, f.severity) for f in out] == [
+        ("GET /api/orders", "$.orders[*].total", "step 3", MEDIUM)]
+
+
+def test_a_low_shape_difference_passes_the_run_but_not_the_journey(monkeypatch):
+    rec = Exchange("GET", "/api/orders", 200, body_shape=shape({"orders": [{"total": 1}]}))
+    step = Step(1, "goto", url="/orders", region="- heading", exchanges=[rec])
+    j = Journey("j1", "http://source.invalid", story="S-1", steps=[step])
+    got = Captured(Exchange("GET", "/api/orders", 200), 0.0, None, {"orders": [{"total": 1}, {}]},
+                   None)
+    ran = StepRun(1, "goto", status="ok", region="- heading", exchanges=[got], attempts=1)
+    fakereplay.no_browser(monkeypatch, lambda j: JourneyRun(
+        j.journey_id, status="completed", steps=[ran], attempts=1))
+    findings = []
+    result = _replay([j], findings.append)
+    assert [(f.severity, f.summary) for f in findings] == [
+        (LOW, "field $.orders[*].total missing from some elements on the target")]
+    assert [r.status for r in result.journeys] == ["different"]
+    assert verdict(findings) == PASSED_WITH_DIFFERENCES
 
 
 def test_correlated_values_are_masked_everywhere():

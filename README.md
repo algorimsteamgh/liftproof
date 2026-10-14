@@ -62,6 +62,13 @@ journey has sent one (a sign in, an order), only a transport or timing failure o
 runs it again, and not even that after the target answered one of its writes with an
 error.
 
+Each response is compared by status and by shape, and value by value only for bodies
+kept under `web.capture_bodies`. The shape goes into arrays: a field missing from every
+order the target returned (`$.orders[*].total`), or a number turned string, fails the
+run; a field only some orders have, or a value where every one was null, is what other
+data looks like too, so it is a low difference. In `web.ignore_json_paths`, `[*]` is
+every element: `GET /api/orders $.orders[*].updated_at`.
+
 ## Files
 
 ```bash
