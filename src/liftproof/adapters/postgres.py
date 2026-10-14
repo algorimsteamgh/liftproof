@@ -5,16 +5,23 @@ network. Tables containing a column that PostgreSQL cannot canonicalise identica
 (json and jsonb, whose text forms reorder keys) are hashed application side by
 streaming rows through the reference implementation. Both paths are held to byte
 identical output by the parity tests.
+
+Dates and timestamps can be infinity or -infinity, which no Python date holds and to_char
+renders as NULL. Both paths render them as PostgreSQL prints them (canonical revision 1).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import functools
 from collections.abc import Iterator, Sequence
 from typing import Any
 
 import psycopg
 from psycopg import sql
+from psycopg.abc import AdaptContext, Buffer
+from psycopg.adapt import Loader
+from psycopg.pq import Format
 
 from liftproof.adapters import sqllog
 from liftproof.adapters.base import (
@@ -27,7 +34,14 @@ from liftproof.adapters.base import (
     TableRef,
     TableSchema,
 )
-from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest, value64
+from liftproof.canonical import (
+    GROUP_SIZE,
+    CanonicalType,
+    RowHasher,
+    Verbatim,
+    column_digest,
+    value64,
+)
 from liftproof.errors import ConfigError
 
 TYPE_MAP: dict[str, CanonicalType] = {
@@ -54,6 +68,8 @@ TYPE_MAP: dict[str, CanonicalType] = {
 }
 
 PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON}
+INFINITE_TYPES = {CanonicalType.DATE, CanonicalType.TIMESTAMP, CanonicalType.TIMESTAMPTZ}
+INFINITE = {b"infinity": Verbatim("infinity"), b"-infinity": Verbatim("-infinity")}
 
 NULL_DIGEST = column_digest(None)
 TWO_64 = "18446744073709551616"
@@ -69,6 +85,15 @@ SESSION = {
 
 def render_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sql.Composable:
     """PostgreSQL expression producing the canonical rendering of one column, or NULL."""
+    expr = _finite_sql(col, ctype, precision)
+    if ctype in INFINITE_TYPES:
+        # to_char is NULL only for NULL and for infinity and -infinity, which render as
+        # PostgreSQL prints them in any DateStyle; the cast runs for those rows alone
+        return sql.SQL("coalesce({}, ({})::text)").format(expr, col)
+    return expr
+
+
+def _finite_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sql.Composable:
     match ctype:
         case CanonicalType.INTEGER | CanonicalType.UUID:
             return sql.SQL("({})::text").format(col)
@@ -142,6 +167,39 @@ def _excluding(predicate: str | None) -> sql.Composable:
     return sql.SQL(" WHERE ({}) IS NOT TRUE").format(sql.SQL(predicate))  # noqa: S608
 
 
+class InfinityLoader(Loader):
+    """Loads a value as the loader it replaces does, except infinity and -infinity, where
+    that one raises: they load as Verbatim, rendered as PostgreSQL prints them. Checking
+    the first byte keeps the cost on other values to one Python call."""
+
+    replaces: type[Loader]
+
+    def __init__(self, oid: int, context: AdaptContext | None = None) -> None:
+        super().__init__(oid, context)
+        self._load = self.replaces(oid, context).load
+
+    def load(self, data: Buffer) -> Any:
+        if data[0] in b"i-":  # no finite value starts so: years before 1 end in BC
+            word = INFINITE.get(bytes(data))
+            if word is not None:
+                return word
+        return self._load(data)
+
+
+@functools.cache
+def _with_infinity(replaces: type[Loader]) -> type[Loader]:
+    return type(f"Infinity{replaces.__name__}", (InfinityLoader,), {"replaces": replaces})
+
+
+def load_infinity(conn: psycopg.Connection) -> None:
+    """Every read of a date or timestamp on this connection, hashed here, drilled into,
+    or a data range or watermark, gets infinity as Verbatim rather than an error."""
+    for name in ("date", "timestamp", "timestamptz"):
+        oid = conn.adapters.types[name].oid
+        replaces = conn.adapters.get_loader(oid, Format.TEXT)
+        conn.adapters.register_loader(oid, _with_infinity(replaces))
+
+
 def _shown_version(v: int) -> str:
     """psycopg's server_version as PostgreSQL writes it: 160004 is 16.4, and before
     version 10 the minor release had its own two digits (90624 is 9.6.24)."""
@@ -196,6 +254,7 @@ class PostgresAdapter(Adapter):
             raise ConfigError(
                 f"cannot connect to PostgreSQL at {host}:{port}/{database}: {exc}"
             ) from exc
+        load_infinity(self.conn)
         self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
         self.pacer = Pacer(rows_per_second, pause_ms)

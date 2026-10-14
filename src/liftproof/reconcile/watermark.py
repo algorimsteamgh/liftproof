@@ -63,6 +63,14 @@ def _text(value: Any) -> tuple[str, str]:
     return str(value), "number"
 
 
+def _usable(value: Any) -> bool:
+    """A time or a finite number. Not PostgreSQL's infinity timestamps (read as Verbatim)
+    or numeric Infinity: no window can be written with them."""
+    if isinstance(value, decimal.Decimal):
+        return value.is_finite()
+    return isinstance(value, (int, dt.datetime))
+
+
 def _utc(text: str) -> dt.datetime:
     """A stored time as an aware UTC datetime (texts differ in precision and offset, so
     they are not compared as strings); a time without an offset is UTC."""
@@ -122,8 +130,8 @@ def windows(
     for t, col in tables.items():
         hi = after.get(t)
         lo = before.get(t)
-        if hi is None or (lo is not None and hi <= lo):
-            continue  # nothing created
+        if not _usable(hi) or (lo is not None and (not _usable(lo) or hi <= lo)):
+            continue  # nothing created, or no window to write
         upto, kind = _text(hi)
         out.append(Window(t.qualified, col, None if lo is None else _text(lo)[0], upto, kind,
                           run_id, now))  # fmt: skip

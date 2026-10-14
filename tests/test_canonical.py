@@ -1,19 +1,23 @@
 """Canonical v1.0 rules, one test per rule (Technical Spec 19).
 
 The golden vectors pin the wire format: if any of them changes, baselines taken by an
-earlier build can no longer be compared, and CANONICAL_VERSION must be bumped.
+earlier build can no longer be compared, and CANONICAL_VERSION must be bumped. A rule that
+only gives a rendering to values that had none adds vectors and raises CANONICAL_REVISION.
 """
 
 import datetime as dt
 import itertools
+import json
 import uuid
 from decimal import Decimal
 
 import pytest
 
 from liftproof.canonical import (
+    CANONICAL_REVISION,
     GROUP_SIZE,
     MOD64,
+    Verbatim,
     aggregate,
     bucket_of,
     column_digest,
@@ -27,6 +31,8 @@ from liftproof.canonical import (
     CanonicalType as T,
 )
 from liftproof.canonical.render import RenderError
+from liftproof.errors import ConfigError
+from liftproof.reconcile.baseline import Baseline, BaselineTable, hashed_infinity_as_null
 
 
 # -- rendering (9.4) ---------------------------------------------------------------
@@ -41,6 +47,8 @@ from liftproof.canonical.render import RenderError
         (Decimal("1E+3"), "1000"),
         (Decimal("12345678901234567890.123"), "12345678901234567890.123"),
         (Decimal("NaN"), "NaN"),
+        (Decimal("Infinity"), "Infinity"),
+        (Decimal("-Infinity"), "-Infinity"),
         (7, "7"),
     ],
 )
@@ -80,6 +88,17 @@ def test_timestamps():
         render(naive, T.TIMESTAMPTZ)
     with pytest.raises(RenderError):
         render(aware, T.TIMESTAMP)
+
+
+@pytest.mark.parametrize("ctype", [T.DATE, T.TIMESTAMP, T.TIMESTAMPTZ])
+@pytest.mark.parametrize("precision", [0, 3, 6])
+def test_postgres_infinity_dates(ctype, precision):
+    # as PostgreSQL prints them, with no fraction: never NULL, never each other, never a
+    # finite date (which starts with a digit)
+    for word in ("infinity", "-infinity"):
+        assert render(Verbatim(word), ctype, precision=precision) == word
+    digests = {column_digest(v) for v in ("infinity", "-infinity", None, "9999-12-31")}
+    assert len(digests) == 4
 
 
 def test_binary_uuid_json():
@@ -159,3 +178,67 @@ def test_golden_vectors():
     b = row_hash(["2", "OPEN", None])
     assert a == "76fc102734908db654e63701c08f3b38"
     assert aggregate([a, b]) == "5ef4b266564d16d3"
+
+
+def test_golden_vectors_of_revision_1():
+    assert CANONICAL_REVISION >= 1
+    assert column_digest("infinity") == "4090a77607bb447150404f8a998bba1a"
+    assert column_digest("-infinity") == "418090c1b3d71ee0febfff882916eac7"
+
+
+# -- revisions in baselines ----------------------------------------------------------
+def _entry(columns, revision=None, entry_ranges=None):
+    d = {
+        "columns": [[n, t, t, False] for n, t in columns],
+        "primary_key": ["id"],
+        "plan": {"columns": columns, "key_columns": ["id"], "buckets": 1, "precision": 6},
+        "row_count": 1,
+        "bucket_aggregates": {"0": [1, "5"]},
+        "completed_at": "2026-10-01T00:00:00+00:00",
+    }
+    if revision is not None:
+        d["canonical_revision"] = revision
+    if entry_ranges is not None:
+        d["ranges"] = entry_ranges
+    return d
+
+
+def test_entries_that_may_hold_infinity_hashed_as_null():
+    dated = [["id", "integer"], ["valid_from", "date"], ["valid_to", "timestamptz"]]
+    both = {"id": [1, 9], "valid_from": ["2026-01-01", "2026-02-01"], "valid_to": [None, None]}
+
+    def stale(engine, d):
+        return hashed_infinity_as_null(engine, BaselineTable.from_dict("public.t", d))
+
+    assert stale("postgresql", _entry(dated))  # before ranges: nothing shows it held none
+    assert stale("postgresql", _entry(dated, 0, {"valid_from": both["valid_from"]}))
+    assert not stale("postgresql", _entry(dated, 0, both))  # reading the ranges would fail
+    assert not stale("postgresql", _entry(dated, 1))
+    assert not stale("mysql", _entry(dated))
+    assert not stale("postgresql", _entry([["id", "integer"], ["name", "text"]]))
+    # hashed here: loading infinity failed
+    assert not stale("postgresql", _entry([*dated, ["doc", "json"]]))
+
+    entry = BaselineTable.from_dict("public.t", _entry(dated))
+    assert entry.canonical_revision == 0
+    entry.canonical_revision = CANONICAL_REVISION
+    assert entry.to_dict()["canonical_revision"] == CANONICAL_REVISION
+
+
+def test_a_baseline_from_a_newer_revision_is_refused(tmp_path):
+    # refused before its tables are read: a later revision may hash types this build lacks
+    path = tmp_path / "manifest.json"
+    later = _entry([["id", "integer"], ["doc", "a type from later"]], CANONICAL_REVISION + 1)
+    doc = {
+        "baseline_id": "b9", "canonical_version": "1.0", "hash_algorithm": "md5",
+        "product_version": "9", "engine": "postgresql", "consistency": {}, "session": {},
+        "taken_at": "2026-10-01T00:00:00+00:00", "selection": ["public.t"],
+        "tables": {"public.t": later},
+    }  # fmt: skip
+    path.write_text(json.dumps(doc))
+    newer = f"canonical revision {CANONICAL_REVISION + 1}; this build knows revision"
+    with pytest.raises(ConfigError, match=newer):
+        Baseline.load(path)
+    doc["tables"]["public.t"] = _entry([["id", "integer"]], CANONICAL_REVISION)
+    path.write_text(json.dumps(doc))
+    assert Baseline.load(path).tables["public.t"].canonical_revision == CANONICAL_REVISION

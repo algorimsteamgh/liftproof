@@ -20,7 +20,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, PackageLoader, select_autoescape
 
 from liftproof import __version__, aws
-from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical import CANONICAL_REVISION, CANONICAL_VERSION, HASH_ALGORITHM
 from liftproof.findings import Finding, Kind, Severity
 from liftproof.reconcile.engine import ReconcileResult
 
@@ -209,6 +209,7 @@ def build_report(
             "finished_at": finished_at,
             "product_version": __version__,
             "canonical_version": CANONICAL_VERSION,
+            "canonical_revision": CANONICAL_REVISION,
             "hash_algorithm": HASH_ALGORITHM,
             "aws_sdk": aws.sdk_versions(),
             **metadata,

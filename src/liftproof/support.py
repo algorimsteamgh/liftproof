@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from liftproof import __version__, logs
-from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical import CANONICAL_REVISION, CANONICAL_VERSION, HASH_ALGORITHM
 from liftproof.config import Project
 
 REDACTED = "[redacted]"
@@ -99,6 +99,7 @@ def environment(instance_config: dict[str, Any]) -> dict[str, Any]:
     return {
         "product_version": __version__,
         "canonical_version": CANONICAL_VERSION,
+        "canonical_revision": CANONICAL_REVISION,
         "hash_algorithm": HASH_ALGORITHM,
         "python": sys.version.split()[0],
         "platform": platform.platform(),

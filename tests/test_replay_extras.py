@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json
+from decimal import Decimal
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -14,6 +15,7 @@ import yaml
 
 from liftproof import cli
 from liftproof.adapters.base import TableRef
+from liftproof.canonical import Verbatim
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_OK
 from liftproof.findings import FindingWriter, read_findings
@@ -222,6 +224,18 @@ def test_windows_after_a_target_baseline_only():
     [rule] = watermark.rules(w, pg, since="2026-10-08T10:00:00+00:00")
     assert rule.target_where == '("id" > 20 AND "id" <= 25)' and "(r2)" in rule.reason
     assert watermark.rules(w, pg, since="2026-10-08T12:00:00+00:00") == []
+
+
+def test_no_window_from_an_infinite_watermark():
+    # PostgreSQL infinity reads as Verbatim: no window can be written with it, and a stored
+    # one would fail every later reconciliation
+    t = TableRef("public", "orders")
+    at = dt.datetime(2026, 10, 1)
+    for before, after in [(None, Verbatim("infinity")), (at, Verbatim("infinity")),
+                          (Verbatim("infinity"), at), (None, Decimal("Infinity"))]:  # fmt: skip
+        assert watermark.windows({t: "c"}, {t: before}, {t: after}, "r1") == []
+    [w] = watermark.windows({t: "c"}, {t: None}, {t: at}, "r1")
+    assert (w.after, w.upto, w.kind) == (None, "2026-10-01T00:00:00", "timestamp")
 
 
 @pytest.mark.postgres

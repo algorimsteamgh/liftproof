@@ -4,11 +4,15 @@ The application side hash must produce byte identical values to the PostgreSQL
 pushdown, for every type rule.
 """
 
+from decimal import Decimal
+
 import pytest
 
 from liftproof.adapters.base import HashPlan, TableRef
 from liftproof.adapters.postgres import PostgresAdapter
 from liftproof.canonical import CanonicalType as T
+from liftproof.canonical import Verbatim
+from liftproof.reconcile import ranges
 
 pytestmark = pytest.mark.postgres
 
@@ -37,7 +41,9 @@ INSERT INTO everything VALUES
  (4, 0, 'NaN', true, E'tab\\there\\u001fsep', '', '2026-02-28', '23:59:59.999',
   '2026-02-28 23:59:59.999999', '2026-02-28 23:59:59.999999-05', '\\xdeadbeef', NULL),
  (5, 32767, 12345678.9, false, '\\N', 'Z', '0001-01-01', '12:00', '1970-01-01', '1970-01-01+00',
-  '\\x5c4e', NULL);
+  '\\x5c4e', NULL),
+ (6, 1, 1, true, 'x', 'x', 'infinity', '00:00', '-infinity', 'infinity', NULL, NULL),
+ (7, 2, 2, false, 'y', 'y', '-infinity', '00:00', 'infinity', '-infinity', NULL, NULL);
 """
 
 COLUMNS = [
@@ -58,7 +64,7 @@ def test_pushdown_matches_fallback(make_db, adapter_for, precision, keyed):
     pushed = a.bucket_aggregates(plan)
     fallback = a._bucket_aggregates_fallback(plan)
     assert pushed == fallback
-    assert sum(b.count for b in pushed.values()) == 5
+    assert sum(b.count for b in pushed.values()) == 7
 
     rows_push = sorted(a.row_hashes(plan, set(range(3))))
     plan_json = HashPlan(plan.table, plan.columns, plan.key_columns, 3, precision)
@@ -74,3 +80,44 @@ def test_describe_maps_types(make_db, adapter_for):
     assert schema.primary_key == ["id"]
     got = {c.name: c.canonical for c in schema.columns}
     assert got == dict(COLUMNS)
+
+
+def test_infinity_is_not_null(make_db, adapter_for):
+    """to_char renders infinity as NULL and psycopg cannot load it: neither may make it
+    NULL, nor fail a read."""
+    db, conn = make_db()
+    conn.execute(
+        "CREATE TABLE spans (id int PRIMARY KEY, d date, ts timestamp(3), tz timestamptz);"
+        "INSERT INTO spans VALUES (1, 'infinity', 'infinity', 'infinity'),"
+        " (2, '-infinity', '-infinity', '-infinity'), (3, NULL, NULL, NULL),"
+        " (4, '2026-10-01', '2026-10-01 12:00', '2026-10-01 12:00+00')"
+    )
+    a = adapter_for(db)
+    table = TableRef("public", "spans")
+    cols = [("d", T.DATE), ("id", T.INTEGER), ("ts", T.TIMESTAMP), ("tz", T.TIMESTAMPTZ)]
+    plan = HashPlan(table, cols, ["id"], 1, 3)
+    dates = HashPlan(table, [c for c in cols if c[0] != "id"], [], 1, 3)
+    assert len({h for _, h in a.row_hashes(dates, {0})}) == 4
+    schema = a.describe(table)
+    assert ranges.read(a, table, schema, ["d", "ts", "tz"], None) == {
+        "d": ["-infinity", "infinity"],
+        "ts": ["-infinity", "infinity"],
+        "tz": ["-infinity", "infinity"],
+    }
+    rows = a.fetch_rows(plan, [("1",), ("2",), ("3",)])
+    assert rows[("1",)] == [Verbatim("infinity"), 1, "infinity", "infinity"]
+    assert rows[("2",)][0] == "-infinity" and isinstance(rows[("2",)][3], Verbatim)
+    assert rows[("3",)] == [None, 3, None, None]
+
+    # infinity as a key: rendered alike in the hash and in the drill-down's IN list
+    keyed = HashPlan(table, cols, ["d"], 1, 3)
+    keys = sorted(k for k, _ in a.row_hashes(keyed, {0}) if k != (None,))
+    assert keys == [("-infinity",), ("2026-10-01",), ("infinity",)]
+    assert set(a.fetch_rows(keyed, keys)) == set(keys)
+
+    # PostgreSQL 14 and later: numeric Infinity as a key's range
+    conn.execute("CREATE TABLE amounts (n numeric PRIMARY KEY);"
+                 "INSERT INTO amounts VALUES (1), ('Infinity')")  # fmt: skip
+    amounts = TableRef("public", "amounts")
+    assert ranges.read(a, amounts, a.describe(amounts), ["n"], None) == {"n": [1, "Infinity"]}
+    assert a.value_ranges(amounts, ["n"])["n"][1] == Decimal("Infinity")

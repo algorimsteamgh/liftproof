@@ -29,12 +29,14 @@ from liftproof.adapters.base import Adapter, BucketAggregate, HashPlan, TableRef
 from liftproof.canonical import RowHasher, column_digest, reduce_total
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity
 from liftproof.reconcile import ranges
-from liftproof.reconcile.baseline import Baseline
+from liftproof.reconcile.baseline import Baseline, hashed_infinity_as_null
 from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table, row_filter
 from liftproof.reconcile.replication import REASON_BEHIND, ReplicationConfig, check
 
 DB = Comparator.DATABASE
+INFINITY = {"infinity", "-infinity"}
 REASON_STOPPED = "the run stopped before this table was compared"
+REASON_INFINITY = "the baseline may hold PostgreSQL infinity dates hashed as NULL"
 
 
 @dataclass
@@ -534,6 +536,25 @@ class Reconciler:
             and base_entry.plan.key_columns == plan.key_columns
             and base_entry.plan.filter == plan.filter
         ):
+            if hashed_infinity_as_null(self.baseline.engine, base_entry):
+                # taken before canonical revision 1, with nothing to show it held no infinity
+                res.status = "not_checked"
+                res.reason = f"{REASON_INFINITY}; " + (
+                    "take a new target baseline (liftproof rebaseline)"
+                    if self.against_target
+                    else "take a new baseline, or compare with the live source without --baseline"
+                )
+                self.emit(
+                    Kind.NOT_CHECKED,
+                    Severity.MEDIUM,
+                    q,
+                    res.reason,
+                    detail={
+                        "reason": REASON_INFINITY,
+                        "baseline_canonical_revision": base_entry.canonical_revision,
+                    },
+                )
+                return res
             s_aggs = base_entry.buckets
             if plan.sample is not None:
                 s_aggs = {b: a for b, a in s_aggs.items() if b in plan.sample}
@@ -811,7 +832,18 @@ class Reconciler:
             "decimal": "numeric scale or rounding",
             "json": "JSON normalisation",
         }
-        causes = sorted({likely.get(str(types[c]), "type mapping") for c in cols})
+        # PostgreSQL infinity on one side: an open ended date mapped to or from NULL or a
+        # sentinel date in the move, not a time zone or type mapping
+        infinite = {c for _, c, a, b in diffs if types[c] in ranges.DATES and {a, b} & INFINITY}
+        causes = sorted(
+            {
+                "PostgreSQL infinity dates mapped to NULL or a sentinel date (ignore the "
+                "column if intended)"
+                if c in infinite
+                else likely.get(str(types[c]), "type mapping")
+                for c in cols
+            }
+        )
         examples = [
             {"key": list(k), "column": c, "source": self._show(a), "target": self._show(b)}
             for k, c, a, b in diffs[:3]

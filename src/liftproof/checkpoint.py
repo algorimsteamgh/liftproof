@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from liftproof.canonical import CANONICAL_REVISION
 from liftproof.errors import LiftproofError
 from liftproof.findings import FindingWriter
 from liftproof.reconcile.engine import ReconcileResult, TableResult
@@ -114,6 +115,7 @@ class RunProgress:
     prelude_done: bool = False  # the table list and table level findings are written
     complete: bool = False
     resumed_at: list[str] = field(default_factory=list)
+    canonical_revision: int = CANONICAL_REVISION  # a resume must hash under the same rules
 
     def done(self) -> list[TableResult]:
         return [TableResult(**t) for t in self.tables]
@@ -125,7 +127,9 @@ class RunProgress:
 
     @classmethod
     def load(cls, path: Path) -> RunProgress:
-        return cls(**json.loads(path.read_text(encoding="utf-8")))
+        d = json.loads(path.read_text(encoding="utf-8"))
+        d.setdefault("canonical_revision", 0)  # saved before canonical revisions
+        return cls(**d)
 
 
 class RunCheckpoint:

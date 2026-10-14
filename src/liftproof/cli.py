@@ -26,7 +26,7 @@ from liftproof.adapters.mysql import MySQLAdapter
 from liftproof.adapters.oracle import OracleAdapter
 from liftproof.adapters.postgres import PostgresAdapter
 from liftproof.adapters.sqlserver import SQLServerAdapter
-from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical import CANONICAL_REVISION, CANONICAL_VERSION, HASH_ALGORITHM
 from liftproof.config import TEMPLATE, Connection, Project, load_project
 from liftproof.credentials import from_secrets_manager, secret_value
 from liftproof.errors import (
@@ -184,6 +184,7 @@ def cmd_version(args: argparse.Namespace) -> int:
     info = {
         "liftproof": __version__,
         "canonical_version": CANONICAL_VERSION,
+        "canonical_revision": CANONICAL_REVISION,
         "hash_algorithm": HASH_ALGORITHM,
         **aws.sdk_versions(),
         "python": sys.version.split()[0],
@@ -657,6 +658,12 @@ def _restore_run(store: Store, run_dir: Path, run_id: str) -> ckpt.RunProgress:
     progress = ckpt.RunProgress.load(local)
     if progress.complete:
         raise ConfigError(f"run {run_id} finished every table; there is nothing to resume")
+    if progress.canonical_revision != CANONICAL_REVISION:
+        # its finished tables were hashed under other rules than the rest would be
+        raise ConfigError(
+            f"run {run_id} was started under canonical revision {progress.canonical_revision} "
+            f"and this build hashes under revision {CANONICAL_REVISION}; start a new run"
+        )
     for name in progress.segments:
         seg = run_dir / name
         if not store.get_file(f"runs/{run_id}/{name}", seg) and not seg.exists():
@@ -1131,6 +1138,7 @@ def _report(
 def _rewrite_report(project, run_id, mode, run_dir, findings, result, started, web_result,
                     files_result, failure, template, prior) -> dict[str, Any]:  # fmt: skip
     run = dict(prior.get("run", {}))
+    run.setdefault("canonical_revision", 0)  # a run from before canonical revisions
     finished = run.pop("finished_at", None) or _now()
     run.pop("started_at", None)
     run["regenerated"] = {"at": _now(), "by": who_ran_it(), "product_version": __version__}

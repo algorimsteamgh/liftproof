@@ -7,8 +7,21 @@ byte, and `tests/test_pg_parity.py` proves that for PostgreSQL. Every baseline r
 `canonical_version` and `hash_algorithm`, and Liftproof refuses to compare baselines taken
 under a different version.
 
-Changing anything below changes the golden vectors in `tests/test_canonical.py` and
-requires a new `CANONICAL_VERSION`.
+Changing the rendering of a value that already had one changes the golden vectors in
+`tests/test_canonical.py` and requires a new `CANONICAL_VERSION`. A rule that only gives a
+rendering to values that had none (they failed to load, or hashed as NULL) keeps the
+version, adds golden vectors, and raises `CANONICAL_REVISION`, a whole number. Each
+baseline table records the revision it was hashed under (`canonical_revision`; absent
+means 0), and so do the report's run block and a run's checkpoint. A build refuses a
+baseline holding a table of a newer revision than its own, and refuses to resume a run
+started under another revision. A baseline table of an older revision is compared only
+when nothing in it can render differently under the newer rules; otherwise it is reported
+not checked, naming the baseline to take again. Builds from before revisions do not read
+the field.
+
+| Revision | Rule | An older baseline table is still compared when |
+|---|---|---|
+| 1 | PostgreSQL `infinity` and `-infinity` dates and timestamps (below) | it is not PostgreSQL, it has no date or timestamp column, its data ranges cover every one (reading the range of a column holding infinity failed then), or it has a JSON column (it was hashed application side, and loading infinity failed then) |
 
 ## 1. Columns
 
@@ -25,7 +38,7 @@ requires a new `CANONICAL_VERSION`.
 | Type | Rule |
 |---|---|
 | integer | decimal digits, minus sign for negatives |
-| decimal | fixed point, trailing zeros and a bare point stripped, no negative zero (`10.50` → `10.5`, `-0.00` → `0`), `NaN` |
+| decimal | fixed point, trailing zeros and a bare point stripped, no negative zero (`10.50` → `10.5`, `-0.00` → `0`), `NaN`, `Infinity`, `-Infinity` |
 | boolean | `1` / `0` (so PostgreSQL boolean and MySQL tinyint(1) agree) |
 | text | UTF-8, Unicode NFC. No trimming, no case folding |
 | char | as text, trailing spaces stripped; only when both sides are fixed width |
@@ -42,6 +55,18 @@ Every connection pins its session settings (PostgreSQL: `TimeZone=UTC`,
 records them.
 MySQL sessions pin `time_zone='+00:00'`, `sql_mode='NO_ENGINE_SUBSTITUTION'` (so no
 `ANSI_QUOTES`, `PIPES_AS_CONCAT` or `PAD_CHAR_TO_FULL_LENGTH`) and `utf8mb4`.
+
+### PostgreSQL engine specific rules
+
+PostgreSQL `date`, `timestamp` and `timestamptz` can hold `infinity` and `-infinity`, which
+no other supported engine can store. They render as exactly those words, the way
+PostgreSQL prints them, with no fraction at any precision (revision 1). Against PostgreSQL
+they equal only the same infinity: never NULL, never each other, never a finite date,
+which starts with a digit. Against another engine they are always a difference, so a
+migration that mapped an open ended date to NULL or to a sentinel such as `9999-12-31`
+reports each such row as a changed value; ignore the column if that mapping is intended.
+The pushdown is `coalesce(<finite rendering>, c::text)`: `to_char` gives NULL for both
+words, and their text form does not depend on `DateStyle`.
 
 ### MySQL type mapping and engine specific rules
 

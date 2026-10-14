@@ -4,11 +4,14 @@ The acceptance test for PRD F6: a known injected difference of ten rows in one t
 reported with the table named, the count difference shown and the differing rows listed.
 """
 
+import json
+
 import pytest
 
+from liftproof.canonical import CANONICAL_REVISION
 from liftproof.findings import FindingWriter, Kind, read_findings
 from liftproof.reconcile.baseline import Baseline, take_baseline
-from liftproof.reconcile.engine import ReconcileOptions, Reconciler
+from liftproof.reconcile.engine import REASON_INFINITY, ReconcileOptions, Reconciler
 from liftproof.reconcile.plan import IgnoreRule
 
 pytestmark = pytest.mark.postgres
@@ -169,6 +172,121 @@ def test_baseline_then_reconcile(tmp_path, make_db, adapter_for, pair):
     writer.close()
     findings = list(read_findings(tmp_path / "f3"))
     assert [f.locator for f in findings if f.summary == "row missing in target"] == ["id = 7"]
+
+
+CONTRACTS = """
+CREATE TABLE contracts (id int PRIMARY KEY, valid_from date, valid_to timestamptz);
+INSERT INTO contracts SELECT g, date '2026-01-01' + g,
+  CASE WHEN g % 2 = 0 THEN 'infinity' ELSE timestamptz '2027-01-01 00:00+00' + g * interval '1 hour'
+  END FROM generate_series(1, 2000) g;
+"""
+
+
+@pytest.fixture
+def contracts(make_db, adapter_for):
+    s, sc = make_db("src")
+    t, tc = make_db("tgt")
+    for c in (sc, tc):
+        c.execute(CONTRACTS)
+    return adapter_for(s), adapter_for(t), sc, tc
+
+
+def test_infinity_differences(tmp_path, contracts):
+    """An open ended date that became NULL, or minus infinity, is a changed value: before
+    canonical revision 1 infinity hashed as NULL, and reading its range failed the run."""
+    src, tgt, _, tc = contracts
+    tc.execute("UPDATE contracts SET valid_to = NULL WHERE id = 10")
+    tc.execute("UPDATE contracts SET valid_to = '-infinity' WHERE id = 20")
+    result, findings = _run(tmp_path / "a", src, tgt, show_values=True)
+    [table] = result.tables
+    assert table.status == "different" and table.changed_rows == 2
+    changed = {f.locator: (f.expected, f.actual) for f in findings
+               if f.summary == "value differs in column valid_to"}  # fmt: skip
+    assert changed == {"id = 10": ("infinity", "NULL"), "id = 20": ("infinity", "-infinity")}
+
+    tc.execute("UPDATE contracts SET valid_to = 'infinity' WHERE id IN (10, 20)")
+    result, findings = _run(tmp_path / "b", src, tgt)
+    [table] = result.tables
+    assert table.status == "matched", [f.summary for f in findings]
+    assert table.ranges["valid_to"]["source"] == ["2027-01-01T01:00:00+00:00", "infinity"]
+    assert table.ranges["valid_to"]["target"][1] == "infinity"
+
+
+def test_infinity_mapped_to_null_is_named_as_the_likely_cause(tmp_path, contracts):
+    src, tgt, _, tc = contracts
+    tc.execute("UPDATE contracts SET valid_to = NULL WHERE valid_to = 'infinity'")
+    _, findings = _run(tmp_path, src, tgt, breaker_min_buckets=2)
+    [systemic] = [f for f in findings if f.severity == 5]
+    assert "PostgreSQL infinity dates mapped to NULL" in systemic.summary
+    assert "time zone" not in systemic.summary
+
+
+def _strip(manifest, tables, *, keep_ranges=()):
+    """The manifest as a build from before canonical revisions wrote it for these tables:
+    no revision, and no data ranges unless kept (the oldest builds wrote none)."""
+    doc = json.loads(manifest.read_text())
+    for q in tables:
+        entry = doc["tables"][q]
+        del entry["canonical_revision"]
+        if q not in keep_ranges:
+            entry.pop("ranges")
+    manifest.write_text(json.dumps(doc))
+    return Baseline.load(manifest)
+
+
+def test_a_baseline_from_before_revisions(tmp_path, contracts, monkeypatch):
+    src, tgt, sc, tc = contracts
+    for c in (sc, tc):
+        c.execute("CREATE TABLE events (id int PRIMARY KEY, at date);"
+                  "CREATE TABLE plain (id int PRIMARY KEY, v text);"
+                  "CREATE TABLE docs (id int PRIMARY KEY, body jsonb, at date);"
+                  "INSERT INTO events SELECT g, date '2026-01-01' + g FROM generate_series(1, 9) g;"
+                  "INSERT INTO plain SELECT g, 'v' || g FROM generate_series(1, 9) g;"
+                  "INSERT INTO docs SELECT g, '{\"a\": 1}', date '2026-01-01' + g "
+                  "FROM generate_series(1, 9) g")  # fmt: skip
+    manifest = tmp_path / "b1" / "manifest.json"
+    take_baseline(src, manifest, baseline_id="b1", schemas=["public"], tables=None, ignore=[],
+                  business_keys={}, rows_per_bucket=1000, precision=6)  # fmt: skip
+    b = Baseline.load(manifest)
+    assert {t.canonical_revision for t in b.tables.values()} == {CANONICAL_REVISION}
+
+    def compare(name, baseline, source=None):
+        writer = FindingWriter(tmp_path / name, name)
+        opts = ReconcileOptions(rows_per_bucket=1000)
+        result = Reconciler(tgt, writer, opts, baseline=baseline, source=source).run()
+        writer.close()
+        return {t.table: t for t in result.tables}, list(read_findings(tmp_path / name))
+
+    tables, _ = compare("f1", b)
+    assert {t.status for t in tables.values()} == {"matched"}  # infinity in the baseline too
+
+    # Old entries are reused when nothing could have hashed as NULL: their data ranges
+    # cover every date column, they have none, or they were hashed here (JSON)
+    old = _strip(manifest, list(b.tables), keep_ranges=["public.events"])
+    tables, findings = compare("f2", old)
+    assert tables["public.contracts"].status == "not_checked"
+    assert tables["public.contracts"].reason.endswith(
+        "take a new baseline, or compare with the live source without --baseline"
+    )
+    [f] = [f for f in findings if f.detail.get("reason") == REASON_INFINITY]
+    assert f.kind == Kind.NOT_CHECKED and f.detail["baseline_canonical_revision"] == 0
+    for q in ("public.events", "public.plain", "public.docs"):
+        assert tables[q].status == "matched", q  # no live source: the baseline was reused
+
+    # the live source does not stand in for it: replication was checked at the baseline
+    hashed = []
+    monkeypatch.setattr(src, "bucket_aggregates", lambda plan: hashed.append(plan))
+    tables, _ = compare("f3", old, source=src)
+    assert tables["public.contracts"].status == "not_checked" and hashed == []
+
+    target = tmp_path / "t1" / "manifest.json"
+    take_baseline(tgt, target, baseline_id="t1", schemas=["public"], tables=["contracts"],
+                  ignore=[], business_keys={}, rows_per_bucket=1000, precision=6,
+                  side="target")  # fmt: skip
+    tables, _ = compare("f4", _strip(target, ["public.contracts"]))
+    assert tables["public.contracts"].reason == (
+        f"{REASON_INFINITY}; take a new target baseline (liftproof rebaseline)"
+    )
 
 
 @pytest.mark.postgres

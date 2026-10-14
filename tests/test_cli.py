@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from liftproof import cli
+from liftproof.canonical import CANONICAL_REVISION
 from liftproof.config import LOCK_TIMEOUT_MS, SOURCE_PAUSE_MS, SOURCE_ROWS_PER_SECOND
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_OK, EXIT_RUN_FAILED
@@ -161,6 +162,7 @@ def test_version_reports_sdk(capsys):
     assert cli.main(["version", "--format", "json"]) == EXIT_OK
     info = json.loads(capsys.readouterr().out)
     assert info["canonical_version"] == "1.0" and "botocore" in info
+    assert info["canonical_revision"] == CANONICAL_REVISION
 
 
 def test_init_writes_template(tmp_path):
@@ -307,6 +309,7 @@ def test_support_bundle_carries_the_run_without_values(tmp_path, dbs, capsys, mo
     assert changed and changed[0]["expected"] == "[redacted]"
     env = json.loads(bundle.read("environment.json"))
     assert env["canonical_version"] and env["packages"]["psycopg"]
+    assert env["canonical_revision"] == CANONICAL_REVISION
     # also in the store, for an operator who has no shell on the instance
     assert (tmp_path / "work/acme/support" / out["bundle"].rsplit("/", 1)[1]).exists()
 

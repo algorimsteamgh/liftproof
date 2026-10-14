@@ -8,6 +8,7 @@ prove that they do.
 """
 
 from liftproof.canonical.encoding import (
+    CANONICAL_REVISION,
     CANONICAL_VERSION,
     GROUP_SIZE,
     HASH_ALGORITHM,
@@ -26,6 +27,7 @@ from liftproof.canonical.render import Verbatim, render
 from liftproof.canonical.types import CanonicalType
 
 __all__ = [
+    "CANONICAL_REVISION",
     "CANONICAL_VERSION",
     "GROUP_SIZE",
     "HASH_ALGORITHM",

@@ -172,8 +172,10 @@ A resumed run compares only the tables it had not finished and keeps the run id,
 reference baseline and the sampling of the first attempt; its report says when it
 resumed. Against a live source, the tables compared after the resume are read as of the
 resume. The lost instance's run lock expires 15 minutes after its last renewal; until
-then a resume is refused with exit code 2. A run that fails rather than stops names each
-table, file set and journey it never reached as not checked.
+then a resume is refused with exit code 2. A resume on a build that hashes under another
+canonical revision (docs/canonical-v1.md) is refused with exit code 3: start a new run. A
+run that fails rather than stops names each table, file set and journey it never reached
+as not checked.
 
 ## Exit codes
 
@@ -200,9 +202,12 @@ schemas and tables, the run window and, per table and side, the lowest and highe
 and the earliest and latest value of each date and time column of the rows compared
 (`data_ranges`). Those are aggregates of integer keys and dates only; a text key's ends
 appear only with `show_values`. `database.ranges: false` turns them off, saving one
-MIN/MAX statement per table and side. `liftproof report --run ID` rebuilds the HTML and
-JSON from the run's findings and keeps what the run was (its reference, window, schedule
-and who ran it), adding when it was regenerated.
+MIN/MAX statement per table and side. A PostgreSQL date or timestamp can be `infinity` or
+`-infinity`, shown and compared as those words: never equal to NULL or to a sentinel date
+on the other side. The run block records the canonical version and revision the run
+hashed under. `liftproof report --run ID` rebuilds the HTML and JSON from the run's
+findings and keeps what the run was (its reference, window, schedule and who ran it),
+adding when it was regenerated.
 
 ## Tests
 

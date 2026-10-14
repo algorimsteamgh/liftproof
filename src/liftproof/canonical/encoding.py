@@ -31,6 +31,10 @@ from liftproof.canonical.render import render
 from liftproof.canonical.types import CanonicalType
 
 CANONICAL_VERSION = "1.0"
+# Rules added within a version that give a rendering to values that had none (they failed
+# to load, or hashed as NULL); a baseline records the revision of each table it holds.
+#   1: PostgreSQL infinity and -infinity dates and timestamps
+CANONICAL_REVISION = 1
 HASH_ALGORITHM = "md5"
 GROUP_SIZE = 32
 MOD64 = 1 << 64

@@ -17,6 +17,7 @@ import yaml
 
 from liftproof import checkpoint as ckpt
 from liftproof import cli
+from liftproof.canonical import CANONICAL_REVISION
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_RUN_FAILED
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, read_findings
@@ -186,6 +187,32 @@ def test_a_failed_run_names_what_it_never_compared_and_resumes(tmp_path, project
     differences = Counter(f["object"] for f in report["findings"] if f["kind"] == "difference")
     assert len(differences) == 4 and len(set(differences.values())) == 1
     assert not [f for f in report["findings"] if f["kind"] in ("error", "not_checked")]
+
+
+def test_a_resume_under_other_canonical_rules_is_refused(tmp_path, project, monkeypatch, s3,
+                                                         capsys):  # fmt: skip
+    """Its finished tables were hashed under the rules of the build that started it."""
+    work = tmp_path / "w"
+    original = Reconciler._table
+
+    def flaky(self, ref, tref):
+        if ref.name == "t3":
+            raise ConnectionError("server closed the connection unexpectedly")
+        return original(self, ref, tref)
+
+    monkeypatch.setattr(Reconciler, "_table", flaky)
+    code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--run-id", "r3")
+    assert code == EXIT_RUN_FAILED
+    key = "acme/runs/r3/progress.json"
+    saved = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+    assert saved["canonical_revision"] == CANONICAL_REVISION
+    del saved["canonical_revision"]  # as a build from before canonical revisions saved it
+    s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(saved).encode())
+    monkeypatch.setattr(Reconciler, "_table", original)
+    capsys.readouterr()
+    code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
+    assert code == EXIT_CONFIG
+    assert "started under canonical revision 0" in capsys.readouterr().err
 
 
 def test_baseline_resumes_on_a_replacement_instance(tmp_path, project, monkeypatch, s3):

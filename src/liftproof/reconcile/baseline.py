@@ -34,7 +34,13 @@ from liftproof.adapters.base import (
     TableRef,
     TableSchema,
 )
-from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM, CanonicalType, reduce_total
+from liftproof.canonical import (
+    CANONICAL_REVISION,
+    CANONICAL_VERSION,
+    HASH_ALGORITHM,
+    CanonicalType,
+    reduce_total,
+)
 from liftproof.errors import ConfigError
 from liftproof.reconcile import ranges
 from liftproof.reconcile.plan import IgnoreRule, plan_table
@@ -51,6 +57,8 @@ class BaselineTable:
     completed_at: str
     # the report's data ranges of this side when the baseline was taken (ranges.py)
     ranges: dict[str, list[Any]] = field(default_factory=dict)
+    # the canonical revision it was hashed under; 0 for entries from before revisions
+    canonical_revision: int = CANONICAL_REVISION
 
     @property
     def aggregate(self) -> str:
@@ -79,6 +87,7 @@ class BaselineTable:
             },
             "completed_at": self.completed_at,
             "ranges": self.ranges,
+            "canonical_revision": self.canonical_revision,
         }
 
     @classmethod
@@ -103,8 +112,26 @@ class BaselineTable:
             int(b): BucketAggregate(int(c), int(t)) for b, (c, t) in d["bucket_aggregates"].items()
         }
         return cls(
-            schema, plan, int(d["row_count"]), buckets, d["completed_at"], d.get("ranges", {})
+            schema,
+            plan,
+            int(d["row_count"]),
+            buckets,
+            d["completed_at"],
+            d.get("ranges", {}),
+            int(d.get("canonical_revision", 0)),
         )
+
+
+def hashed_infinity_as_null(engine: str, entry: BaselineTable) -> bool:
+    """Whether a PostgreSQL entry from before canonical revision 1 can hold an infinity
+    date or timestamp hashed as NULL. Not when it was hashed here (a JSON column): loading
+    infinity failed then. Nor when its data ranges cover every date column: reading the
+    ranges of a column holding infinity failed too."""
+    if engine != "postgresql" or entry.canonical_revision >= 1:
+        return False
+    if any(t == CanonicalType.JSON for _, t in entry.plan.columns):
+        return False
+    return any(t in ranges.DATES and n not in entry.ranges for n, t in entry.plan.columns)
 
 
 @dataclass
@@ -158,6 +185,15 @@ class Baseline:
                 f"baseline {d['baseline_id']} was computed under canonical "
                 f"{d['canonical_version']}/{d['hash_algorithm']}; this build uses "
                 f"{CANONICAL_VERSION}/{HASH_ALGORITHM}. They cannot be compared."
+            )
+        revision = max(
+            (int(t.get("canonical_revision", 0)) for t in d["tables"].values()), default=0
+        )
+        if revision > CANONICAL_REVISION:
+            raise ConfigError(
+                f"baseline {d['baseline_id']} was hashed under canonical revision {revision}; "
+                f"this build knows revision {CANONICAL_REVISION} and cannot compare it. "
+                "Use a build at least as new as the one that took it."
             )
         b = cls(
             d["baseline_id"],

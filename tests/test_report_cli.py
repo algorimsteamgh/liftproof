@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from liftproof import cli
+from liftproof.canonical import CANONICAL_REVISION
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_DIFFERENCES, EXIT_OK
 from tests.conftest import PG
@@ -127,8 +128,10 @@ def test_regenerating_a_report_keeps_what_the_run_was(tmp_path, project):
     after = _report(tmp_path, "r1")
     assert after["range"] == before["range"]
     assert after["range"]["reference"] == "source baseline b1"
-    for key in ("started_at", "finished_at", "schedule", "invoked_by", "product_version"):
+    for key in ("started_at", "finished_at", "schedule", "invoked_by", "product_version",
+                "canonical_revision"):  # fmt: skip
         assert after["run"][key] == before["run"][key], key
+    assert before["run"]["canonical_revision"] == CANONICAL_REVISION
     assert after["run"]["regenerated"]["at"] >= before["run"]["finished_at"]
     assert after["findings"] == before["findings"]
 
