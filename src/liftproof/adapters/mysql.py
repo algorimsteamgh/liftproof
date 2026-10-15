@@ -42,38 +42,8 @@ from liftproof.adapters.base import (
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, Verbatim, column_digest
 from liftproof.canonical import value64 as _value64
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
-
-TYPE_MAP: dict[str, CanonicalType] = {
-    "tinyint": CanonicalType.INTEGER,
-    "smallint": CanonicalType.INTEGER,
-    "mediumint": CanonicalType.INTEGER,
-    "int": CanonicalType.INTEGER,
-    "bigint": CanonicalType.INTEGER,
-    "year": CanonicalType.INTEGER,
-    "decimal": CanonicalType.DECIMAL,
-    "float": CanonicalType.FLOAT,
-    "double": CanonicalType.FLOAT,
-    "varchar": CanonicalType.TEXT,
-    "tinytext": CanonicalType.TEXT,
-    "text": CanonicalType.TEXT,
-    "mediumtext": CanonicalType.TEXT,
-    "longtext": CanonicalType.TEXT,
-    "enum": CanonicalType.TEXT,
-    "set": CanonicalType.TEXT,
-    "char": CanonicalType.CHAR,
-    "date": CanonicalType.DATE,
-    "time": CanonicalType.TIME,
-    "datetime": CanonicalType.TIMESTAMP,  # no zone: rendered as stored
-    "timestamp": CanonicalType.TIMESTAMPTZ,  # stored as UTC, read in a UTC session
-    "binary": CanonicalType.BINARY,
-    "varbinary": CanonicalType.BINARY,
-    "tinyblob": CanonicalType.BINARY,
-    "blob": CanonicalType.BINARY,
-    "mediumblob": CanonicalType.BINARY,
-    "longblob": CanonicalType.BINARY,
-    "json": CanonicalType.JSON,
-}
 
 TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
 PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {
@@ -478,9 +448,7 @@ class MySQLAdapter(Adapter):
         cols = []
         for name, data_type, column_type, nullable in rows:
             native = str(column_type).lower()
-            ctype = TYPE_MAP.get(str(data_type).lower(), CanonicalType.UNSUPPORTED)
-            if native.startswith("tinyint(1)"):
-                ctype = CanonicalType.BOOLEAN  # MySQL's BOOLEAN is TINYINT(1)
+            ctype = DEFAULT_TYPE_MAP.canonical(self.engine, native)
             cols.append(Column(name, native, ctype, fixed_width=data_type == "char",
                                nullable=nullable == "YES"))  # fmt: skip
         # each index's key parts in order; an expression (functional key part) has no

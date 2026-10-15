@@ -162,6 +162,27 @@ A baseline records each table's structure. One taken by an earlier build has non
 only primary keys are compared against it, and the report's range block (`structure`)
 names those tables.
 
+Which canonical type each native type is compared as comes from the type map,
+`src/liftproof/canonical/typemap.yaml` (docs/canonical-v1.md). A column the target holds as
+another type, such as a MySQL `tinyint(1)` moved into a `smallint`, is a type change and is
+left out of the data comparison. Where the move was intended, the project compares it as one
+of the alternatives the map lists for that type:
+
+```yaml
+database:
+  type_map:
+    mysql:
+      tinyint(1): integer      # the target column is a smallint
+      datetime: timestamptz    # it holds UTC times
+    oracle:
+      NUMBER(1): boolean       # 0 is false, any other value true
+      DATE: date               # a DATE with a time of day still differs
+```
+
+The report names each column compared so and records the map's version and overrides. A
+baseline taken under another map is hashed again from the source for the tables whose plan
+it changes; without the source they are not checked, naming the columns.
+
 ## Record and replay
 
 ```bash
@@ -235,7 +256,8 @@ resume. A resumed baseline reads the tables left in a new snapshot (one each wit
 the source), and replication must reach that later point. The lost instance's run
 lock expires 15 minutes after its last renewal; until then a resume is refused with exit
 code 2. A resume on a build that hashes under another canonical revision
-(docs/canonical-v1.md) is refused with exit code 3: start a new run. A run that fails
+(docs/canonical-v1.md) is refused with exit code 3: start a new run. So is a resume of a run
+or a baseline under another `database.type_map` than it was started with. A run that fails
 rather than stops names each table, file set and journey it never reached as not checked.
 
 ## Exit codes
@@ -295,7 +317,7 @@ PRD F6 acceptance test (a ten row injected difference, reported exactly).
 ## Layout
 
 ```
-src/liftproof/canonical   canonical v1.0 encoding and hashing (docs/canonical-v1.md)
+src/liftproof/canonical   canonical v1.0 encoding and hashing, the type map (docs/canonical-v1.md)
 src/liftproof/adapters    one adapter per database engine
 src/liftproof/reconcile   planning, baselines, reconciliation
 src/liftproof/web         recorder, replay engine, UI and API comparison

@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
 from liftproof.files.compare import FileSetConfig, IgnoreFile
 from liftproof.reconcile.baseline import SNAPSHOT_MODES
@@ -247,6 +248,9 @@ def _options(
     )
     opts.replication = ReplicationConfig.from_dict(d.get("replication"))
     opts.structure = _structure(d.get("structure", True))
+    if d.get("type_map") is not None:
+        engines = {c.engine for c in (source, target) if c is not None}
+        opts.type_map = DEFAULT_TYPE_MAP.with_overrides(d["type_map"], engines)
     breaker = d.get("circuit_breaker") or {}
     opts.breaker_bucket_ratio = float(breaker.get("bucket_ratio", opts.breaker_bucket_ratio))
     opts.breaker_table_ratio = float(breaker.get("table_ratio", opts.breaker_table_ratio))
@@ -534,6 +538,13 @@ database:
   ranges: true                  # lowest/highest integer key and dates per table, in the report
   business_keys: {{}}           # e.g. orders: [order_number] where keys were renumbered
   workers: 1                    # tables hashed at once; each is another source connection
+  # type_map:                  # how native types compare (docs/canonical-v1.md); the
+  #   mysql:                    # report names each column compared otherwise
+  #     tinyint(1): integer     # the target column is a smallint, not a boolean
+  #     datetime: timestamptz   # it holds UTC times; the target's are zone aware
+  #   oracle:
+  #     NUMBER(1): boolean      # 0 is false, any other value true
+  #     DATE: date              # a DATE with a time of day differs from every date
   # structure:                  # compared before data; false turns all of it off
   #   nullability: true
   #   keys: true                # primary and unique keys

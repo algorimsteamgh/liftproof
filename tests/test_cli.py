@@ -9,6 +9,7 @@ import yaml
 
 from liftproof import cli
 from liftproof.canonical import CANONICAL_REVISION
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.config import LOCK_TIMEOUT_MS, SOURCE_PAUSE_MS, SOURCE_ROWS_PER_SECOND
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_OK, EXIT_RUN_FAILED
@@ -163,6 +164,7 @@ def test_version_reports_sdk(capsys):
     info = json.loads(capsys.readouterr().out)
     assert info["canonical_version"] == "1.0" and "botocore" in info
     assert info["canonical_revision"] == CANONICAL_REVISION
+    assert info["type_map_version"] == "1.0"
 
 
 def test_init_writes_template(tmp_path):
@@ -310,6 +312,10 @@ def test_support_bundle_carries_the_run_without_values(tmp_path, dbs, capsys, mo
     env = json.loads(bundle.read("environment.json"))
     assert env["canonical_version"] and env["packages"]["psycopg"]
     assert env["canonical_revision"] == CANONICAL_REVISION
+    assert env["type_map_version"] == "1.0"
+    type_map = DEFAULT_TYPE_MAP.record("postgresql")
+    assert json.loads(bundle.read("project.json"))["database"]["type_map"] == type_map
+    assert json.loads(bundle.read("run/report.json"))["run"]["type_map"] == type_map
     # why a structure check was not made: switched off, or a structure rule with its reason
     every = {"nullability": True, "keys": True, "foreign_keys": True, "indexes": True}
     assert json.loads(bundle.read("project.json"))["database"]["structure"] == every

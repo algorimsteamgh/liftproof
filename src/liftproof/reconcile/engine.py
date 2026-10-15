@@ -22,11 +22,12 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from liftproof.adapters.base import Adapter, BucketAggregate, HashPlan, TableRef, TableSchema
 from liftproof.canonical import CanonicalType, RenderError, RowHasher, column_digest, reduce_total
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, TypeMap
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity
 from liftproof.reconcile import ranges
 from liftproof.reconcile.baseline import Baseline, hashed_infinity_as_null
@@ -36,6 +37,7 @@ from liftproof.reconcile.plan import (
     NOT_IN_BASELINE,
     IgnoreRule,
     TablePlan,
+    map_types,
     plan_table,
     row_filter,
 )
@@ -82,6 +84,8 @@ class ReconcileOptions:
     ranges: bool = True
     # nullability, keys, foreign keys and indexes compared before data (spec 9.13)
     structure: StructureChecks = field(default_factory=StructureChecks)
+    # how native types compare: the shipped map with the project's overrides (spec 9.13)
+    type_map: TypeMap = field(default_factory=lambda: DEFAULT_TYPE_MAP)
 
 
 @dataclass
@@ -127,6 +131,13 @@ class ReconcileResult:
 
 def _short(h: str) -> str:
     return f"md5:{h[:12]}"
+
+
+def _replanned(old: HashPlan, new: HashPlan) -> set[str]:
+    """Lower cased columns hashed in one plan and not the other, or as another type."""
+    a = {n.lower(): t for n, t in old.columns}
+    b = {n.lower(): t for n, t in new.columns}
+    return {n for n in a.keys() | b.keys() if a.get(n) != b.get(n)}
 
 
 def _target_plan(plan: HashPlan, target: TableSchema) -> HashPlan:
@@ -468,15 +479,24 @@ class Reconciler:
     def _table(self, table: TableRef, ttable: TableRef) -> TableResult:
         unhashed: dict[str, tuple[str, str]] = getattr(self._local, "unhashed", {})
         q = table.qualified
-        tschema = self.target.describe(ttable)
+        tm = self.o.type_map
+        tschema, t_over = map_types(self.target.describe(ttable), self.target.engine, tm, "target")
         base_entry = self.baseline.tables.get(q) if self.baseline else None
+        retyped: set[str] = set()  # columns the map types otherwise than the baseline did
         if base_entry is not None:
-            sschema = base_entry.schema
+            sschema, s_over = map_types(base_entry.schema, self.baseline.engine, tm, self.reference)
+            retyped = {
+                c.name.lower()
+                for c, was in zip(sschema.columns, base_entry.schema.columns, strict=True)
+                if c.canonical != was.canonical
+            }
             source_rows = base_entry.row_count
         else:
-            sschema = self.source.describe(table)
+            described = self.source.describe(table)
+            sschema, s_over = map_types(described, self.source.engine, tm, "source")
             with self.source.pacer.statement() as counted:
                 source_rows = counted.rows = self.source.row_count(table)
+        overridden = s_over + t_over
 
         tp: TablePlan = plan_table(
             sschema,
@@ -488,6 +508,7 @@ class Reconciler:
             business_key=self.o.business_keys.get(q) or self.o.business_keys.get(table.name),
             side="target" if self.against_target else "source",
             unhashed={**(base_entry.unhashed if base_entry else {}), **unhashed},
+            type_map=tm,
         )
         plan = tp.plan
         if base_entry is not None:
@@ -528,6 +549,18 @@ class Reconciler:
                 f"column excluded: {reason}",
                 column=col,
                 detail={"reason": reason},
+            )
+        if overridden:
+            self.emit(
+                Kind.NOTICE,
+                Severity.INFO,
+                q,
+                "columns compared under the project's type map: "
+                + ", ".join(
+                    f"{o.column} ({o.side} {o.native} as {o.canonical}, default {o.default})"
+                    for o in overridden
+                ),
+                detail={"type_map": [asdict(o) for o in overridden]},
             )
         res.structure_differences = self._structure(q, sschema, tschema)
         if tp.partial:
@@ -620,7 +653,15 @@ class Reconciler:
                 if self.against_target
                 else "schema changed since the baseline; the live source is needed to re-hash"
             )
-            if base_entry is not None and unhashed:
+            typed = retyped | {o.column.lower() for o in overridden}
+            mapped = sorted(typed & _replanned(base_entry.plan, plan)) if base_entry else []
+            if mapped:
+                res.reason = f"the type map compares {', '.join(mapped)} otherwise than the " + (
+                    "target baseline did; rebaseline to apply it"
+                    if self.against_target
+                    else "baseline did; the live source is needed to re-hash"
+                )
+            elif base_entry is not None and unhashed:
                 res.reason = (
                     f"the baseline hashed {', '.join(sorted(unhashed))}, which cannot be "
                     "canonicalised now; "

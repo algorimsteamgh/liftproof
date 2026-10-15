@@ -116,6 +116,8 @@ class RunProgress:
     complete: bool = False
     resumed_at: list[str] = field(default_factory=list)
     canonical_revision: int = CANONICAL_REVISION  # a resume must hash under the same rules
+    # the type map it compares under (TypeMap.record); None: saved before it was kept
+    type_map: dict[str, Any] | None = None
 
     def done(self) -> list[TableResult]:
         return [TableResult(**t) for t in self.tables]

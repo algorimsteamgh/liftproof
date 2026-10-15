@@ -39,8 +39,9 @@ class Verbatim(str):
     """A value the adapter rendered itself, used as is.
 
     Only for engine values that have no canonical type value at all, such as MySQL zero
-    dates, a MySQL TIME outside one day or a PostgreSQL infinity date. The adapter's
-    pushdown must render the same text; see docs/canonical-v1.md.
+    dates, a MySQL TIME outside one day, a PostgreSQL infinity date or an Oracle DATE with
+    a time of day compared as date. The adapter's pushdown must render the same text; see
+    docs/canonical-v1.md.
     """
 
 

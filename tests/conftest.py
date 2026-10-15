@@ -13,6 +13,7 @@ import psycopg
 import pytest
 
 from liftproof.adapters.postgres import PostgresAdapter
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 
 PG = {
     "host": os.environ.get("LIFTPROOF_TEST_PG_HOST", "/tmp"),
@@ -20,6 +21,19 @@ PG = {
     "user": os.environ.get("LIFTPROOF_TEST_PG_USER", "postgres"),
     "password": os.environ.get("LIFTPROOF_TEST_PG_PASSWORD") or None,
 }
+
+
+def type_map_alternatives(engine: str, columns: dict[str, str]) -> list[tuple[str, object]]:
+    """(fixture column, canonical type) for each alternative the shipped type map lets a
+    project choose on this engine, and for each type a compatible pair widens one to.
+    columns: type map key -> a fixture column of that type; one missing fails collection."""
+    out = []
+    for key, rule in DEFAULT_TYPE_MAP.engines[engine].items():
+        for ctype in rule.also:
+            out.append((columns[key], ctype))
+            out += [(columns[key], c) for types, c in DEFAULT_TYPE_MAP.compatible
+                    if ctype in types and c != ctype]  # fmt: skip
+    return out
 
 
 def _admin():

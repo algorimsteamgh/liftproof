@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from liftproof.adapters.base import HashPlan, TableSchema
 from liftproof.canonical import CanonicalType
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, TypeMap
 
 
 @dataclass
@@ -91,6 +92,33 @@ class TablePlan:
         return bool(self.excluded_columns)
 
 
+@dataclass
+class TypeOverride:
+    """A column the project's type map compares otherwise than the default (spec 9.13)."""
+
+    column: str
+    side: str
+    native: str
+    canonical: str
+    default: str
+
+
+def map_types(
+    schema: TableSchema, engine: str, type_map: TypeMap, side: str
+) -> tuple[TableSchema, list[TypeOverride]]:
+    """The schema with each column typed by the project's type map, and the columns typed
+    otherwise than by the default. A baseline's stored schema is typed again too, so a
+    changed map changes the plan and the baseline's aggregates are not reused under it."""
+    columns, overridden = [], []
+    for c in schema.columns:
+        ctype = type_map.canonical(engine, c.native_type)
+        default = type_map.default(engine, c.native_type)
+        if ctype != default:
+            overridden.append(TypeOverride(c.name, side, c.native_type, str(ctype), str(default)))
+        columns.append(replace(c, canonical=ctype))
+    return replace(schema, columns=columns), overridden
+
+
 def canonical_order(names: list[str]) -> list[str]:
     return sorted(names, key=lambda n: n.lower().encode("utf-8"))
 
@@ -110,6 +138,7 @@ def plan_table(
     business_key: list[str] | None = None,
     side: str = "source",
     unhashed: dict[str, tuple[str, str]] | None = None,
+    type_map: TypeMap = DEFAULT_TYPE_MAP,
 ) -> TablePlan:
     """Plan the comparison of one table over the intersection of mapped columns.
 
@@ -146,12 +175,8 @@ def plan_table(
                 )
                 continue
             if tcol.canonical != ctype:
-                if {ctype, tcol.canonical} <= {CanonicalType.CHAR, CanonicalType.TEXT}:
-                    ctype = CanonicalType.TEXT  # strip rule only fires when both are fixed width
-                elif {ctype, tcol.canonical} == {CanonicalType.INTEGER, CanonicalType.DECIMAL}:
-                    # a whole number renders the same either way (Oracle NUMBER to bigint);
-                    # a fraction lost in the move shows up as a changed value
-                    ctype = CanonicalType.DECIMAL
+                if common := type_map.common(ctype, tcol.canonical):
+                    ctype = common  # a compatible pair: char and text, integer and decimal
                 else:
                     issues.append(
                         ColumnIssue(

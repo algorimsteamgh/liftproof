@@ -10,6 +10,7 @@ import yaml
 
 from liftproof import cli
 from liftproof.canonical import CANONICAL_REVISION
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_DIFFERENCES, EXIT_OK
 from tests.conftest import PG
@@ -129,9 +130,10 @@ def test_regenerating_a_report_keeps_what_the_run_was(tmp_path, project):
     assert after["range"] == before["range"]
     assert after["range"]["reference"] == "source baseline b1"
     for key in ("started_at", "finished_at", "schedule", "invoked_by", "product_version",
-                "canonical_revision"):  # fmt: skip
+                "canonical_revision", "type_map"):  # fmt: skip
         assert after["run"][key] == before["run"][key], key
     assert before["run"]["canonical_revision"] == CANONICAL_REVISION
+    assert before["run"]["type_map"] == DEFAULT_TYPE_MAP.record("postgresql")
     assert after["run"]["regenerated"]["at"] >= before["run"]["finished_at"]
     assert after["findings"] == before["findings"]
 
@@ -145,14 +147,24 @@ def test_a_report_rebuilt_from_a_checkpoint_states_its_revision(tmp_path, projec
     progress = run_dir / "progress.json"
     saved = json.loads(progress.read_text())
     assert saved["canonical_revision"] == CANONICAL_REVISION
+    assert saved["type_map"] == DEFAULT_TYPE_MAP.record("postgresql")
+
+    def rebuilt(progress_saved):
+        progress.write_text(json.dumps(progress_saved))
+        for name in ("report.json", "report.html"):
+            (run_dir / name).unlink()
+        cli.main(["report", "--project", str(project), "--run", "r1", *work])
+        return _report(tmp_path, "r1")["run"]
+
+    # the map the run compared under, not the project file's of today
+    other = {"version": "1.0", "overrides": {"postgresql": {"x": "y"}},
+             "fingerprints": {"postgresql": "0" * 16}}  # fmt: skip
+    assert rebuilt(dict(saved, complete=False, type_map=other))["type_map"] == other
     # as a build from before canonical revisions left a run it never finished
-    del saved["canonical_revision"]
-    saved["complete"] = False
-    progress.write_text(json.dumps(saved))
-    for name in ("report.json", "report.html"):
-        (run_dir / name).unlink()
-    cli.main(["report", "--project", str(project), "--run", "r1", *work])
-    assert _report(tmp_path, "r1")["run"]["canonical_revision"] == 0
+    del saved["canonical_revision"], saved["type_map"]
+    run = rebuilt(dict(saved, complete=False))
+    assert run["canonical_revision"] == 0
+    assert run["type_map"] == DEFAULT_TYPE_MAP.record("postgresql")  # the 1.0 defaults
 
 
 def test_the_classification_follows_show_values_for_files(tmp_path):

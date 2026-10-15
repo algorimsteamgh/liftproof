@@ -27,6 +27,7 @@ from liftproof.adapters.oracle import OracleAdapter
 from liftproof.adapters.postgres import PostgresAdapter
 from liftproof.adapters.sqlserver import SQLServerAdapter
 from liftproof.canonical import CANONICAL_REVISION, CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, legacy_record, shown
 from liftproof.config import TEMPLATE, Connection, Project, load_project
 from liftproof.credentials import from_secrets_manager, secret_value
 from liftproof.errors import (
@@ -186,6 +187,7 @@ def cmd_version(args: argparse.Namespace) -> int:
         "canonical_version": CANONICAL_VERSION,
         "canonical_revision": CANONICAL_REVISION,
         "hash_algorithm": HASH_ALGORITHM,
+        "type_map_version": DEFAULT_TYPE_MAP.version,
         **aws.sdk_versions(),
         "python": sys.version.split()[0],
     }
@@ -275,6 +277,7 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
             checkpoint=lambda: throttle.due() and ckpt.keep(store, key, manifest),
             with_ranges=o.ranges,
             snapshot=conn.snapshot,
+            type_map=o.type_map,
         )
     store.put_file(key, manifest)
     ckpt.set_marker(store, marker_local, marker_key, "")
@@ -655,7 +658,14 @@ SEGMENT_SECONDS = 60.0
 RESUMED_OPTIONS = ("tables", "no_source", "show_values", "include_replay_rows")
 
 
-def _restore_run(store: Store, run_dir: Path, run_id: str) -> ckpt.RunProgress:
+def _type_map(project: Project, legacy: bool = False) -> dict[str, Any]:
+    """The type map a database run compares under, as its checkpoint and report keep it;
+    `legacy`: the one a checkpoint saved before it was kept was taken under."""
+    engines = [c.engine for c in project.require_database()]
+    return legacy_record(*engines) if legacy else project.database.type_map.record(*engines)
+
+
+def _restore_run(store: Store, run_dir: Path, run_id: str, project: Project) -> ckpt.RunProgress:
     """The progress of an interrupted reconciliation and the findings it had written,
     from the store: the instance that ran it may be gone."""
     local = run_dir / ckpt.PROGRESS
@@ -670,6 +680,14 @@ def _restore_run(store: Store, run_dir: Path, run_id: str) -> ckpt.RunProgress:
         raise ConfigError(
             f"run {run_id} was started under canonical revision {progress.canonical_revision} "
             f"and this build hashes under revision {CANONICAL_REVISION}; start a new run"
+        )
+    started = progress.type_map or _type_map(project, legacy=True)
+    now = _type_map(project)
+    if started["fingerprints"] != now["fingerprints"]:
+        # its finished tables were compared under other types than the rest would be
+        raise ConfigError(
+            f"run {run_id} was started under {shown(started)}, not {shown(now)}; resume it "
+            "with the database.type_map it was started with, or start a new run"
         )
     for name in progress.segments:
         seg = run_dir / name
@@ -697,7 +715,7 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     started = _now()
     progress = None
     if getattr(args, "resume", False):
-        progress = _restore_run(store, run_dir, run_id)
+        progress = _restore_run(store, run_dir, run_id, project)
         for name in RESUMED_OPTIONS:
             setattr(args, name, progress.options.get(name))
         args.baseline = progress.baseline
@@ -713,7 +731,10 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     checkpoint = None
     if mode == "reconcile":
         progress = progress or ckpt.RunProgress(
-            run_id, started, {k: getattr(args, k, None) for k in RESUMED_OPTIONS}
+            run_id,
+            started,
+            {k: getattr(args, k, None) for k in RESUMED_OPTIONS},
+            type_map=_type_map(project),
         )
         checkpoint = ckpt.RunCheckpoint(store, run_dir, progress, writer, uploads)
         ckpt.set_marker(store, workdir / ckpt.RUN_MARKER, ckpt.RUN_MARKER, run_id)
@@ -1054,11 +1075,12 @@ def _report(
     finished_at=None,
     prior=None,
     canonical_revision=None,
+    type_map=None,
 ) -> dict[str, Any]:
     """`prior` is the run's own report when one is regenerated: what the run was (its
     reference, window, schedule, who ran it, versions) is taken from it as recorded,
-    never restated from today's project file. `canonical_revision`: the one a run that
-    wrote no report hashed under, from its checkpoint."""
+    never restated from today's project file. `canonical_revision` and `type_map`: those a
+    run that wrote no report compared under, from its checkpoint."""
     findings = list(read_findings(run_dir))
     o = project.database
     finished_at = finished_at or _now()
@@ -1112,6 +1134,7 @@ def _report(
                 "tls": {"source": project.source.sslmode, "target": project.target.sslmode},
                 "rows_per_bucket": o.rows_per_bucket,
                 "timestamp_precision": o.precision,
+                "type_map": type_map or _type_map(project),
             }
         )
         if result.protection:
@@ -1357,7 +1380,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     )
     store = _store(project, Path(args.workdir))
     baseline = None
-    revision = None
+    revision = type_map = None
     progress_file = run_dir / ckpt.PROGRESS
     if not prior and progress_file.exists():
         # no report was written (the run stopped): its checkpoint names the reference
@@ -1365,6 +1388,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         progress = ckpt.RunProgress.load(progress_file)
         started = progress.started_at
         revision = progress.canonical_revision
+        type_map = progress.type_map or _type_map(project, legacy=True)
         if progress.baseline:
             baseline = _baseline_by_id(store, workdir, progress.baseline)
     else:
@@ -1394,6 +1418,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         failure=prior.get("failure"),
         template=args.template,
         canonical_revision=revision,
+        type_map=type_map,
     )
     for name in ("report.html", "report.json"):
         store.put_file(f"runs/{args.run}/{name}", run_dir / name)

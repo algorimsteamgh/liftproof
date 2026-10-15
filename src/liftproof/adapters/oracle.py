@@ -54,28 +54,10 @@ from liftproof.adapters.base import (
     in_list,
     plain_prefix,
 )
-from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest
+from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, Verbatim, column_digest
 from liftproof.canonical import value64 as _value64
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
-
-TYPE_MAP: dict[str, CanonicalType] = {
-    "FLOAT": CanonicalType.FLOAT,  # binary precision NUMBER; targets store it as a double
-    "BINARY_FLOAT": CanonicalType.FLOAT,
-    "BINARY_DOUBLE": CanonicalType.FLOAT,
-    "VARCHAR2": CanonicalType.TEXT,
-    "NVARCHAR2": CanonicalType.TEXT,
-    "VARCHAR": CanonicalType.TEXT,
-    "CLOB": CanonicalType.TEXT,
-    "NCLOB": CanonicalType.TEXT,
-    "CHAR": CanonicalType.CHAR,
-    "NCHAR": CanonicalType.CHAR,
-    "DATE": CanonicalType.TIMESTAMP,  # an Oracle DATE carries a time of day
-    "RAW": CanonicalType.BINARY,
-    "BLOB": CanonicalType.BINARY,
-    "JSON": CanonicalType.JSON,
-    "XMLTYPE": CanonicalType.XML,
-    "BOOLEAN": CanonicalType.BOOLEAN,  # 23ai
-}
 
 LOB_TYPES = {"CLOB", "NCLOB", "BLOB"}
 TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
@@ -102,16 +84,7 @@ def quote(name: str) -> str:
 
 
 def canonical_type(data_type: str, precision: int | None, scale: int | None) -> CanonicalType:
-    t = data_type.upper()
-    if t == "NUMBER":
-        if scale is not None and scale <= 0:
-            return CanonicalType.INTEGER  # NUMBER(p), NUMBER(p,0), INTEGER
-        return CanonicalType.DECIMAL  # NUMBER(p,s) and unconstrained NUMBER
-    if t.startswith("TIMESTAMP"):
-        if "TIME ZONE" in t:
-            return CanonicalType.TIMESTAMPTZ  # WITH TIME ZONE and WITH LOCAL TIME ZONE
-        return CanonicalType.TIMESTAMP
-    return TYPE_MAP.get(t, CanonicalType.UNSUPPORTED)
+    return DEFAULT_TYPE_MAP.canonical("oracle", native_name(data_type, None, precision, scale))
 
 
 def native_name(data_type: str, length: int | None, precision: int | None, scale: int | None):
@@ -154,13 +127,20 @@ def render_sql(col: str, ctype: CanonicalType, precision: int, native: str = "")
                 f"ELSE REGEXP_REPLACE(TO_CHAR({col}), '^(-?)\\.', '\\10.') END"
             )
         case CanonicalType.BOOLEAN:
+            if native == "NUMBER":  # NUMBER(p) compared as boolean (type map)
+                return f"CASE WHEN {col} <> 0 THEN '1' WHEN {col} = 0 THEN '0' END"
             return f"CASE WHEN {col} THEN '1' WHEN NOT {col} THEN '0' END"
         case CanonicalType.TEXT:
             return f"TO_CHAR({col})"
         case CanonicalType.CHAR:
             return f"RTRIM(TO_CHAR({col}), ' ')"
         case CanonicalType.DATE:
-            return f"TO_CHAR({col}, 'YYYY-MM-DD')"
+            # a DATE compared as date (type map): one with a time of day renders as a
+            # timestamp, which no date equals (see prepare)
+            return (
+                f"CASE WHEN {col} = TRUNC({col}) THEN TO_CHAR({col}, 'YYYY-MM-DD') "
+                f"ELSE TO_CHAR({col}, 'YYYY-MM-DD\"T\"HH24:MI:SS') END"
+            )
         case CanonicalType.BINARY:
             return f"LOWER(RAWTOHEX({col}))"
         case CanonicalType.TIMESTAMP | CanonicalType.TIMESTAMPTZ:
@@ -243,6 +223,11 @@ def prepare(value: Any, ctype: CanonicalType) -> Any:
         return None
     if ctype is CanonicalType.TIMESTAMPTZ and isinstance(value, dt.datetime):
         return value.replace(tzinfo=dt.UTC)  # selected in UTC (see _select_sql)
+    if ctype is CanonicalType.DATE and isinstance(value, dt.datetime):
+        # a DATE compared as date: a time of day has no date rendering
+        if value.time() == dt.time():
+            return value.date()
+        return Verbatim(value.isoformat(timespec="seconds"))
     if ctype is CanonicalType.JSON and isinstance(value, (dict, list)):
         return _json_value(value)
     return value
@@ -489,11 +474,12 @@ class OracleAdapter(Adapter):
             length = int(char_len or 0) or int(data_len or 0) or None
             data_type = str(data_type)
             natives[name] = data_type.upper()
+            native = native_name(data_type, length, precision, scale)
             cols.append(
                 Column(
                     name,
-                    native_name(data_type, length, precision, scale),
-                    canonical_type(data_type, precision, scale),
+                    native,
+                    DEFAULT_TYPE_MAP.canonical(self.engine, native),
                     fixed_width=data_type.upper() in ("CHAR", "NCHAR"),
                     nullable=nullable != "N",
                 )

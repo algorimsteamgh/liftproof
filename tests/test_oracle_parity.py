@@ -15,6 +15,7 @@ from liftproof.adapters.base import ForeignKey, HashPlan, Index, TableRef
 from liftproof.adapters.oracle import OracleAdapter, _pushable_sql, canonical_type
 from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import render
+from tests.conftest import type_map_alternatives
 
 pytestmark = pytest.mark.oracle
 
@@ -153,6 +154,10 @@ COLUMNS = [
 ]
 
 
+# the fixture column of each native type the type map has alternatives for
+ALTERNATIVES = {"number(p)": "I2", "date": "DAY"}
+
+
 def _upper(columns):
     return [(n.upper(), t) for n, t in columns]
 
@@ -191,6 +196,37 @@ def test_pushdown_matches_reference(loaded, precision, keyed):
     rows_ref = sorted(a.row_hashes(plan, set(range(3))))
     assert rows_push == rows_ref
     assert len(rows_push) == 6
+
+
+@pytest.mark.parametrize(("column", "ctype"), type_map_alternatives("oracle", ALTERNATIVES))
+@pytest.mark.parametrize("precision", [0, 3, 6])
+@pytest.mark.parametrize("keyed", [True, False])
+def test_type_map_alternatives_match_reference(loaded, column, ctype, precision, keyed):
+    """A column compared as an alternative a project chose (database.type_map): NUMBER(5)
+    as boolean; DATE as date, rows at midnight and rows with a time of day."""
+    a, schema = loaded
+    columns = [(n, ctype if n == column else t) for n, t in _upper(COLUMNS)]
+    plan = HashPlan(TableRef(schema, "EVERYTHING"), columns, ["ID"] if keyed else [], 3,
+                    precision)  # fmt: skip
+    assert a._pushdown(plan)
+    assert a.bucket_aggregates(plan) == a._bucket_aggregates_fallback(plan)
+    rows_push = sorted(a.row_hashes(plan, set(range(3))))
+    a._pushdown = lambda p: False
+    assert rows_push == sorted(a.row_hashes(plan, set(range(3))))
+
+
+def test_a_date_compared_as_date_differs_by_its_time_of_day(loaded):
+    a, schema = loaded
+    plan = HashPlan(TableRef(schema, "EVERYTHING"), [("ID", T.INTEGER), ("DAY", T.DATE)],
+                    ["ID"], 1)  # fmt: skip
+    q = f'SELECT "ID", {a._render(plan, "DAY", T.DATE)} FROM "{schema}"."EVERYTHING" ORDER BY 1'
+    assert {int(i): d for i, d in a._query(q)} == {
+        1: "2026-01-31T13:14:15", 2: "1999-12-31", 3: None, 4: "2026-02-28T23:59:59",
+        5: "1901-01-01", 6: "2000-02-29T12:00:00",
+    }  # fmt: skip
+    rows = a.fetch_rows(plan, [("1",), ("2",)])
+    assert render(rows[("1",)][1], T.DATE) == "2026-01-31T13:14:15"
+    assert render(rows[("2",)][1], T.DATE) == "1999-12-31"
 
 
 def test_rows_oracle_cannot_render_take_the_reference_path(loaded):

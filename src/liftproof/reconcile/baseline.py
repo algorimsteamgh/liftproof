@@ -46,9 +46,16 @@ from liftproof.canonical import (
     RenderError,
     reduce_total,
 )
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, TypeMap, legacy_record, shown
 from liftproof.errors import ConfigError, RunFailed
 from liftproof.reconcile import ranges
-from liftproof.reconcile.plan import NOT_CANONICALISABLE, NOT_IN_BASELINE, IgnoreRule, plan_table
+from liftproof.reconcile.plan import (
+    NOT_CANONICALISABLE,
+    NOT_IN_BASELINE,
+    IgnoreRule,
+    map_types,
+    plan_table,
+)
 
 SIDES = ("source", "target")
 # how a baseline holds its snapshot (spec 9.2): one over every table, or one per table
@@ -220,6 +227,13 @@ class Baseline:
     snapshot_mode: str = "whole"
     # per table: a position read after the last table, which replication must reach
     end_position: dict[str, Any] | None = None
+    # the type map it was taken under (TypeMap.record); a manifest from before it was
+    # recorded was taken under version 1.0 without overrides
+    type_map: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.type_map is None:
+            self.type_map = legacy_record(self.engine)
 
     @property
     def complete(self) -> bool:
@@ -301,6 +315,7 @@ class Baseline:
             "tables": {q: t.to_dict() for q, t in sorted(self.tables.items())},
             "snapshot_mode": self.snapshot_mode,
             "end_position": self.end_position,
+            "type_map": self.type_map,
         }
 
     def save(self, path: Path) -> None:
@@ -343,6 +358,7 @@ class Baseline:
             side=d.get("side", "source"),  # manifests from before rebaseline existed
             snapshot_mode=d.get("snapshot_mode", "whole"),
             end_position=d.get("end_position"),
+            type_map=d.get("type_map"),
         )
         b.tables = {q: BaselineTable.from_dict(q, t) for q, t in d["tables"].items()}
         return b
@@ -372,11 +388,12 @@ def take_baseline(
     checkpoint: Callable[[], object] = lambda: None,
     with_ranges: bool = True,
     snapshot: str = "whole",
+    type_map: TypeMap = DEFAULT_TYPE_MAP,
 ) -> Baseline:
     """`checkpoint` runs after each table's entry is saved to the manifest; the CLI
     copies the manifest to the store there. `snapshot`: whole holds one snapshot over
     every table; per_table opens one for each table instead, for a database that cannot
-    hold one that long (spec 9.2)."""
+    hold one that long (spec 9.2). `type_map` types the columns, as a comparison does."""
     if side not in SIDES:
         raise ValueError(f"side must be one of {SIDES}")
     if snapshot not in SNAPSHOT_MODES:
@@ -387,6 +404,14 @@ def take_baseline(
         raise ConfigError(
             f"baseline {existing.baseline_id} is a {existing.side} baseline; "
             f"it cannot be resumed as a {side} baseline"
+        )
+    mapping = type_map.record(source.engine)
+    if existing is not None and existing.type_map["fingerprints"] != mapping["fingerprints"]:
+        # its finished tables were typed otherwise than the rest would be
+        raise ConfigError(
+            f"baseline {existing.baseline_id} was started under {shown(existing.type_map)}, "
+            f"not {shown(mapping)}; resume it with the database.type_map it was started "
+            "with, or take a new baseline"
         )
     position = source.begin_snapshot()
     try:
@@ -415,6 +440,7 @@ def take_baseline(
                 selection=[r.qualified for r in refs],
                 side=side,
                 snapshot_mode=snapshot,
+                type_map=mapping,
             )
         todo = [
             ref
@@ -442,7 +468,7 @@ def take_baseline(
 
         def read(a: Adapter, ref: TableRef, snap: dict[str, Any]) -> BaselineTable:
             progress(f"baselining {ref}")
-            schema = a.describe(ref)
+            schema, _ = map_types(a.describe(ref), a.engine, type_map, side)
             with a.pacer.statement() as scan:  # each read of the table is charged (9.15)
                 rows = scan.rows = a.row_count(ref)
             unhashed: dict[str, tuple[str, str]] = {}

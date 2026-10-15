@@ -47,31 +47,8 @@ from liftproof.canonical import (
     column_digest,
     value64,
 )
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
-
-TYPE_MAP: dict[str, CanonicalType] = {
-    "smallint": CanonicalType.INTEGER,
-    "integer": CanonicalType.INTEGER,
-    "bigint": CanonicalType.INTEGER,
-    "numeric": CanonicalType.DECIMAL,
-    "real": CanonicalType.FLOAT,
-    "double precision": CanonicalType.FLOAT,
-    "boolean": CanonicalType.BOOLEAN,
-    "text": CanonicalType.TEXT,
-    "character varying": CanonicalType.TEXT,
-    "name": CanonicalType.TEXT,
-    "citext": CanonicalType.TEXT,
-    "character": CanonicalType.CHAR,
-    "date": CanonicalType.DATE,
-    "time without time zone": CanonicalType.TIME,
-    "timestamp without time zone": CanonicalType.TIMESTAMP,
-    "timestamp with time zone": CanonicalType.TIMESTAMPTZ,
-    "bytea": CanonicalType.BINARY,
-    "uuid": CanonicalType.UUID,
-    "json": CanonicalType.JSON,
-    "jsonb": CanonicalType.JSON,
-    "xml": CanonicalType.XML,
-}
 
 PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON, CanonicalType.XML}
 INFINITE_TYPES = {CanonicalType.DATE, CanonicalType.TIMESTAMP, CanonicalType.TIMESTAMPTZ}
@@ -408,7 +385,7 @@ class PostgresAdapter(Adapter):
             cols = []
             for name, data_type, udt, nullable in cur.fetchall():
                 native = udt if data_type == "USER-DEFINED" else data_type
-                ctype = TYPE_MAP.get(native, CanonicalType.UNSUPPORTED)
+                ctype = DEFAULT_TYPE_MAP.canonical(self.engine, native)
                 cols.append(Column(name, native, ctype, fixed_width=native == "character",
                                    nullable=nullable == "YES"))  # fmt: skip
             if not cols:

@@ -18,6 +18,7 @@ import yaml
 from liftproof import checkpoint as ckpt
 from liftproof import cli
 from liftproof.canonical import CANONICAL_REVISION
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_RUN_FAILED
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, read_findings
@@ -213,6 +214,71 @@ def test_a_resume_under_other_canonical_rules_is_refused(tmp_path, project, monk
     code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
     assert code == EXIT_CONFIG
     assert "started under canonical revision 0" in capsys.readouterr().err
+
+
+# as if the project's database.type_map had changed since the work was started
+OTHER_MAP = {"version": "1.0", "overrides": {"postgresql": {"x": "y"}},
+             "fingerprints": {"postgresql": "0" * 16}}  # fmt: skip
+
+
+def test_a_resume_under_another_type_map_is_refused(tmp_path, project, monkeypatch, s3, capsys):
+    """Its finished tables were compared under the map it was started with."""
+    work = tmp_path / "w"
+    original = Reconciler._table
+
+    def flaky(self, ref, tref):
+        if ref.name == "t3":
+            raise ConnectionError("server closed the connection unexpectedly")
+        return original(self, ref, tref)
+
+    monkeypatch.setattr(Reconciler, "_table", flaky)
+    code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--run-id", "r5")
+    assert code == EXIT_RUN_FAILED
+    key = "acme/runs/r5/progress.json"
+    saved = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+    assert saved["type_map"] == DEFAULT_TYPE_MAP.record("postgresql")
+    s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(dict(saved, type_map=OTHER_MAP)))
+    monkeypatch.setattr(Reconciler, "_table", original)
+    capsys.readouterr()
+    code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
+    assert code == EXIT_CONFIG
+    assert "started under type map 1.0 with postgresql x as y, not type map 1.0 without " \
+        "overrides" in capsys.readouterr().err
+    del saved["type_map"]  # as a build from before the map was kept left it: the 1.0 defaults
+    s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(saved).encode())
+    code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
+    assert code == EXIT_DIFFERENCES
+
+
+def test_a_baseline_resumes_under_its_type_map_only(tmp_path, project, monkeypatch, s3, capsys):
+    work = tmp_path / "w"
+    monkeypatch.setattr(ckpt.Throttle, "due", lambda self: True)
+    original = baseline_mod.plan_table
+
+    def plan_or_crash(schema, *a, **kw):
+        if schema.table.name == "t3":
+            raise InstanceLost
+        return original(schema, *a, **kw)
+
+    monkeypatch.setattr(baseline_mod, "plan_table", plan_or_crash)
+    with pytest.raises(InstanceLost):
+        _main("baseline", "--project", str(project), "--workdir", str(work), "--baseline-id", "b9")
+    monkeypatch.setattr(baseline_mod, "plan_table", original)
+    key = "acme/baselines/b9/manifest.json"
+    saved = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+    assert saved["type_map"] == DEFAULT_TYPE_MAP.record("postgresql")
+    s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(dict(saved, type_map=OTHER_MAP)))
+    capsys.readouterr()
+    assert _main("baseline", "--project", str(project), "--workdir", str(work),
+                 "--resume") == EXIT_CONFIG  # fmt: skip
+    assert "baseline b9 was started under type map 1.0 with postgresql x as y" in (
+        capsys.readouterr().err
+    )
+    del saved["type_map"]  # as a build from before the map was kept left it
+    s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(saved).encode())
+    assert _main("baseline", "--project", str(project), "--workdir", str(work), "--resume") == 0
+    manifest = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+    assert manifest["complete"] and manifest["type_map"] == DEFAULT_TYPE_MAP.record("postgresql")
 
 
 def test_baseline_resumes_on_a_replacement_instance(tmp_path, project, monkeypatch, s3):

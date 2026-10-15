@@ -23,6 +23,7 @@ from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import render
 from liftproof.errors import ConfigError
 from liftproof.reconcile.baseline import Baseline, take_baseline
+from tests.conftest import type_map_alternatives
 
 pytestmark = pytest.mark.sqlserver
 
@@ -114,6 +115,10 @@ COLUMNS = [
 ]
 
 
+# the fixture column of each native type the type map has alternatives for
+ALTERNATIVES = {"bit": "flag"}
+
+
 @pytest.fixture
 def loaded(make_sqlserver_db, sqlserver_adapter_for):
     db, cur = make_sqlserver_db()
@@ -145,6 +150,22 @@ def test_pushdown_matches_reference(loaded, precision, keyed):
     rows_ref = sorted(a.row_hashes(plan, set(range(3))))
     assert rows_push == rows_ref
     assert len(rows_push) == 5
+
+
+@pytest.mark.parametrize(("column", "ctype"), type_map_alternatives("sqlserver", ALTERNATIVES))
+@pytest.mark.parametrize("precision", [0, 3, 6])
+@pytest.mark.parametrize("keyed", [True, False])
+def test_type_map_alternatives_match_reference(loaded, column, ctype, precision, keyed):
+    """A column compared as an alternative a project chose (database.type_map): bit as
+    integer, and as decimal against an exact number."""
+    a = loaded
+    columns = [(n, ctype if n == column else t) for n, t in COLUMNS]
+    plan = HashPlan(table(), columns, ["id"] if keyed else [], 3, precision)
+    assert a._pushdown(plan)
+    assert a.bucket_aggregates(plan) == a._bucket_aggregates_fallback(plan)
+    rows_push = sorted(a.row_hashes(plan, set(range(3))))
+    a._pushdown = lambda p: False
+    assert rows_push == sorted(a.row_hashes(plan, set(range(3))))
 
 
 def test_only_ascii_rows_are_rendered_in_the_database(loaded):

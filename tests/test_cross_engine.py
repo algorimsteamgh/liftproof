@@ -12,7 +12,10 @@ from decimal import Decimal
 import pytest
 
 from liftproof.adapters.base import HashPlan, TableRef
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
+from liftproof.errors import ConfigError
 from liftproof.findings import FindingWriter, Kind, read_findings
+from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import ReconcileOptions, Reconciler
 
 pytestmark = [pytest.mark.postgres, pytest.mark.mysql]
@@ -182,3 +185,114 @@ def test_foreign_keys_and_their_indexes_across_engines(
     _, findings = _run(tmp_path / "c", pg, my, ["public"], {"public": mdb})
     assert structure(findings) == [("orders", Kind.DIFFERENCE, "foreign_key_missing_in_target"),
                                    ("orders", Kind.NOTICE, "index_added_in_target")]  # fmt: skip
+
+
+MAPPED = DEFAULT_TYPE_MAP.with_overrides(
+    {"mysql": {"tinyint(1)": "integer", "datetime": "timestamptz"}}, {"mysql", "postgresql"}
+)
+
+
+@pytest.fixture
+def flags(pg_and_mysql):
+    """A tinyint(1) moved into a smallint, and a datetime holding UTC times moved into a
+    timestamptz."""
+    pg, my, pc, mc, mdb = pg_and_mysql
+    pc.execute("CREATE TABLE flags (id int PRIMARY KEY, flag smallint, at timestamptz)")
+    mc.execute("CREATE TABLE flags (id int PRIMARY KEY, flag tinyint(1), at datetime(6))")
+    epoch = dt.datetime(2026, 1, 1, 12)
+    rows = [(i, i % 3 - 1 if i % 7 else None, epoch + dt.timedelta(minutes=i, microseconds=i))
+            for i in range(1, 301)]  # fmt: skip
+    with pc.cursor() as cur:
+        cur.executemany("INSERT INTO flags VALUES (%s, %s, %s)",
+                        [(i, f, at.replace(tzinfo=dt.UTC)) for i, f, at in rows])  # fmt: skip
+    mc.executemany("INSERT INTO flags VALUES (%s, %s, %s)", rows)
+    return pg_and_mysql
+
+
+def test_the_projects_type_map_compares_what_the_shipped_one_cannot(tmp_path, flags):
+    """Type changes under the shipped map; the project's map compares them."""
+    pg, my, pc, mc, mdb = flags
+    where = ([mdb], {mdb: "public"})
+
+    result, findings = _run(tmp_path / "shipped", my, pg, *where, tables=["flags"])
+    [flags] = result.tables
+    assert flags.partial and flags.excluded_columns == ["at", "flag"]
+    assert sorted(f.column for f in findings if f.detail.get("issue") == "type_changed") == [
+        "at", "flag",
+    ]  # fmt: skip
+
+    result, findings = _run(tmp_path / "mapped", my, pg, *where, tables=["flags"],
+                            type_map=MAPPED)  # fmt: skip
+    [flags] = result.tables
+    assert (flags.status, flags.partial) == ("matched", False)
+    [notice] = [f for f in findings if "type_map" in f.detail]
+    assert notice.kind == Kind.NOTICE
+    assert [(o["column"], o["side"], o["native"], o["canonical"], o["default"])
+            for o in notice.detail["type_map"]] == [
+        ("flag", "source", "tinyint(1)", "integer", "boolean"),
+        ("at", "source", "datetime(6)", "timestamptz", "timestamp"),
+    ]  # fmt: skip
+    assert not [f for f in findings if f.kind == Kind.DIFFERENCE]
+
+    pc.execute("UPDATE flags SET flag = 2 WHERE id = 10")  # 1 on MySQL: alike as booleans
+    result, findings = _run(tmp_path / "changed", my, pg, *where, tables=["flags"],
+                            type_map=MAPPED)  # fmt: skip
+    [flags] = result.tables
+    assert (flags.status, flags.changed_rows) == ("different", 1)
+    [changed] = [f for f in findings if f.kind == Kind.DIFFERENCE and f.column == "flag"]
+    assert changed.locator == "id = 10"
+
+
+def test_a_baseline_is_compared_under_the_map_it_was_taken_under(tmp_path, flags):
+    """A baseline taken under another map than the project's is not reused for the columns
+    the map types otherwise; without the live source the table is not checked, saying why."""
+    pg, my, pc, mc, mdb = flags
+    manifest = tmp_path / "b1.json"
+    take = dict(baseline_id="b1", schemas=[mdb], tables=["flags"], ignore=[],
+                business_keys={}, rows_per_bucket=500, precision=6)  # fmt: skip
+    take_baseline(my, manifest, **take)
+    b = Baseline.load(manifest)
+    assert b.type_map == DEFAULT_TYPE_MAP.record("mysql")
+    assert dict(b.tables[f"{mdb}.flags"].plan.columns)["flag"] == "boolean"
+    opts = dict(schemas=[mdb], schema_map={mdb: "public"}, rows_per_bucket=500, type_map=MAPPED)
+
+    def compare(name, baseline, source=None):
+        writer = FindingWriter(tmp_path / name, "r-x")
+        result = Reconciler(pg, writer, ReconcileOptions(**opts), baseline=baseline,
+                            source=source).run()  # fmt: skip
+        writer.close()
+        return result.tables[0], list(read_findings(tmp_path / name))
+
+    flags_, findings = compare("alone", b)
+    assert flags_.status == "not_checked"
+    assert flags_.reason == (
+        "the type map compares at, flag otherwise than the baseline did; the live source is "
+        "needed to re-hash"
+    )
+    flags_, _ = compare("live", b, source=my)  # hashed again, under the project's map
+    assert flags_.status == "matched" and not flags_.partial
+
+    # resumed under another map, its finished tables would be typed otherwise than the rest
+    with pytest.raises(ConfigError, match=r"started under type map 1\.0 without overrides, not "
+                       r"type map 1\.0 with mysql datetime as timestamptz, mysql tinyint\(1\) "
+                       "as integer"):  # fmt: skip
+        take_baseline(my, manifest, resume=True, type_map=MAPPED, **take)
+    mapped_manifest = tmp_path / "b2.json"
+    take_baseline(my, mapped_manifest, type_map=MAPPED, **dict(take, baseline_id="b2"))
+    b2 = Baseline.load(mapped_manifest)
+    assert b2.type_map["overrides"] == {
+        "mysql": {"datetime": "timestamptz", "tinyint(1)": "integer"}
+    }
+    flags_, _ = compare("taken-under-it", b2)  # its plan applies: no source needed
+    assert flags_.status == "matched" and not flags_.partial
+
+    # a target baseline, the target's own accepted state: rebaseline under the new map
+    take_baseline(my, tmp_path / "t1.json", side="target", **dict(take, baseline_id="t1"))
+    writer = FindingWriter(tmp_path / "target", "r-x")
+    options = ReconcileOptions(schemas=[mdb], rows_per_bucket=500, type_map=MAPPED)
+    result = Reconciler(my, writer, options, baseline=Baseline.load(tmp_path / "t1.json")).run()
+    writer.close()
+    assert result.tables[0].reason == (
+        "the type map compares at, flag otherwise than the target baseline did; rebaseline to "
+        "apply it"
+    )

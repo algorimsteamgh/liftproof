@@ -47,42 +47,8 @@ from liftproof.adapters.base import (
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest
 from liftproof.canonical import value64 as _value64
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
-
-TYPE_MAP: dict[str, CanonicalType] = {
-    "tinyint": CanonicalType.INTEGER,
-    "smallint": CanonicalType.INTEGER,
-    "int": CanonicalType.INTEGER,
-    "bigint": CanonicalType.INTEGER,
-    "decimal": CanonicalType.DECIMAL,
-    "numeric": CanonicalType.DECIMAL,
-    "money": CanonicalType.DECIMAL,
-    "smallmoney": CanonicalType.DECIMAL,
-    "real": CanonicalType.FLOAT,
-    "float": CanonicalType.FLOAT,
-    "bit": CanonicalType.BOOLEAN,
-    "varchar": CanonicalType.TEXT,
-    "nvarchar": CanonicalType.TEXT,
-    "text": CanonicalType.TEXT,
-    "ntext": CanonicalType.TEXT,
-    "sysname": CanonicalType.TEXT,
-    "char": CanonicalType.CHAR,
-    "nchar": CanonicalType.CHAR,
-    "date": CanonicalType.DATE,
-    "time": CanonicalType.TIME,
-    "datetime": CanonicalType.TIMESTAMP,
-    "datetime2": CanonicalType.TIMESTAMP,
-    "smalldatetime": CanonicalType.TIMESTAMP,
-    "datetimeoffset": CanonicalType.TIMESTAMPTZ,
-    "binary": CanonicalType.BINARY,
-    "varbinary": CanonicalType.BINARY,
-    "image": CanonicalType.BINARY,
-    "timestamp": CanonicalType.BINARY,  # rowversion
-    "uniqueidentifier": CanonicalType.UUID,
-    "json": CanonicalType.JSON,  # SQL Server 2025 and Azure SQL
-    "xml": CanonicalType.XML,
-    # sql_variant, geography, geometry, hierarchyid: unsupported (not checked)
-}
 
 TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
 PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON, CanonicalType.XML}
@@ -115,7 +81,7 @@ def quote(name: str) -> str:
 
 
 def canonical_type(data_type: str) -> CanonicalType:
-    return TYPE_MAP.get(data_type.lower(), CanonicalType.UNSUPPORTED)
+    return DEFAULT_TYPE_MAP.canonical("sqlserver", data_type)
 
 
 def native_name(data_type: str, max_length: int, precision: int, scale: int) -> str:
@@ -239,7 +205,10 @@ def _excluding(predicate: str | None) -> str | None:
 
 def prepare(value: Any, ctype: CanonicalType) -> Any:
     """python-tds already returns what the reference renderer expects: Decimal for exact
-    numbers, zone aware datetimes for datetimeoffset, UUID, bytes."""
+    numbers, zone aware datetimes for datetimeoffset, UUID, bytes. A bit compared as a
+    number (type map) is 1 or 0."""
+    if isinstance(value, bool) and ctype in (CanonicalType.INTEGER, CanonicalType.DECIMAL):
+        return int(value)
     return value
 
 
@@ -504,11 +473,12 @@ class SQLServerAdapter(Adapter):
         for name, data_type, max_length, precision, scale, nullable in rows:
             data_type = str(data_type).lower()
             natives[name] = data_type
+            native = native_name(data_type, int(max_length), int(precision), int(scale))
             cols.append(
                 Column(
                     name,
-                    native_name(data_type, int(max_length), int(precision), int(scale)),
-                    canonical_type(data_type),
+                    native,
+                    DEFAULT_TYPE_MAP.canonical(self.engine, native),
                     fixed_width=data_type in ("char", "nchar"),
                     nullable=bool(nullable),
                 )

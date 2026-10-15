@@ -12,6 +12,7 @@ from liftproof.adapters.base import ForeignKey, HashPlan, Index, TableRef
 from liftproof.adapters.mysql import MySQLAdapter, prepare
 from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import Verbatim, render
+from tests.conftest import type_map_alternatives
 
 pytestmark = pytest.mark.mysql
 
@@ -65,6 +66,10 @@ COLUMNS = [
 ]
 
 
+# the fixture column of each native type the type map has alternatives for
+ALTERNATIVES = {"tinyint(1)": "flag", "datetime": "naive", "timestamp": "aware"}
+
+
 @pytest.fixture
 def loaded(make_mysql_db, mysql_adapter_for):
     db, cur = make_mysql_db()
@@ -88,6 +93,22 @@ def test_pushdown_matches_reference(loaded, precision, keyed):
     rows_ref = sorted(a.row_hashes(plan, set(range(3))))
     assert rows_push == rows_ref
     assert len(rows_push) == 5
+
+
+@pytest.mark.parametrize(("column", "ctype"), type_map_alternatives("mysql", ALTERNATIVES))
+@pytest.mark.parametrize("precision", [0, 3, 6])
+@pytest.mark.parametrize("keyed", [True, False])
+def test_type_map_alternatives_match_reference(loaded, column, ctype, precision, keyed):
+    """A column compared as an alternative a project chose (database.type_map): tinyint(1)
+    as integer, and as decimal against an exact number; datetime as timestamptz, the zero
+    datetime included; timestamp as timestamp."""
+    a, db = loaded
+    columns = [(n, ctype if n == column else t) for n, t in COLUMNS]
+    plan = HashPlan(TableRef(db, "everything"), columns, ["id"] if keyed else [], 3, precision)
+    assert a.bucket_aggregates(plan) == a._bucket_aggregates_fallback(plan)
+    rows_push = sorted(a.row_hashes(plan, set(range(3))))
+    a._pushdown = lambda p: False
+    assert rows_push == sorted(a.row_hashes(plan, set(range(3))))
 
 
 def test_non_ascii_rows_take_the_reference_path(loaded):
