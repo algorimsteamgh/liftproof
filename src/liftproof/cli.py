@@ -620,6 +620,8 @@ def _run(
     and must not then be reconciled or compared against), then one report over every
     finding."""
     project = _project(args)
+    if web and (database or files):
+        _check_regions(project)
     store = _store(project, Path(args.workdir))
     run_id = args.run_id or _new_id("r")
     if getattr(args, "resume", False) and not args.run_id:
@@ -631,6 +633,23 @@ def _run(
         args, project, store, run_id, mode,
         lambda: _run_locked(args, mode, project, store, run_id, database, web, files),
     )  # fmt: skip
+
+
+def _check_regions(project: Project) -> None:
+    """A selector the browser refuses stops the run before it starts: found by the replay,
+    after a reconciliation, the error would end the run with no report of what it did. A
+    browser that does not start is left for the replay to report, as it would."""
+    from liftproof.web.browser import check_regions
+
+    web = project.web
+    if web is None or not web.ignore_regions:
+        return
+    try:
+        check_regions(web.ignore_regions, web.chromium_path)
+    except ConfigError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the replay reports it
+        log.warning("web.ignore_regions not checked before the run: %s", exc)
 
 
 # Findings reach the store at least this often while a run goes (spec 3).
@@ -949,6 +968,7 @@ def _replay_into(
         compare_headers=web.compare_headers,
         ignore_json_paths=web.ignore_json_paths,
         ignore_text=web.ignore_text,
+        ignore_regions=web.ignore_regions,
         show_values=bool(args.show_values or project.database.show_values),
     )
     marks = _replay_watermarks(project, journeys, writer)
@@ -989,7 +1009,7 @@ def _record_replay_windows(marks, store: Store, workdir: Path, writer: FindingWr
 
 
 def cmd_record(args: argparse.Namespace) -> int:
-    from liftproof.web.browser import BodyPolicy
+    from liftproof.web.browser import VOLATILE, BodyPolicy
     from liftproof.web.recorder import Recorder
 
     project = _project(args)
@@ -1001,6 +1021,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         policy=BodyPolicy(web.capture_bodies, web.capture_snapshots),
         headless=False,
         executable_path=web.chromium_path,
+        regions=web.ignore_regions,
     )
     print(
         "Recording. Carry out the journey in the browser window, then close the window.",
@@ -1012,6 +1033,14 @@ def cmd_record(args: argparse.Namespace) -> int:
     path = _save_journey(store, workdir, journey, assets)
     unconfirmed = [c.name for c in journey.correlations if not c.confirmed]
     kept = sum(1 for s in journey.steps if s.region_asset)
+    # the steps each ignore region hid content in on the source, which is read only now: a
+    # selector that matched nothing there is worth knowing before the source is gone
+    hid = {
+        source: sum(source in (*s.region_hidden, s.region_ignored) for s in journey.steps)
+        for r in journey.ignore_regions
+        if (source := r.on("source"))
+    }
+    hid = {s: n for s, n in hid.items() if n or s != VOLATILE.selector}
     _out(
         args,
         {
@@ -1023,11 +1052,16 @@ def cmd_record(args: argparse.Namespace) -> int:
             "unbound_tokens": journey.unbound_tokens(),
             "snapshots_kept": kept,
             "snapshots_structure_only": len(journey.steps) - kept,
+            "ignore_regions_hid": hid,
         },
         f"recorded {journey.journey_id}: {len(journey.steps)} steps, "
         f"{len(journey.correlations)} correlations ({len(unconfirmed)} to confirm)\n"
         f"page snapshots kept for {kept} of {len(journey.steps)} steps (web.capture_snapshots); "
         "the others are compared by structure\n"
+        + "".join(
+            f"ignore region {s} hid content in {n} of {len(journey.steps)} steps\n"
+            for s, n in hid.items()
+        )
         + "".join(
             f"bind {t} ({journey.secrets[t].field}): liftproof bind --project {args.project} "
             f"--journey {journey.journey_id} --token {t} --secret-arn ARN --key KEY\n"
@@ -1616,6 +1650,20 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
             return f"chromium {version}"
 
         check("browser starts", _browser, "the AMI ships Chromium; set web.chromium_path")
+        if project.web.ignore_regions:
+
+            def _regions():
+                from liftproof.web.browser import check_regions
+
+                check_regions(project.web.ignore_regions, project.web.chromium_path)
+                return f"{len(project.web.ignore_regions)} ignore region(s)"
+
+            check(
+                "web.ignore_regions are CSS selectors",
+                _regions,
+                "write each as document.querySelector takes it; Playwright's text= and >> "
+                "are not CSS",
+            )
     for fs in project.files:
         for which in ("source", "target"):
 

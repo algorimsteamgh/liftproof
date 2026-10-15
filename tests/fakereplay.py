@@ -12,8 +12,19 @@ from liftproof.web.journey import Exchange, Journey, Step
 from liftproof.web.replay import JourneyRun, StepRun
 
 
+class Page:
+    def evaluate(self, script: str, arg=None) -> list:
+        return []  # every ignore region's selector is CSS
+
+    def close(self) -> None:
+        pass
+
+
 class Browser:
     version = "0-test"
+
+    def new_page(self) -> Page:
+        return Page()
 
     def close(self) -> None:
         pass

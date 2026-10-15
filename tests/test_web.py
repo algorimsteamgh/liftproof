@@ -17,11 +17,18 @@ from pathlib import Path
 
 import pytest
 
-from liftproof.errors import ConfigError
+from liftproof.errors import EXIT_CONFIG, ConfigError
 from liftproof.findings import Comparator, Kind, Severity
-from liftproof.web.browser import BodyPolicy, launch
+from liftproof.web.browser import (
+    HIDE_JS,
+    VOLATILE,
+    BodyPolicy,
+    launch,
+    region_snapshot,
+    unhide,
+)
 from liftproof.web.compare import WebOptions
-from liftproof.web.journey import Exchange, Journey, Locator, Step
+from liftproof.web.journey import Exchange, IgnoreRegion, Journey, Locator, Step
 from liftproof.web.recorder import Recorder
 from liftproof.web.replay import JourneyRun, Replayer
 from liftproof.web.run import run_journeys
@@ -50,14 +57,15 @@ def recorded(browser_available, tmp_path_factory):
     return journey, assets_dir
 
 
-def replay(journey, assets_dir, variant, *, secrets=None, timeout=10_000, posts=None, **app):
+def replay(journey, assets_dir, variant, *, secrets=None, timeout=10_000, posts=None,
+           options=None, **app):  # fmt: skip
     """posts, when given, gets the POSTs that reached the target, by path."""
     findings = []
     with ShopApp(variant, **app) as target:
         result = run_journeys(
             [journey],
             target_url=target.url,
-            options=WebOptions(),
+            options=options or WebOptions(),
             emit=findings.append,
             assets_dir=lambda j: assets_dir,
             secret_values=secrets or (lambda j: {t: PASSWORD for t in j.secrets}),
@@ -96,6 +104,11 @@ def test_recording_redacts_and_correlates(recorded):
     assert journey.steps[5].region_asset == f"assets/{journey.steps[5].region_sha256}"
     assert "Back to orders" in (assets / journey.steps[5].region_sha256).read_text()
     assert "Back to orders" not in text and 'heading "' not in text  # no snapshot text
+    # the node that served a page is marked volatile: left out of what was recorded
+    assert journey.ignore_regions == [VOLATILE]
+    assert [s.n for s in journey.steps if s.region_hidden] == [4, 6]
+    assert journey.steps[5].region_hidden == ["[data-liftproof-volatile]"]
+    assert "Served by" not in (assets / journey.steps[5].region_sha256).read_text()
     assert journey.steps[2].region_shape.splitlines() == [  # the password filled in
         "- text: *", '- textbox "*": *', "- text: *", '- textbox "*": *', '- button "*"']
     roundtrip = Journey.from_dict(json.loads(text))
@@ -110,6 +123,11 @@ def test_unchanged_target_replays_clean(recorded):
     assert j.ui_compared == {"text": 1, "shape": 5, "expired": 0}
     assert not [f for f in findings if f.kind in (Kind.DIFFERENCE, Kind.ERROR)]
     assert result.endpoints and all(e["target_ms"] is not None for e in result.endpoints)
+    # the node names differ, and are left out on both sides, with the reason given
+    [volatile] = [f for f in findings if f.object == "page region"]
+    assert (volatile.kind, volatile.column, volatile.detail["reason"]) == (
+        Kind.NOTICE, "[data-liftproof-volatile]", VOLATILE.reason)
+    assert (volatile.detail["steps_on_source"], volatile.detail["steps_on_target"]) == (2, 2)
 
 
 def test_changed_target_reports_exactly_the_changes(recorded):
@@ -140,9 +158,189 @@ def test_a_page_not_kept_is_compared_by_structure(recorded, tmp_path):
     assert result.journeys[0].ui_compared == {"text": 0, "shape": 6, "expired": 0}
     result, findings = replay(journey, tmp_path, "changed")  # no asset: the bucket expired it
     assert result.journeys[0].ui_compared == {"text": 0, "shape": 5, "expired": 1}
-    [notice] = [f for f in findings if f.kind == Kind.NOTICE]
+    [notice] = [f for f in findings if f.kind == Kind.NOTICE and f.object != "page region"]
     assert notice.detail == {"snapshots_expired": 1, "bodies_expired": 2}
     assert not [f for f in findings if f.summary.startswith("page ")]
+
+
+# ------------------------------------------------------------- ignore regions (spec 7)
+GREETING = IgnoreRegion("personalised for whoever signed in", ".greeting")
+
+
+@pytest.fixture(scope="module")
+def greeted(browser_available, tmp_path_factory):
+    """The checkout recorded on a shop whose order page greets the user by a name that
+    differs on every visit: with the project's ignore region for it, and without."""
+    assets_dir = tmp_path_factory.mktemp("greeted")
+    journeys = {}
+    with ShopApp(greeting="plain") as app:
+        for name, regions in (("with", [GREETING]), ("without", [])):
+            journey, assets = Recorder(
+                app.url, policy=BodyPolicy(["/api/*"], snapshots=["/orders/*"]),
+                headless=True, regions=regions,
+            ).record(f"greeted-{name}", start="/login", drive=drive)  # fmt: skip
+            journeys[name] = journey
+            for sha, body in assets.items():
+                (assets_dir / sha).write_bytes(body)
+    return journeys, assets_dir
+
+
+def region_notices(findings):
+    return {f.column: f for f in findings if f.object == "page region"}
+
+
+def test_an_ignore_region_leaves_the_same_part_out_on_both_sides(greeted):
+    journeys, assets = greeted
+    j = journeys["with"]
+    assert j.ignore_regions == [VOLATILE, GREETING]
+    assert j.steps[5].region_hidden == [VOLATILE.selector, ".greeting"]
+    assert "Welcome back" not in (assets / j.steps[5].region_sha256).read_text()
+    options = WebOptions(ignore_regions=[GREETING])
+    result, findings = replay(j, assets, "same", greeting="plain", options=options)
+    assert result.journeys[0].status == "passed", [f.summary for f in findings]
+    notice = region_notices(findings)[".greeting"]
+    assert (notice.kind, notice.detail["reason"], notice.detail["journeys"]) == (
+        Kind.NOTICE, GREETING.reason, ["greeted-with"])
+    assert (notice.detail["steps_on_source"], notice.detail["steps_on_target"]) == (1, 1)
+    # once the project drops it, the target still leaves out what the source did
+    result, findings = replay(j, assets, "same", greeting="plain")
+    assert result.journeys[0].status == "passed", [f.summary for f in findings]
+    assert region_notices(findings)[".greeting"].detail["reason"] == (
+        f"{GREETING.reason} (as recorded; no longer in web.ignore_regions)")
+    # the migrated application marks it instead: a selector for each side
+    marked = IgnoreRegion("personalised", source_selector=".greeting",
+                          target_selector=VOLATILE.selector)  # fmt: skip
+    result, findings = replay(j, assets, "same", greeting="marked",
+                              options=WebOptions(ignore_regions=[marked]))  # fmt: skip
+    assert result.journeys[0].status == "passed", [f.summary for f in findings]
+    assert f"source .greeting, target {VOLATILE.selector}" in region_notices(findings)
+
+
+def test_a_journey_recorded_without_an_ignore_region_is_compared_in_full(greeted):
+    """The source is read only when a journey is recorded, so a rule added since does not
+    apply to it: the greeting is compared, and the notice says to record it again."""
+    journeys, assets = greeted
+    j = journeys["without"]
+    assert j.ignore_regions == [VOLATILE] and j.steps[5].region_hidden == [VOLATILE.selector]
+    options = WebOptions(ignore_regions=[GREETING])
+    result, findings = replay(j, assets, "same", greeting="plain", options=options)
+    assert result.journeys[0].status == "different"
+    [diff] = [f for f in findings if f.kind == Kind.DIFFERENCE]
+    assert (diff.object, diff.summary) == (
+        "greeted-without step 6", "page content differs after the step")
+    notice = region_notices(findings)[".greeting (not applied)"]
+    assert notice.detail["not_applied"] == ["greeted-without"]
+    assert notice.summary.endswith("the journey was recorded without it; record it again")
+    # nor does a marker only the target carries: the source showed the greeting
+    result, findings = replay(j, assets, "same", greeting="marked")
+    [diff] = [f for f in findings if f.kind == Kind.DIFFERENCE]
+    assert (diff.detail["lines_only_on_source"], diff.detail["lines_only_on_target"]) == (1, 0)
+
+
+def test_a_part_of_the_page_is_left_out_only_while_it_is_read(browser_available):
+    """aria-hidden for one snapshot: a block, a span in a heading's name, a field, inside an
+    open shadow root; an element with display: contents keeps its own text. What the page
+    had is put back, and a touched region inside an ignore region gives the page."""
+    from playwright.sync_api import sync_playwright
+
+    html = """<main><section data-liftproof-region="1"><h1>Order <span class="v">4821</span>
+      placed</h1><p class="v">Served by node ab12</p><input class="v" value="typed">
+      <p class="v" aria-hidden="false">was shown</p>
+      <div class="v" style="display: contents">own text <b>bold</b></div>
+      <shadowed-note></shadowed-note><a href="#more">More</a></section></main>
+      <script>customElements.define('shadowed-note', class extends HTMLElement {
+        constructor() { super(); this.attachShadow({mode: 'open'}).innerHTML =
+          '<p class="v">in the shadow</p><p>shadow kept</p>'; } });</script>"""
+    marks = """() => [...document.querySelectorAll('[aria-hidden]'),
+                      ...document.querySelector('shadowed-note').shadowRoot.children]
+                     .map((e) => e.getAttribute('aria-hidden'))"""
+    with sync_playwright() as p:
+        browser = launch(p)
+        page = browser.new_page()
+        page.set_content(html)
+        before = page.evaluate(marks)
+        snap = region_snapshot(page, [".v", ".absent"])
+        assert 'heading "Order placed" [level=1]' in snap.text
+        assert "text: own text" in snap.text  # display: contents: its own text is read
+        left_out = ("4821", "Served by", "typed", "was shown", "bold", "in the shadow")
+        assert not [t for t in left_out if t in snap.text], snap.text
+        assert "shadow kept" in snap.text and 'link "More"' in snap.text
+        assert (snap.hidden, snap.unhideable, snap.whole) == ([".v"], [".v"], None)
+        assert page.evaluate(marks) == before == ["false", None, None]
+        # a snapshot that did not finish leaves its part hidden until it is put back
+        page.locator("main").evaluate_all(HIDE_JS, ["a"])
+        assert page.get_by_role("link", name="More").count() == 0
+        unhide(page)
+        assert page.get_by_role("link", name="More").count() == 1
+        # the touched region inside an ignore region: the page, without it
+        snap = region_snapshot(page, ["section"])
+        assert (snap.text, snap.hidden, snap.whole) == ("- main", ["section"], None)
+        # the page inside one: nothing is read
+        snap = region_snapshot(page, ["main"])
+        assert (snap.text, snap.whole) == ("", "main")
+        assert page.evaluate(marks) == before
+        browser.close()
+
+
+def test_a_step_finds_its_element_after_a_snapshot_left_it_hidden(browser_available, monkeypatch):
+    """An element left aria-hidden is not found by its role, so each step puts back what
+    the snapshot before it hid, should that snapshot not have."""
+    monkeypatch.setattr("liftproof.web.browser.unhide", lambda page: None)
+    sign_in = Locator([{"kind": "role", "role": "link", "name": "Sign in"}], "Sign in")
+    journey = Journey("help", "http://source", ignore_regions=[VOLATILE],
+                      steps=[Step(1, "goto", url="/help"), Step(2, "click", locator=sign_in)])
+    runs = []
+    with ShopApp() as target:
+        Replayer(target.url, secret_values=lambda j: {}, step_timeout_ms=3000).run(
+            [journey], lambda i, j, run: runs.append(run))  # fmt: skip
+    [run] = runs
+    assert (run.status, run.flakes) == ("completed", []), run.error
+    assert run.steps[0].region_hidden == [VOLATILE.selector]
+    assert target.pages["/login"] == 1
+
+
+BAD = IgnoreRegion("a typo", "div[")
+
+
+def test_a_selector_that_is_not_css_is_refused_before_anything_runs(browser_available, tmp_path):
+    with ShopApp() as app:
+        with pytest.raises(ConfigError, match=r"not a CSS selector: 'div\['"):
+            Recorder(app.url, headless=True, regions=[BAD]).record("j", drive=drive)
+        with pytest.raises(ConfigError, match=r"not a CSS selector: 'div\['"):
+            run_journeys([Journey("j", app.url, steps=[Step(1, "goto", url="/login")])],
+                         target_url=app.url, options=WebOptions(ignore_regions=[BAD]),
+                         emit=lambda f: None, assets_dir=lambda j: None,
+                         secret_values=lambda j: {})  # fmt: skip
+    assert not app.pages and not app.posts
+
+
+def test_a_selector_that_is_not_css_stops_a_validation_before_it_reconciles(
+    browser_available, tmp_path, monkeypatch, capsys
+):
+    """Found by the replay, after a reconciliation that may have run for hours, the error
+    would end the run with no report of what it did."""
+    import yaml
+
+    from liftproof import cli
+
+    monkeypatch.setattr(cli, "_reconcile_into", lambda *a: pytest.fail("reconciled"))
+    web = {"source_url": "http://source.invalid", "target_url": "http://target.invalid",
+           "ignore_regions": [{"selector": "div[", "reason": "a typo"}]}
+    conn = {"engine": "postgresql", "host": "db.invalid", "database": "app",
+            "secret_arn": "arn:aws:secretsmanager:ap-south-1:000000000000:secret:db"}
+    project = tmp_path / "shop.yaml"
+    project.write_text(yaml.safe_dump({"project": "shop", "source": conn, "target": conn,
+                                       "web": web}))  # fmt: skip
+    work = ["--workdir", str(tmp_path / "work"), "--format", "json"]
+    assert cli.main(["validate", "--project", str(project), *work]) == EXIT_CONFIG
+    assert "not a CSS selector: 'div['" in capsys.readouterr().err
+    assert not (tmp_path / "work" / "shop" / "runs").exists()
+    # doctor says so too, with how to write one
+    project.write_text(yaml.safe_dump({"project": "shop", "web": web}))
+    cli.main(["doctor", "--project", str(project), *work])
+    checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+    regions = checks["web.ignore_regions are CSS selectors"]
+    assert regions["result"] == "fail" and "querySelector" in regions["remedy"]
 
 
 @pytest.mark.parametrize("resolved", [True, False])
@@ -384,7 +582,8 @@ def test_a_browser_crash_fails_that_journey_and_the_run_goes_on(
     assert (crashes.attempts, crashes.browser_crashes) == (2, len(kill_on))
     assert [j["browser_crashes"] for j in result.to_dict()["journeys"]] == [0, len(kill_on), 0]
     # never a difference made up from the evidence of a dead browser
-    assert not [f for f in findings if f.kind in (Kind.DIFFERENCE, Kind.NOTICE)]
+    assert not [f for f in findings
+                if f.kind in (Kind.DIFFERENCE, Kind.NOTICE) and f.object != "page region"]
     ours = [f for f in findings if f.journey == "crashes"]
     assert [f.detail.get("cause") for f in ours if f.kind == Kind.FLAKE] == ["browser_crash"]
     errors = [f for f in findings if f.kind == Kind.ERROR]
@@ -440,7 +639,7 @@ def test_a_browser_that_dies_between_journeys_is_started_again(recorded, monkeyp
     assert [(r.status, r.attempts, r.browser_crashes) for r in result.journeys] == [
         ("passed", 1, 0)] * 3, [f.summary for f in findings]
     # each worker's first journey has the browser it launched; every later one restarts it
-    notices = [f.journey for f in findings if f.kind == Kind.NOTICE]
+    notices = [f.journey for f in findings if f.kind == Kind.NOTICE and f.journey]
     assert len(notices) == len(launched) - workers >= 1 and "first" not in notices
     assert not [f for f in findings if f.kind in (Kind.DIFFERENCE, Kind.ERROR, Kind.FLAKE)]
 
@@ -465,7 +664,8 @@ def test_cli_bind_and_replay(recorded, tmp_path, monkeypatch, capsys, variant, e
         project = tmp_path / "shop.yaml"
         project.write_text(yaml.safe_dump({"project": "shop", "web": {
             "source_url": "http://source.invalid", "target_url": target.url,
-            "capture_bodies": ["/api/*"]}}))
+            "capture_bodies": ["/api/*"],
+            "ignore_regions": [{"selector": ".greeting", "reason": "personalised"}]}}))
         base = ["--project", str(project), "--workdir", str(work), "--format", "json"]
         # the password token is not bound yet: the journey is reported as not run
         assert cli.main(["replay", *base, "--run-id", "r-unbound"]) == 10
@@ -486,7 +686,13 @@ def test_cli_bind_and_replay(recorded, tmp_path, monkeypatch, capsys, variant, e
     assert report["timings"]["journeys"][0]["target_ms"] is not None
     assert report["journeys"][0]["ui_compared"] == {"text": 1, "shape": 5, "expired": 0}
     assert report["coverage"]["ui_compared"] == report["journeys"][0]["ui_compared"]
-    assert PASSWORD not in (work / "shop" / "runs" / "r-web" / "report.html").read_text()
+    # each ignore region with its reason: the journey was recorded before .greeting
+    assert report["coverage"]["exclusions"] == [
+        {"object": "page region", "column": VOLATILE.selector, "reason": VOLATILE.reason},
+        {"object": "page region", "column": ".greeting (not applied)", "reason": "personalised"},
+    ]
+    html = (work / "shop" / "runs" / "r-web" / "report.html").read_text()
+    assert PASSWORD not in html and "<td>.greeting (not applied)</td><td>personalised" in html
 
 
 def test_parallel_journeys_opt_in(recorded):

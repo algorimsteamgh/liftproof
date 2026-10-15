@@ -1,7 +1,8 @@
 """Browser plumbing shared by the recorder and the replay engine.
 
 Network capture, header redaction, what is kept as content (default deny, spec 5),
-endpoint normalisation and the snapshot of the page region a step touched.
+endpoint normalisation, the snapshot of the page region a step touched and the ignore
+regions left out of it (spec 7).
 """
 
 from __future__ import annotations
@@ -11,12 +12,13 @@ import json
 import os
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from liftproof.web.journey import Exchange, sha256, shape
+from liftproof.errors import ConfigError
+from liftproof.web.journey import Exchange, IgnoreRegion, sha256, shape
 
 CAPTURED_TYPES = {"document", "xhr", "fetch"}
 REDACTED_HEADERS = {
@@ -301,16 +303,165 @@ def step_settled(page: Any, net: NetworkLog, timeout_ms: int, quiet_ms: int = 15
             return
 
 
-def region_snapshot(page: Any) -> str:
-    """Accessible tree of the touched region if it survived the step, else the page."""
+VOLATILE = IgnoreRegion(
+    "marked volatile in the application (data-liftproof-volatile)", "[data-liftproof-volatile]"
+)
+
+
+def in_force(rules: Iterable[IgnoreRegion]) -> list[IgnoreRegion]:
+    """The built-in ignore region, then the project's. A project rule with the same
+    selectors takes the built-in one's place, with its own reason."""
+    rules = list(rules)
+    if any(r.on("source") == r.on("target") == VOLATILE.selector for r in rules):
+        return rules
+    return [VOLATILE, *rules]
+
+
+def applied_regions(
+    recorded: Iterable[IgnoreRegion], rules: Iterable[IgnoreRegion]
+) -> tuple[list[IgnoreRegion], list[IgnoreRegion]]:
+    """The ignore regions a replay of a journey applies, and those it leaves out. The
+    source page is read only when the journey is recorded, so a rule with a source side
+    applies only to a journey recorded with it (the rule now in force with that source
+    selector, else, once the project has dropped it, the rule as recorded, so the target
+    still hides what the source did). A rule for the target alone always applies."""
+    at_source = {s: r for r in recorded if (s := r.on("source"))}
+    applied: list[IgnoreRegion] = []
+    left_out: list[IgnoreRegion] = []
+    for r in rules:
+        source = r.on("source")
+        (applied if source is None or source in at_source else left_out).append(r)
+    named = {r.on("source") for r in applied}
+    return applied + [r for s, r in at_source.items() if s not in named], left_out
+
+
+# An ignore region's elements are left out of the accessible tree with aria-hidden, set
+# only while the snapshot is read. The page holds them and the aria-hidden each had, so
+# they are put back wherever they are (in an open shadow root too), also by the next
+# snapshot or step when a page did not let this one finish.
+UNHIDE_JS = """
+() => {
+  for (const [el, was] of window.__liftproofHidden || []) {
+    if (was === null) el.removeAttribute('aria-hidden');
+    else el.setAttribute('aria-hidden', was);
+  }
+  window.__liftproofHidden = [];
+}
+"""
+
+HIDE_JS = """
+(roots, selectors) => {
+  (UNHIDE)();
+  if (roots.length !== 1) return null;
+  const root = roots[0];
+  const whole = selectors.find((s) => root.closest(s));
+  if (whole) return {hidden: [], unhideable: [], whole};
+  const scopes = [root];  // the tree reads into open shadow roots, so they are searched too
+  for (let i = 0; i < scopes.length; i++) {
+    for (const el of scopes[i].querySelectorAll('*')) {
+      if (el.shadowRoot) scopes.push(el.shadowRoot);
+    }
+  }
+  const hidden = new Set(), unhideable = new Set(), done = new Set();
+  for (const s of selectors) {
+    for (const scope of scopes) {
+      for (const el of scope.querySelectorAll(s)) {
+        // display: contents renders no box: aria-hidden hides its elements, not its own text
+        const own = getComputedStyle(el).display === 'contents' &&
+          [...el.childNodes].some((n) => n.nodeType === 3 && n.data.trim());
+        (own ? unhideable : hidden).add(s);
+        if (done.has(el)) continue;
+        done.add(el);
+        window.__liftproofHidden.push([el, el.getAttribute('aria-hidden')]);
+        el.setAttribute('aria-hidden', 'true');
+      }
+    }
+  }
+  return {hidden: [...hidden], unhideable: [...unhideable], whole: null};
+}
+""".replace("UNHIDE", UNHIDE_JS.strip())
+
+
+@dataclass
+class RegionSnapshot:
+    """The accessible tree of a region, and what the ignore regions left out of it."""
+
+    text: str
+    hidden: list[str] = field(default_factory=list)  # selectors that hid an element
+    # selectors matching an element with display: contents whose own text is still read
+    unhideable: list[str] = field(default_factory=list)
+    whole: str | None = None  # the selector the page itself is inside: nothing was read
+
+
+def unhide(page: Any) -> None:
+    """Put back what an ignore region hid."""
+    try:
+        page.evaluate(UNHIDE_JS)
+    except Exception:  # noqa: BLE001, S110 - the page navigated: what was hidden went with it
+        pass
+
+
+def region_snapshot(page: Any, hide: Sequence[str] = ()) -> RegionSnapshot:
+    """Accessible tree of the touched region if it survived the step and is not inside an
+    ignore region, else the page, without the elements the hide selectors match."""
     for selector in ("[data-liftproof-region]", "main", "body"):
         loc = page.locator(selector)
         try:
-            if loc.count() == 1:
-                return loc.aria_snapshot(timeout=5000)
+            if hide:
+                # None unless exactly one element: finding it and hiding are one round trip
+                got = loc.evaluate_all(HIDE_JS, list(hide))
+            else:
+                got = {} if loc.count() == 1 else None
+            if got is None:
+                continue
+            if got.get("whole"):
+                if selector == "[data-liftproof-region]":
+                    continue  # what the step touched is ignored, the rest of the page is not
+                return RegionSnapshot("", whole=got["whole"])
+            try:
+                text = loc.aria_snapshot(timeout=5000)
+            finally:
+                if got.get("hidden") or got.get("unhideable"):
+                    unhide(page)
+            return RegionSnapshot(text, got.get("hidden", []), got.get("unhideable", []))
         except Exception:  # noqa: S112 - page navigating; fall through to the next
             continue
-    return ""
+    return RegionSnapshot("")
+
+
+SELECTOR_JS = """
+(selectors) => selectors.filter((s) => {
+  try { document.createDocumentFragment().querySelector(s); return false; }
+  catch (e) { return true; }
+})
+"""
+
+
+def check_selectors(browser: Any, selectors: Iterable[str]) -> None:
+    """Refuse an ignore region the browser does not take as a CSS selector (Playwright's
+    own text= and >> are not CSS), before anything is recorded or replayed."""
+    wanted = list(dict.fromkeys(selectors))
+    if not wanted:
+        return
+    page = browser.new_page()
+    try:
+        bad = page.evaluate(SELECTOR_JS, wanted)
+    finally:
+        page.close()
+    if bad:
+        raise ConfigError("web.ignore_regions: not a CSS selector: " + ", ".join(map(repr, bad)))
+
+
+def check_regions(rules: Iterable[IgnoreRegion], executable_path: str | None = None) -> None:
+    """check_selectors in a browser of its own, for a run that does other work first."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = launch(p, executable_path=executable_path)
+        try:
+            check_selectors(browser, [s for r in rules for s in r.selectors])
+        finally:
+            browser.close()
 
 
 def endpoints(exchanges: Iterable[Exchange], values: dict[str, str] | None = None) -> list[str]:

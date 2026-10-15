@@ -83,6 +83,16 @@ The report's journey table counts the pages compared each way. Replay and `bind`
 the journey from the bucket, so one recorded again on another machine replaces the
 instance's copy, and a replay deletes the instance's copies of what the bucket has expired.
 
+Parts of a page expected to differ (a greeting with the user's name, recently viewed
+items, an advert) are left out with `web.ignore_regions`: a CSS selector and a reason,
+which the report prints, such as `{selector: ".recently-viewed", reason: personalised}`,
+or `source_selector` and `target_selector` where the markup differs. Any element the
+application marks `data-liftproof-volatile` is left out the same way. A rule leaves its
+part out of the text and the structure on both sides, so a journey is compared with the
+rules it was recorded with: a rule added later applies once the journey is recorded
+again, and the report says which journeys that is. A selector that matches the page's
+main element leaves nothing to compare, and the step is reported as not checked.
+
 ## Files
 
 ```bash

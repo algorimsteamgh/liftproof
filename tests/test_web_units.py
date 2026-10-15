@@ -9,18 +9,31 @@ from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from liftproof import support
+from liftproof.config import TEMPLATE, load_project
+from liftproof.errors import ConfigError
 from liftproof.findings import Kind, Severity
 from liftproof.report.builder import PASSED_WITH_DIFFERENCES, build_report, render_html, verdict
 from liftproof.web import correlate, replay
 from liftproof.web import run as webrun
-from liftproof.web.browser import BodyPolicy, Captured, NetworkLog, Write, normalise_path
+from liftproof.web.browser import (
+    VOLATILE,
+    BodyPolicy,
+    Captured,
+    NetworkLog,
+    Write,
+    applied_regions,
+    in_force,
+    normalise_path,
+)
 from liftproof.web.compare import Comparison, WebOptions, compare_journey
 from liftproof.web.journey import (
     REGION_SHAPE_VERSION,
     Correlation,
     Exchange,
+    IgnoreRegion,
     Journey,
     Step,
     region_shape,
@@ -220,10 +233,11 @@ def test_detect_skips_coincidences():
 
 
 # ---------------------------------------------------- findings as journeys finish
-def _replay(journeys, emit, *, workers=1, on_journey=None):
-    return run_journeys(journeys, target_url="http://target.invalid", options=WebOptions(),
-                        emit=emit, assets_dir=lambda j: None, secret_values=lambda j: {},
-                        workers=workers, on_journey=on_journey)  # fmt: skip
+def _replay(journeys, emit, *, workers=1, on_journey=None, options=None):
+    return run_journeys(journeys, target_url="http://target.invalid",
+                        options=options or WebOptions(), emit=emit, assets_dir=lambda j: None,
+                        secret_values=lambda j: {}, workers=workers,
+                        on_journey=on_journey)  # fmt: skip
 
 
 @pytest.mark.parametrize("workers", [1, 3])
@@ -946,3 +960,190 @@ def test_the_report_says_how_pages_were_compared():
     assert report["coverage"]["ui_compared"] == {"text": 1, "shape": 4, "expired": 1}
     assert [j["ui_compared"] for j in report["journeys"]] == [compared.ui_compared, {}]
     assert ">1 / 5 (1 expired)</td>" in render_html(report)
+
+
+# ------------------------------------------------------------- ignore regions (spec 7)
+GREETING = IgnoreRegion("personalised", ".greeting")
+
+
+def _project(tmp_path, web):
+    p = tmp_path / "p.yaml"
+    p.write_text(yaml.safe_dump({"project": "t", "web": {"source_url": "http://a", **web}}))
+    return load_project(p).web
+
+
+@pytest.mark.parametrize("regions", [
+    ".greeting", [".greeting"], [{"selector": ".greeting"}], [{"reason": "personalised"}],
+    [{"selector": "", "reason": "personalised"}], [{"selector": 7, "reason": "personalised"}],
+])  # fmt: skip
+def test_an_ignore_region_needs_a_selector_and_a_reason(tmp_path, regions):
+    with pytest.raises(ConfigError, match="web.ignore_regions"):
+        _project(tmp_path, {"ignore_regions": regions})
+
+
+def test_ignore_regions_in_the_project(tmp_path):
+    assert _project(tmp_path, {}).ignore_regions == []
+    web = _project(tmp_path, {"ignore_regions": [
+        {"selector": ".greeting", "reason": "personalised"},
+        {"source_selector": "#legacy-ad", "target_selector": "[data-ad]", "reason": "ads"},
+    ]})  # fmt: skip
+    marked = IgnoreRegion("ads", source_selector="#legacy-ad", target_selector="[data-ad]")
+    assert web.ignore_regions == [GREETING, marked]
+    assert (marked.on("source"), marked.on("target")) == ("#legacy-ad", "[data-ad]")
+    assert marked.label == "source #legacy-ad, target [data-ad]" and GREETING.label == ".greeting"
+    template = tmp_path / "t.yaml"
+    template.write_text(TEMPLATE.format(name="x"))
+    assert load_project(template).web.ignore_regions == []
+    project = SimpleNamespace(name="t", source=None, target=None, store=None,
+                              database=load_project(template).database, web=web, files=[],
+                              schedules=[])  # fmt: skip
+    assert support.project_summary(project)["web"]["ignore_regions"][1] == {
+        "selector": None, "source_selector": "#legacy-ad", "target_selector": "[data-ad]",
+        "reason": "ads"}  # fmt: skip
+
+
+def test_a_journey_keeps_the_ignore_regions_it_was_recorded_with():
+    j = Journey("j", "http://source.invalid", ignore_regions=[VOLATILE, GREETING],
+                steps=[Step(1, "goto", url="/", region_hidden=[".greeting"])])  # fmt: skip
+    again = Journey.from_dict(json.loads(json.dumps(j.to_dict())))
+    assert again == j
+    d = j.to_dict()
+    del d["ignore_regions"], d["steps"][0]["region_hidden"], d["steps"][0]["region_ignored"]
+    before = Journey.from_dict(d)  # recorded before ignore regions
+    assert (before.ignore_regions, before.steps[0].region_hidden) == ([], [])
+
+
+def test_an_ignore_region_applies_to_the_journeys_recorded_with_it():
+    """The source is read only at recording, so a rule with a source side applies to a
+    journey recorded with it, and to it only; a rule for the target alone, to every one."""
+    chat = IgnoreRegion("added since", ".chat")
+    banner = IgnoreRegion("target only", target_selector=".banner")
+    reworded = IgnoreRegion("personalised for the user", ".greeting")
+    recorded = [VOLATILE, GREETING]
+    assert in_force([chat]) == [VOLATILE, chat]
+    own = IgnoreRegion("our own reason", VOLATILE.selector)
+    assert in_force([own]) == [own]  # the project's reason for the built-in selector
+    assert applied_regions(recorded, in_force([reworded, chat, banner])) == (
+        [VOLATILE, reworded, banner], [chat])
+    # dropped from the project, it still applies as recorded: the target hides what the
+    # source did
+    assert applied_regions(recorded, in_force([])) == ([VOLATILE, GREETING], [])
+    # recorded before ignore regions
+    assert applied_regions([], in_force([chat, banner])) == ([banner], [VOLATILE, chat])
+
+
+def _hiding(source: dict, target: dict, region: str = ORDER_PAGE):
+    j = Journey("j", "http://source.invalid", ignore_regions=[VOLATILE, GREETING],
+                steps=[Step(1, "goto", url="/orders/7", **{"region": ORDER_PAGE, **source})])
+    run = JourneyRun("j", status="completed", attempts=1,
+                     steps=[StepRun(1, "goto", "ok", region=region, **target)])
+    findings = []
+    cmp = compare_journey(j, run, WebOptions(), findings.append, None)
+    return findings, cmp
+
+
+def test_a_page_inside_an_ignore_region_is_not_checked():
+    """A selector that matches the page's main element (or one around it) leaves nothing
+    to compare: not checked, so the run cannot read as a plain pass."""
+    for source, target in [({"region": None, "region_ignored": ".greeting"}, {}),
+                           ({}, {"region_ignored": ".greeting"})]:  # fmt: skip
+        [f], cmp = _hiding(source, target, "" if target else ORDER_PAGE)
+        assert (f.kind, f.severity, f.object, f.detail) == (
+            Kind.NOT_CHECKED, LOW, "j", {"steps": [1], "ignore_regions": [".greeting"]})
+        assert f.summary == "page after step 1 not compared: the whole page is inside " \
+                            "ignore region .greeting"
+        assert cmp.ui_compared == {"text": 0, "shape": 0, "expired": 0}
+        assert cmp.hidden_by[GREETING]["source" if source else "target"] == [1]
+        assert verdict([f]) == PASSED_WITH_DIFFERENCES
+
+
+def test_a_difference_names_the_ignore_region_that_hid_content_on_one_side_only():
+    """The application marks a part volatile on one side only, or a selector matches one
+    side's markup: the likely cause of the difference is named with it."""
+    without = ORDER_PAGE.replace("- text: DISPATCHED\n", "")
+    [f], cmp = _hiding({}, {"region_hidden": [VOLATILE.selector]}, without)
+    assert f.summary == "page content differs after the step"
+    assert f.detail["hidden_on_one_side"] == {VOLATILE.selector: "target"}
+    assert cmp.hidden_by[VOLATILE] == {"source": [], "target": [1], "unhideable": []}
+    report = build_report(run_id="r", project="p", mode="replay", started_at="t",
+                          finished_at="t", db=None, findings=[f], metadata={},
+                          range_block={})  # fmt: skip
+    assert f"content on one side only: {VOLATILE.selector} (target)" in render_html(report)
+    # hidden on both sides, nothing differs
+    assert _hiding({"region_hidden": [".greeting"]}, {"region_hidden": [".greeting"]})[0] == []
+
+
+def test_each_ignore_region_is_listed_with_its_reason(monkeypatch):
+    """One notice a rule over the run, which the report lists among the exclusions (spec
+    9.12): where it hid content, that it matched nothing, or that no journey replayed was
+    recorded with it. The built-in rule only once it hid something."""
+    banner = IgnoreRegion("never shown", ".banner")
+    chat = IgnoreRegion("added since", ".chat")
+    contents = IgnoreRegion("rendered as contents", target_selector=".promo")
+    journeys = [fakereplay.journey("j1"), fakereplay.journey("j2")]
+    for j in journeys:
+        j.ignore_regions = in_force([GREETING, banner])
+    journeys[0].steps[0].region_hidden = [".greeting"]
+
+    def replay_one(j):
+        run = fakereplay.replayed(j)
+        if j.journey_id == "j1":
+            run.steps[0].region_hidden, run.steps[0].region_unhideable = [".greeting"], [".promo"]
+        return run
+
+    fakereplay.no_browser(monkeypatch, replay_one)
+    findings = []
+    result = _replay(journeys, findings.append,
+                     options=WebOptions(ignore_regions=[GREETING, banner, chat, contents]))
+    notices = {f.column: f for f in findings if f.object == "page region"}
+    assert sorted(notices) == [
+        ".banner (matched nothing)", ".chat (not applied)", ".greeting", "target .promo"]
+    greeting = notices[".greeting"]
+    assert (greeting.kind, greeting.severity, greeting.summary) == (
+        Kind.NOTICE, Severity.INFO,
+        "ignore region .greeting: what it matched was not compared: personalised")
+    assert {k: greeting.detail[k] for k in ("journeys", "steps_on_source", "steps_on_target")} \
+        == {"journeys": ["j1"], "steps_on_source": 1, "steps_on_target": 1}
+    assert notices[".chat (not applied)"].detail["not_applied"] == ["j1", "j2"]
+    assert notices[".chat (not applied)"].summary == (
+        "ignore region .chat not applied: the journeys were recorded without it; "
+        "record them again")
+    assert notices["target .promo"].summary.endswith(
+        "in 1 step an element it matched kept its own text, which is compared "
+        "(display: contents)")
+    report = build_report(run_id="r", project="p", mode="replay", started_at="t",
+                          finished_at="t", db=None, findings=findings, metadata={},
+                          range_block={}, web=result)  # fmt: skip
+    assert sorted((e["object"], e["column"], e["reason"]) for e in
+                  report["coverage"]["exclusions"]) == [
+        ("page region", ".banner (matched nothing)", "never shown"),
+        ("page region", ".chat (not applied)", "added since"),
+        ("page region", ".greeting", "personalised"),
+        ("page region", "target .promo", "rendered as contents")]  # fmt: skip
+    assert "<td>.greeting</td><td>personalised</td>" in render_html(report)
+
+
+def test_record_says_what_each_ignore_region_hid_on_the_source(tmp_path, monkeypatch, capsys):
+    """The source is read only now: a selector that matched nothing there is worth
+    knowing before it is gone."""
+    from liftproof import cli
+    from liftproof.web.recorder import Recorder
+
+    def record(self, journey_id, **kw):
+        steps = [Step(1, "goto", url="/", region_hidden=[VOLATILE.selector, ".greeting"]),
+                 Step(2, "click", region_ignored=".greeting"), Step(3, "click")]  # fmt: skip
+        return Journey(journey_id, "http://a", steps=steps,
+                       ignore_regions=in_force(self.regions)), {}  # fmt: skip
+
+    monkeypatch.setattr(Recorder, "record", record)
+    p = tmp_path / "p.yaml"
+    regions = [{"selector": ".greeting", "reason": "personalised"},
+               {"source_selector": "#legacy-ad", "reason": "ads"}]  # fmt: skip
+    p.write_text(yaml.safe_dump({"project": "t",
+                                 "web": {"source_url": "http://a", "ignore_regions": regions}}))
+    work = ["--workdir", str(tmp_path / "work"), "--format", "json"]
+    assert cli.main(["record", "--project", str(p), "--journey", "j1", *work]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ignore_regions_hid"] == {VOLATILE.selector: 1, ".greeting": 2, "#legacy-ad": 0}
+    saved = Journey.load(tmp_path / "work" / "t" / "journeys" / "j1.json")
+    assert saved.ignore_regions == in_force(load_project(p).web.ignore_regions)

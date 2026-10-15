@@ -30,6 +30,7 @@ LOGIN = """<!doctype html><html><head><title>Shop</title>
 
 ORDERS = """<!doctype html><html><head><title>Shop</title></head><body><main>
 <h1>Orders</h1>
+<p data-liftproof-volatile>Served by node {node}</p>
 <form id="new">
 <label for="item">Item</label> <input id="item" name="item">
 <button type="submit" {testid}>{button}</button>
@@ -45,8 +46,9 @@ document.getElementById('new').addEventListener('submit', async (e) => {{
 </script></main></body></html>"""
 
 ORDER = """<!doctype html><html><head><title>Shop</title></head><body><main>
-<h1>Order <span id="oid"></span></h1><dl id="d"></dl>
+<h1>Order <span id="oid"></span></h1>{greeting}<dl id="d"></dl>
 <a href="/orders">Back to orders</a>
+<p data-liftproof-volatile>Served by node {node}</p>
 <script>
 fetch('/api/orders/{oid}').then(r => r.json()).then(o => {{
   document.getElementById('oid').textContent = o.id;
@@ -55,6 +57,11 @@ fetch('/api/orders/{oid}').then(r => r.json()).then(o => {{
     '<dt>Placed</dt><dd>' + o.placed_at + '</dd>';
 }});
 </script></main></body></html>"""
+
+HELP = """<!doctype html><html><head><title>Shop</title></head><body><main>
+<h1>Help</h1>
+<aside data-liftproof-volatile>Served by node {node}. <a href="/login">Sign in</a></aside>
+</main></body></html>"""
 
 INBOX = """<!doctype html><html><head><title>Shop</title></head><body><main>
 <h1>Inbox</h1>
@@ -70,7 +77,12 @@ class ShopApp:
     posts counts the POSTs that reach it, by path. post_status and post_delay_ms (by path)
     change the answer to a write it has already stored: its status, and how long it takes.
     GET /dropped closes the connection without an answer. GET /inbox long polls
-    /api/updates, which is held open until the app closes; polls counts those requests."""
+    /api/updates, which is held open until the app closes; polls counts those requests.
+
+    Every page after sign in names the node that served it, marked volatile, and so does
+    GET /help, around its link to sign in. greeting (plain, or marked volatile) welcomes
+    the user on the order page by a name that differs on every visit. pages counts the
+    pages served, by path."""
 
     def __init__(
         self,
@@ -79,12 +91,15 @@ class ShopApp:
         *,
         post_status: dict[str, int] | None = None,
         post_delay_ms: dict[str, int] | None = None,
+        greeting: str | None = None,
     ) -> None:
         self.variant = variant
         self.latency_ms = latency_ms
         self.post_status = post_status or {}
         self.post_delay_ms = post_delay_ms or {}
+        self.greeting = greeting
         self.posts: Counter[str] = Counter()
+        self.pages: Counter[str] = Counter()
         self.polls = 0
         self._closing = threading.Event()
         self.orders: dict[str, dict] = {}
@@ -136,10 +151,14 @@ class ShopApp:
 
             def do_GET(self):
                 path = self.path.split("?")[0]
+                with app._lock:
+                    app.pages[path] += 1
                 if path == "/dropped":
                     return  # the connection closes with nothing sent
                 if path == "/inbox":
                     return self._send(200, INBOX)
+                if path == "/help":
+                    return self._send(200, HELP.format(node=secrets.token_hex(4)))
                 if path == "/api/updates":
                     with app._lock:
                         app.polls += 1
@@ -155,9 +174,11 @@ class ShopApp:
                     same = app.variant == "same"
                     return self._send(200, ORDERS.format(
                         testid='data-testid="place-order"' if same else "",
-                        button="Place order"))
+                        button="Place order", node=secrets.token_hex(4)))
                 if path.startswith("/orders/"):
-                    return self._send(200, ORDER.format(oid=path.rsplit("/", 1)[1]))
+                    return self._send(200, ORDER.format(
+                        oid=path.rsplit("/", 1)[1], node=secrets.token_hex(4),
+                        greeting=app._greeting()))
                 if path.startswith("/api/orders/"):
                     o = app.orders.get(path.rsplit("/", 1)[1])
                     if o is None:
@@ -197,6 +218,12 @@ class ShopApp:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def _greeting(self) -> str:
+        if self.greeting is None:
+            return ""
+        marked = " data-liftproof-volatile" if self.greeting == "marked" else ""
+        return f'<p class="greeting"{marked}>Welcome back, visitor {secrets.token_hex(3)}</p>'
 
     def __enter__(self) -> ShopApp:
         self.thread.start()

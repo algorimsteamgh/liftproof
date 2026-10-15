@@ -22,7 +22,7 @@ import queue
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin
@@ -34,15 +34,19 @@ from liftproof.web.browser import (
     Captured,
     NetworkLog,
     Write,
+    applied_regions,
+    check_selectors,
     dom_settled,
     endpoints,
+    in_force,
     launch,
     mark_region,
     normalise_path,
     path_of,
     region_snapshot,
+    unhide,
 )
-from liftproof.web.journey import Journey, Locator, Step
+from liftproof.web.journey import IgnoreRegion, Journey, Locator, Step
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +107,12 @@ class StepRun:
     degraded_from: dict[str, str] | None = None
     exchanges: list[Captured] = field(default_factory=list)
     region: str | None = None
+    # the ignore regions (target selectors) that left elements out of the region, those
+    # whose element kept text of its own (display: contents), and the one the page itself
+    # was inside, so that none of it was read
+    region_hidden: list[str] = field(default_factory=list)
+    region_unhideable: list[str] = field(default_factory=list)
+    region_ignored: str | None = None
     page_url: str | None = None
     duration_ms: float | None = None
     error: str | None = None
@@ -244,12 +254,14 @@ class Replayer:
         step_timeout_ms: int = 15_000,
         headless: bool = True,
         executable_path: str | None = None,
+        regions: Sequence[IgnoreRegion] = (),
     ) -> None:
         self.target_url = target_url.rstrip("/") + "/"
         self.secret_values = secret_values
         self.step_timeout_ms = step_timeout_ms
         self.headless = headless
         self.executable_path = executable_path
+        self.regions = list(regions)  # the project's ignore regions (web.ignore_regions)
         self.browser_version: str | None = None
         self._done = threading.Lock()
         self._closed = False  # the caller has stopped listening
@@ -300,6 +312,7 @@ class Replayer:
             # one browser process per worker, a fresh context per journey (spec 13)
             browser = _Browser(p, self)
             try:
+                check_selectors(browser.browser, [s for r in self.regions for s in r.selectors])
                 while not self._closed:  # an interrupted run takes no more journeys
                     if isinstance(todo, list):
                         if not todo:
@@ -440,6 +453,7 @@ class Replayer:
     ) -> None:
         net.drain()  # anything left from a failed attempt is not this step's
         timeout = self.step_timeout_ms
+        hide = self._hidden(journey)
         if step.action == "goto":
             # the recorded path, before tokens and correlated values are put in
             log.debug("journey %s step %s: goto %s", journey.journey_id, step.n, step.url)
@@ -447,6 +461,8 @@ class Replayer:
             acted = time.time() * 1000
             page.goto(url, wait_until="load", timeout=timeout)
         else:
+            if hide:
+                unhide(page)  # an element left aria-hidden is not found by its role
             target, index = resolve(page, step.locator, timeout)
             sr.used_locator = step.locator.candidates[index]
             log.debug("journey %s step %s: %s on %s (candidate %d of %d)", journey.journey_id,
@@ -475,11 +491,19 @@ class Replayer:
         sr.exchanges += net.drain()
         sr.duration_ms = step_duration(acted, sr.exchanges)
         dom_settled(page)
-        sr.region = region_snapshot(page)
+        snap = region_snapshot(page, hide)
+        sr.region = snap.text
         for token, value in secrets.items():  # a textbox shows its value in the tree
             sr.region = sr.region.replace(value, token)
+        sr.region_hidden, sr.region_unhideable = snap.hidden, snap.unhideable
+        sr.region_ignored = snap.whole
         sr.page_url = path_of(page.url)
         self._correlate(journey, sr, run)
+
+    def _hidden(self, journey: Journey) -> list[str]:
+        """The target's side of the ignore regions this journey is replayed with."""
+        applied, _ = applied_regions(journey.ignore_regions, in_force(self.regions))
+        return list(dict.fromkeys(t for r in applied if (t := r.on("target"))))
 
     def _await_requests(
         self, page: Any, net: NetworkLog, step: Step, run: JourneyRun, timeout: int
