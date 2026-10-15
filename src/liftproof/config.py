@@ -33,7 +33,7 @@ VERIFYING_TLS = {"verify-full", "verify-ca"}
 # Spec 9.15: the source is the machine not to saturate. Left out of the project file, its
 # connections read at most this many rows a second each, on one core, and pause between
 # statements; the target's do neither. Every connection gives up a lock wait after 10 s.
-SOURCE_ROWS_PER_SECOND = 75_000
+SOURCE_ROWS_PER_SECOND = 125_000
 SOURCE_PAUSE_MS = 100
 LOCK_TIMEOUT_MS = 10_000
 
@@ -482,7 +482,7 @@ source:                         # a read replica where there is one (README: Pro
                                 # already trusts Amazon RDS and public certificate authorities
   statement_timeout_ms: 600000
   lock_timeout_ms: 10000        # a read kept waiting this long for a lock fails the run
-  rows_per_second: 75000        # rows read a second, on one core, by each connection (each
+  rows_per_second: 125000       # rows read a second, on one core, by each connection (each
                                 # worker has its own); 0 = no cap, e.g. for a read replica
   pause_ms: 100                 # at least this long between two statements on a connection
   # snapshot: per_table         # a baseline holds one snapshot over every table; per_table

@@ -46,7 +46,7 @@ Each connection has its own limits, whole numbers where 0 turns one off:
 
 | Setting | Source default | Target default | What it limits |
 |---|---|---|---|
-| `rows_per_second` | 75000 | 0 | rows read a second by one connection, over its statements |
+| `rows_per_second` | 125000 | 0 | rows read a second by one connection, over its statements |
 | `pause_ms` | 100 | 0 | the least time between two statements on a connection |
 | `lock_timeout_ms` | 10000 | 10000 | how long a read waits for a lock before the run fails |
 | `statement_timeout_ms` | 0 (`init` writes 600000) | 0 | how long one statement may run |
