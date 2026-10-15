@@ -198,8 +198,15 @@ class UI:
 
     def journey(self, p: Project, journey_id: str):
         from liftproof.cli import _load_journey, _store
+        from liftproof.store import LocalStore
 
-        return _load_journey(_store(p, self.workdir), self.workdir / p.name, journey_id)
+        workdir = self.workdir / p.name
+        try:
+            return _load_journey(_store(p, self.workdir), workdir, journey_id)
+        except LiftproofError as exc:  # the bucket out of reach: the copy held here shows
+            journey = _load_journey(LocalStore(workdir), workdir, journey_id)
+            log.warning("journey %s of %s from this instance only: %s", journey_id, p.name, exc)
+            return journey
 
     # starting the CLI ------------------------------------------------------------
     def start(self, project: str, command: str, form: dict[str, str], person: str) -> Job:

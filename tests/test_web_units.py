@@ -848,6 +848,7 @@ def test_snapshots_are_kept_only_for_pages_opted_in():
     text = json.dumps(journey.to_dict())
     assert not [t for t in ("s3cret-pass", "Order 4021", "Sign in") if t in text]
     assert Journey.from_dict(json.loads(text)).to_dict() == journey.to_dict()
+    assert BodyPolicy([], snapshots=["/orders"]).keeps_snapshot("/orders?page=2")  # no query
 
 
 ORDER_PAGE = "\n".join([

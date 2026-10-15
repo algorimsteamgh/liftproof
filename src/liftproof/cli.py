@@ -873,21 +873,28 @@ def _load_journey(store: Store, workdir: Path, journey_id: str) -> Journey:
     return journey
 
 
-def _fetch_assets(store: Store, workdir: Path, journey: Journey) -> None:
+def _fetch_assets(store: Store, workdir: Path, journeys: list[Journey]) -> None:
     """The bodies and page snapshots a replay compares with, as the store holds them now.
-    The bucket expires them (spec 5), so a copy this instance holds of one the store no
-    longer has is deleted: the replay then compares without it, as any instance would."""
-    prefix = f"journeys/{journey.journey_id}/"
-    held = store.modified(f"{prefix}assets/")
-    assets = _journey_dir(workdir) / journey.journey_id / "assets"
-    refs = {ex.body_asset for s in journey.steps for ex in s.exchanges}
-    refs |= {s.region_asset for s in journey.steps}
-    for ref in sorted(r for r in refs if r):
-        local = assets / ref.split("/")[-1]
-        if prefix + ref not in held:
-            local.unlink(missing_ok=True)
-        elif not local.exists():
-            store.get_file(prefix + ref, local)
+    The bucket expires them (spec 5), so every copy this instance holds of one the store
+    no longer has is deleted, for each journey the store holds, replayed now or not: the
+    replay then compares without it, as any instance would. A journey only this instance
+    holds (recorded before the project had a bucket) keeps what it kept."""
+    held = store.modified("journeys/")
+    base = _journey_dir(workdir)
+    for assets in base.glob("*/assets"):
+        jid = assets.parent.name
+        if f"journeys/{jid}.json" in held:
+            for local in assets.iterdir():
+                if local.is_file() and f"journeys/{jid}/assets/{local.name}" not in held:
+                    local.unlink()
+    for journey in journeys:
+        prefix = f"journeys/{journey.journey_id}/"
+        refs = {ex.body_asset for s in journey.steps for ex in s.exchanges}
+        refs |= {s.region_asset for s in journey.steps}
+        for ref in sorted(r for r in refs if r and prefix + r in held):
+            local = base / journey.journey_id / "assets" / ref.split("/")[-1]
+            if not local.exists():
+                store.get_file(prefix + ref, local)
 
 
 def _save_journey(store: Store, workdir: Path, journey: Journey, assets: dict[str, bytes]) -> Path:
@@ -937,8 +944,7 @@ def _replay_into(
     ]
     if not journeys:
         raise ConfigError("no journeys recorded for this project; record one with liftproof record")
-    for j in journeys:
-        _fetch_assets(store, workdir, j)
+    _fetch_assets(store, workdir, journeys)
     options = WebOptions(
         compare_headers=web.compare_headers,
         ignore_json_paths=web.ignore_json_paths,

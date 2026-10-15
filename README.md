@@ -81,7 +81,7 @@ the bucket under `journeys/<id>/assets/` and expire after its asset retention
 compares that page by structure and that response by shape, and says so in a notice.
 The report's journey table counts the pages compared each way. Replay and `bind` read
 the journey from the bucket, so one recorded again on another machine replaces the
-instance's copy.
+instance's copy, and a replay deletes the instance's copies of what the bucket has expired.
 
 ## Files
 
