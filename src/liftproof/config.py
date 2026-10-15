@@ -21,6 +21,7 @@ from liftproof.reconcile.engine import ReconcileOptions
 from liftproof.reconcile.plan import IgnoreRule
 from liftproof.reconcile.replication import ReplicationConfig
 from liftproof.schedule import Schedule, parse_schedules
+from liftproof.web.journey import IgnoreRegion
 
 FORBIDDEN_KEYS = re.compile(
     r"(password|passwd|secret_access_key|access_key_id|session_token)", re.I
@@ -72,6 +73,8 @@ class WebConfig:
     compare_headers: list[str] = field(default_factory=list)
     ignore_json_paths: list[str] = field(default_factory=list)
     ignore_text: list[str] = field(default_factory=list)
+    # page parts never compared, by CSS selector, each with its reason (spec 7, 9.12)
+    ignore_regions: list[IgnoreRegion] = field(default_factory=list)
     step_timeout_ms: int = 15_000
     chromium_path: str | None = None
     # journeys replayed at once (spec 6). 1, the default, is sequential; more is an opt in
@@ -261,10 +264,38 @@ def _web(d: Any) -> WebConfig | None:
         compare_headers=strings("compare_headers"),
         ignore_json_paths=strings("ignore_json_paths"),
         ignore_text=strings("ignore_text"),
+        ignore_regions=_regions(d.get("ignore_regions")),
         step_timeout_ms=int(d.get("step_timeout_ms", 15_000)),
         chromium_path=d.get("chromium_path"),
         parallel_journeys=_parallel(d.get("parallel_journeys", 1)),
     )
+
+
+SELECTOR_KEYS = ("selector", "source_selector", "target_selector")
+
+
+def _regions(v: Any) -> list[IgnoreRegion]:
+    """web.ignore_regions: `selector` (both sides) or `source_selector` / `target_selector`
+    (one side each), and a reason. The browser checks that each is CSS before a run."""
+    if not v:
+        return []
+    if not isinstance(v, list):
+        raise ConfigError("web.ignore_regions must be a list of {selector, reason}")
+    rules = []
+    for i, r in enumerate(v):
+        if not isinstance(r, dict) or not r.get("reason") or not any(map(r.get, SELECTOR_KEYS)):
+            raise ConfigError(
+                f"web.ignore_regions.{i}: every ignore region needs a selector (CSS; quote one "
+                "that starts with [ or #) and a reason; the reasons are printed in the report"
+            )
+        for k in SELECTOR_KEYS:
+            if r.get(k) is not None and not isinstance(r[k], str):
+                raise ConfigError(
+                    f"web.ignore_regions.{i}.{k} must be a string: quote a selector that "
+                    "starts with [ or #"
+                )
+        rules.append(IgnoreRegion(str(r["reason"]), *(r.get(k) or None for k in SELECTOR_KEYS)))
+    return rules
 
 
 MAX_PARALLEL_JOURNEYS = 8  # each runs its own browser on the instance
@@ -451,6 +482,10 @@ web:                            # record and replay; omit for database only proj
   ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag";
                                 # [*] is every element: "$.orders[*].updated_at"
   ignore_text: []               # regular expressions masked in page content
+  ignore_regions: []            # page parts never compared, by CSS selector, with a reason:
+                                # {{selector: ".recently-viewed", reason: personalised}};
+                                # or source_selector / target_selector where markup differs.
+                                # Elements marked data-liftproof-volatile are never compared
   step_timeout_ms: 15000
   parallel_journeys: 1          # 1 = in sequence; more only for journeys that do not interfere
 

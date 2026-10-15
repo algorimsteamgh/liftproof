@@ -5,6 +5,7 @@ controls and carries out a real journey. Three layers are captured at once: the
 interactions (with several locators per element), the network traffic behind them, and
 timings. Sensitive values are swapped for random tokens before anything is written, and
 response bodies and page snapshots are kept only for URL patterns the project opted in to.
+Page snapshots never hold what the ignore regions match (spec 7).
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import datetime as dt
 import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from importlib import resources
 from typing import Any
 from urllib.parse import quote, quote_plus, urljoin
@@ -24,6 +25,8 @@ from liftproof.web.browser import (
     BodyPolicy,
     Captured,
     NetworkLog,
+    check_selectors,
+    in_force,
     launch,
     normalise_path,
     path_of,
@@ -33,6 +36,7 @@ from liftproof.web.browser import (
 from liftproof.web.journey import (
     REGION_SHAPE_VERSION,
     TOKEN_PREFIX,
+    IgnoreRegion,
     Journey,
     Locator,
     SecretBinding,
@@ -48,11 +52,19 @@ class RecordingSession:
     """One journey being recorded. Use act() to drive it from code (tests, the sample
     project) or wait_until_closed() to let an engineer drive the window."""
 
-    def __init__(self, page: Any, journey: Journey, policy: BodyPolicy, settle_ms: int) -> None:
+    def __init__(
+        self,
+        page: Any,
+        journey: Journey,
+        policy: BodyPolicy,
+        settle_ms: int,
+        hide: Sequence[str] = (),
+    ) -> None:
         self.page = page
         self.journey = journey
         self.policy = policy
         self.settle_ms = settle_ms
+        self.hide = list(hide)  # the source side of the journey's ignore regions
         self._events: list[dict[str, Any]] = []
         self._times: list[float] = []  # event time of each step, epoch ms
         self._captured: list[Captured] = []
@@ -80,7 +92,9 @@ class RecordingSession:
 
     def _snapshot(self) -> None:
         step = self.journey.steps[-1]
-        step.region = region_snapshot(self.page)
+        snap = region_snapshot(self.page, self.hide)
+        step.region = None if snap.whole else snap.text
+        step.region_hidden, step.region_ignored = snap.hidden, snap.whole
         step.page_url = path_of(self.page.url)
 
     def _token(self, field: str, value: str) -> str:
@@ -216,12 +230,14 @@ class Recorder:
         headless: bool = False,
         executable_path: str | None = None,
         settle_ms: int = 5000,
+        regions: Sequence[IgnoreRegion] = (),
     ) -> None:
         self.base_url = base_url.rstrip("/") + "/"
         self.policy = policy or BodyPolicy()
         self.headless = headless
         self.executable_path = executable_path
         self.settle_ms = settle_ms
+        self.regions = list(regions)  # the project's ignore regions (web.ignore_regions)
 
     def record(
         self,
@@ -235,13 +251,17 @@ class Recorder:
         session.act(); without it the engineer does, and closing the window ends it."""
         from playwright.sync_api import sync_playwright
 
-        journey = Journey(journey_id=journey_id, base_url=self.base_url.rstrip("/"), story=story)
+        regions = in_force(self.regions)
+        journey = Journey(journey_id=journey_id, base_url=self.base_url.rstrip("/"), story=story,
+                          ignore_regions=regions)  # fmt: skip
+        hide = list(dict.fromkeys(s for r in regions if (s := r.on("source"))))
         with sync_playwright() as p:
             browser = launch(p, headless=self.headless, executable_path=self.executable_path)
+            check_selectors(browser, [s for r in self.regions for s in r.selectors])
             journey.browser = f"chromium {browser.version}"
             context = browser.new_context()
             page = context.new_page()
-            session = RecordingSession(page, journey, self.policy, self.settle_ms)
+            session = RecordingSession(page, journey, self.policy, self.settle_ms, hide)
             context.expose_function("__liftproofRecord", session.on_event)
             context.add_init_script(CAPTURE_JS)
             session.start(urljoin(self.base_url, start.lstrip("/")))

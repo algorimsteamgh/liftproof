@@ -4,6 +4,8 @@ UI: the accessible tree of the region each step touched, compared as text after
 volatile values (dates, times, generated ids, correlated values) are masked, where the
 project kept the page's snapshot (web.capture_snapshots); every other page, and a kept
 one the bucket has since expired, by structure: roles, states and nesting. Never pixels.
+What the ignore regions match (web.ignore_regions, and any element marked
+data-liftproof-volatile) is left out of the tree on both sides before either.
 
 API: for every request the journey made, status exactly, response shape structurally
 (an array by the union of its elements' shapes, so $.orders[*].total is one field),
@@ -31,17 +33,25 @@ from typing import Any
 
 from liftproof.findings import Comparator, Finding, Kind, Severity
 from liftproof.web import correlate
-from liftproof.web.browser import REDACTED, Captured, endpoints, normalise_path
+from liftproof.web.browser import (
+    REDACTED,
+    Captured,
+    applied_regions,
+    endpoints,
+    in_force,
+    normalise_path,
+)
 from liftproof.web.journey import (
     REGION_SHAPE_VERSION,
     Correlation,
     Exchange,
+    IgnoreRegion,
     Journey,
     Step,
     region_shape,
     shape,
 )
-from liftproof.web.replay import JourneyRun
+from liftproof.web.replay import JourneyRun, StepRun
 
 DEFAULT_VOLATILE = [
     (r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?", "<datetime>"),
@@ -62,6 +72,7 @@ class WebOptions:
     compare_headers: list[str] = field(default_factory=list)
     ignore_json_paths: list[str] = field(default_factory=list)  # "$.a[*].b" or "GET /x $.y"
     ignore_text: list[str] = field(default_factory=list)  # regular expressions, UI
+    ignore_regions: list[IgnoreRegion] = field(default_factory=list)  # CSS selectors, UI
     volatile_defaults: bool = True
     float_rel_tolerance: float = 1e-9
     show_values: bool = False
@@ -201,6 +212,15 @@ class Comparison:
         self.ui_compared = dict.fromkeys(("text", "shape", "expired"), 0)
         self.bodies_expired = 0
         self.shapes_outdated = 0  # recorded by another version of region_shape()
+        # the ignore regions this journey is compared with, the steps each hid content in on
+        # each side (and those where an element kept its own text), and those left out
+        self.regions, self.regions_left_out = applied_regions(
+            journey.ignore_regions, in_force(options.ignore_regions)
+        )
+        self.hidden_by: dict[IgnoreRegion, dict[str, list[int]]] = {
+            r: {"source": [], "target": [], "unhideable": []} for r in self.regions
+        }
+        self.pages_ignored: dict[int, str] = {}  # step -> the ignore region it was inside
         # correlated values on both sides -> {name}
         self.masks: dict[str, str] = {}
         for c in journey.correlations:
@@ -434,11 +454,17 @@ class Comparison:
             text = re.sub(pattern, "<ignored>", text)
         return text
 
-    def page(self, step: Step, replayed: str | None) -> None:
+    def page(self, step: Step, sr: StepRun) -> None:
         """The region a step touched, after it ran: as text when its snapshot is held (an
         asset the page was opted in for, or inline in a journey recorded before 1.1),
-        otherwise by structure."""
+        otherwise by structure; not at all when an ignore region covered all of it."""
+        replayed = sr.region
         if replayed is None:
+            return
+        one_side = self._hiding(step, sr)
+        covered = step.region_ignored or sr.region_ignored
+        if covered:
+            self.pages_ignored[step.n] = covered
             return
         text = step.region
         if text is None and step.region_asset:
@@ -446,15 +472,40 @@ class Comparison:
             text = raw.decode("utf-8", "replace") if raw is not None else None
         if text is not None:
             self.ui_compared["text"] += 1
-            self.ui(text, replayed, step.n)
+            self.ui(text, replayed, step.n, one_side)
         elif step.region_shape is not None:
             if self.j.region_shape_version != REGION_SHAPE_VERSION:
                 self.shapes_outdated += 1
                 return
             self.ui_compared["expired" if step.region_asset else "shape"] += 1
-            self.ui_shape(step.region_shape, replayed, step.n)
+            self.ui_shape(step.region_shape, replayed, step.n, one_side)
 
-    def ui(self, recorded: str | None, replayed: str | None, step: int) -> None:
+    def _hiding(self, step: Step, sr: StepRun) -> dict[str, str]:
+        """Note where each ignore region hid content at this step, on each side. Returns
+        those that hid content on one side only (by label: the side), the likely cause of
+        a difference there: a selector that matches one side's markup and not the other's."""
+        hid_on = {
+            "source": {*step.region_hidden, step.region_ignored} - {None},
+            "target": {*sr.region_hidden, sr.region_ignored} - {None},
+        }
+        one_side = {}
+        for r, steps in self.hidden_by.items():
+            hid = {side: r.on(side) in selectors for side, selectors in hid_on.items()}
+            for side in (side for side in hid if hid[side]):
+                steps[side].append(step.n)
+            if r.on("target") in sr.region_unhideable:
+                steps["unhideable"].append(step.n)
+            if r.on("source") and r.on("target") and hid["source"] != hid["target"]:
+                one_side[r.label] = "source" if hid["source"] else "target"
+        return one_side
+
+    def ui(
+        self,
+        recorded: str | None,
+        replayed: str | None,
+        step: int,
+        one_side: dict[str, str] | None = None,
+    ) -> None:
         if recorded is None or replayed is None:
             return
         a, b = self.mask(recorded).splitlines(), self.mask(replayed).splitlines()
@@ -476,10 +527,13 @@ class Comparison:
                 "lines_only_on_source": len(removed),
                 "lines_only_on_target": len(added),
                 **({"diff": diff[:40]} if self.o.show_values else {}),
+                **({"hidden_on_one_side": one_side} if one_side else {}),
             },
         )
 
-    def ui_shape(self, recorded: str, replayed: str, step: int) -> None:
+    def ui_shape(
+        self, recorded: str, replayed: str, step: int, one_side: dict[str, str] | None = None
+    ) -> None:
         """A page whose text was not kept, by structure (region_shape). Its lines hold no
         values, so they are shown as they are; masks and ignore_text have no text here."""
         a, b = recorded.splitlines(), region_shape(replayed).splitlines()
@@ -500,6 +554,7 @@ class Comparison:
                 "lines_only_on_source": len(removed),
                 "lines_only_on_target": len(added),
                 "diff": diff[:40],
+                **({"hidden_on_one_side": one_side} if one_side else {}),
             },
         )
 
@@ -539,6 +594,23 @@ class Comparison:
                     "this_version": REGION_SHAPE_VERSION,
                 },
             )
+
+    def report_ignored(self) -> None:
+        """The pages not compared because an ignore region matched the region the step
+        touched, or an element around it: not checked, so a selector that hides more
+        than was meant cannot pass for a comparison."""
+        if not self.pages_ignored:
+            return
+        steps, regions = sorted(self.pages_ignored), sorted(set(self.pages_ignored.values()))
+        self.emit(
+            Comparator.UI,
+            Kind.NOT_CHECKED,
+            Severity.LOW,
+            self.j.journey_id,
+            f"page after {_steps(steps)} not compared: the region the step touched is "
+            f"inside ignore region {' or '.join(regions)}",
+            detail={"steps": steps, "ignore_regions": regions},
+        )
 
     # ------------------------------------------------------------------- API
     def _endpoint(self, ex: Exchange) -> str:
@@ -781,7 +853,7 @@ def compare_journey(
 ) -> Comparison:
     """Emit every UI and API finding for one replayed journey, and one for each
     correlation it left unresolved; returns the comparison, which counts the differences
-    and how each page was compared."""
+    and how each page was compared, and holds where each ignore region hid content."""
 
     def asset(ref: str) -> bytes | None:
         if assets_dir is None:
@@ -807,8 +879,9 @@ def compare_journey(
                 expected=json.dumps(sr.degraded_from),
                 actual=json.dumps(sr.used_locator),
             )
-        cmp.page(step, sr.region)
+        cmp.page(step, sr)
         cmp.api(step.exchanges, sr.exchanges, step.n)
     cmp.report_unresolved()
     cmp.report_unkept()
+    cmp.report_ignored()
     return cmp

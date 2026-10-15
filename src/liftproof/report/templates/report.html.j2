@@ -89,7 +89,7 @@
   </table>{% endif %}
   {% if r.coverage.exclusions %}
   <p><strong>Exclusions and their reasons</strong></p>
-  <table><tr><th>Object</th><th>Column</th><th>Reason</th></tr>
+  <table><tr><th>Object</th><th>Column or selector</th><th>Reason</th></tr>
   {% for e in r.coverage.exclusions %}<tr><td>{{ e.object }}</td><td>{{ e.column or "whole table" }}</td><td>{{ e.reason }}</td></tr>{% endfor %}
   </table>{% endif %}
 
@@ -102,7 +102,7 @@
     <tr>
       <td><span class="sev s{{ f.severity }}">{{ f.severity }}</span></td>
       <td><code>{{ f.object }}{% if f.column %}.{{ f.column }}{% endif %}</code>{% if f.locator %}<br><span class="sub">{{ f.locator }}</span>{% endif %}</td>
-      <td>{{ f.summary }}{% if f.kind != "difference" %} <span class="sub">({{ f.kind|replace("_"," ") }})</span>{% endif %}{% if f.detail.unresolved_correlations %}<br><span class="sub">unresolved correlations: {{ f.detail.unresolved_correlations|join(", ") }}</span>{% endif %}</td>
+      <td>{{ f.summary }}{% if f.kind != "difference" %} <span class="sub">({{ f.kind|replace("_"," ") }})</span>{% endif %}{% if f.detail.unresolved_correlations %}<br><span class="sub">unresolved correlations: {{ f.detail.unresolved_correlations|join(", ") }}</span>{% endif %}{% if f.detail.hidden_on_one_side %}<br><span class="sub">ignore regions that hid content on one side only: {% for sel, side in f.detail.hidden_on_one_side.items() %}{{ sel }} ({{ side }}){% if not loop.last %}, {% endif %}{% endfor %}</span>{% endif %}</td>
       <td><code>{{ f.expected if f.expected is not none else "" }}</code></td>
       <td><code>{{ f.actual if f.actual is not none else "" }}</code></td>
     </tr>
@@ -153,7 +153,7 @@
       <td class="num">{% if j.ui_compared %}{{ j.ui_compared.text or 0 }} / {{ (j.ui_compared.shape or 0) + (j.ui_compared.expired or 0) }}{% if j.ui_compared.expired %} ({{ j.ui_compared.expired }} expired){% endif %}{% endif %}</td></tr>
     {% endfor %}
   </table></div>
-  <p class="sub">The page after each step is compared as text where <code>web.capture_snapshots</code> kept its snapshot, and otherwise by structure: roles, states and nesting, without the text. A kept snapshot past the bucket's asset retention has expired and is compared by structure.</p>
+  <p class="sub">The page after each step is compared as text where <code>web.capture_snapshots</code> kept its snapshot, and otherwise by structure: roles, states and nesting, without the text. A kept snapshot past the bucket's asset retention has expired and is compared by structure. Elements an ignore region matches (<code>web.ignore_regions</code>, or marked <code>data-liftproof-volatile</code>) are left out on both sides, and listed with their reasons under exclusions.</p>
   <h2>Response times, source and AWS</h2>
   <p class="sub">Recorded for comparison only; a slower response is never a pass or fail condition on its own.</p>
   <div class="scroll"><table>

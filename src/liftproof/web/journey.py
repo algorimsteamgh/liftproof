@@ -2,10 +2,10 @@
 
 A journey is data, never a script. It holds the steps the engineer took, the network
 exchanges behind each step, what the touched page region looked like, timings, the
-correlation rules, and the binding of each redaction token to a secret. Bodies and page
-snapshots are kept out of the journey file: an opted in one is an asset referenced by
-hash, which the bucket expires, and everything else is reduced to a hash and a shape
-(default deny, spec 5).
+correlation rules, the ignore regions it was recorded with, and the binding of each
+redaction token to a secret. Bodies and page snapshots are kept out of the journey file:
+an opted in one is an asset referenced by hash, which the bucket expires, and everything
+else is reduced to a hash and a shape (default deny, spec 5).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Any
 
 from liftproof.errors import ConfigError
 
-JOURNEY_FORMAT = "1.1"
+JOURNEY_FORMAT = "1.2"
 REGION_SHAPE_VERSION = 1  # of region_shape(): shapes made by another are not compared
 TOKEN_PREFIX = "@@REDACTED_"  # noqa: S105 - the marker, not a secret
 
@@ -69,6 +69,36 @@ class Step:
     region_sha256: str | None = None
     region_shape: str | None = None  # region_shape() of the region: structure, no content
     region_asset: str | None = None  # assets/<sha256>, present only when the page was opted in
+    # the ignore regions (source selectors) that left elements out of the region, and the
+    # one the region itself was inside, so that none of it was read
+    region_hidden: list[str] = field(default_factory=list)
+    region_ignored: str | None = None
+
+
+@dataclass(frozen=True)
+class IgnoreRegion:
+    """Part of a page never compared (spec 7): the elements a CSS selector matches, left
+    out of the accessible tree on both sides, or source_selector and target_selector where
+    the markup differs. The reason is printed in the report (spec 9.12)."""
+
+    reason: str
+    selector: str | None = None
+    source_selector: str | None = None
+    target_selector: str | None = None
+
+    def on(self, side: str) -> str | None:
+        return (self.source_selector if side == "source" else self.target_selector) or self.selector
+
+    @property
+    def selectors(self) -> list[str]:
+        return [s for s in (self.selector, self.source_selector, self.target_selector) if s]
+
+    @property
+    def label(self) -> str:
+        source, target = self.on("source"), self.on("target")
+        if source == target:
+            return source or ""
+        return ", ".join(f"{side} {s}" for side, s in (("source", source), ("target", target)) if s)
 
 
 @dataclass
@@ -117,6 +147,7 @@ class Journey:
     wall_ms: float | None = None
     format: str = JOURNEY_FORMAT
     region_shape_version: int | None = None
+    ignore_regions: list[IgnoreRegion] = field(default_factory=list)  # in force when recorded
 
     @property
     def non_idempotent(self) -> bool:
@@ -164,6 +195,7 @@ class Journey:
             wall_ms=d.get("wall_ms"),
             format=d.get("format", JOURNEY_FORMAT),
             region_shape_version=d.get("region_shape_version"),
+            ignore_regions=[IgnoreRegion(**r) for r in d.get("ignore_regions", [])],
         )
 
     def save(self, path: Path) -> Path:

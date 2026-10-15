@@ -1,6 +1,7 @@
 """One replay run over a set of journeys: replay, compare, and the journey results the
 report needs (coverage, traceability, timings). Turns replay failures into findings in
-the common shape; nothing here decides the verdict.
+the common shape, and names each ignore region with its reason; nothing here decides the
+verdict.
 
 Each journey is compared as soon as it has been replayed: its findings are written then
 and its captured responses dropped, so a run that stops keeps every journey it finished
@@ -17,9 +18,9 @@ from typing import Any
 
 from liftproof import logs
 from liftproof.findings import Comparator, Finding, Kind, Severity
-from liftproof.web.browser import normalise_path
-from liftproof.web.compare import WebOptions, compare_journey
-from liftproof.web.journey import Journey
+from liftproof.web.browser import VOLATILE, in_force, normalise_path
+from liftproof.web.compare import Comparison, WebOptions, compare_journey
+from liftproof.web.journey import IgnoreRegion, Journey
 from liftproof.web.replay import JourneyRun, Replayer
 
 REPEATED_FLAKE = 2
@@ -171,6 +172,87 @@ def _endpoints(timing: Timing) -> list[dict[str, Any]]:
     return rows
 
 
+@dataclass
+class RegionUse:
+    """What one ignore region did over the journeys a run compared."""
+
+    applied: int = 0  # journeys compared with it
+    journeys: list[str] = field(default_factory=list)  # those it hid content in
+    left_out: list[str] = field(default_factory=list)  # those recorded without it
+    source: int = 0  # steps it hid content in, on the source
+    target: int = 0  # and on the target
+    unhideable: int = 0  # steps where an element it matched kept its own text in the tree
+
+
+def _note_regions(uses: dict[IgnoreRegion, RegionUse], j: Journey, cmp: Comparison) -> None:
+    for rule, steps in cmp.hidden_by.items():
+        use = uses.setdefault(rule, RegionUse())
+        use.applied += 1
+        if any(steps.values()):
+            use.journeys.append(j.journey_id)
+        use.source += len(steps["source"])
+        use.target += len(steps["target"])
+        use.unhideable += len(steps["unhideable"])
+    for rule in cmp.regions_left_out:
+        uses.setdefault(rule, RegionUse()).left_out.append(j.journey_id)
+
+
+def _region_notices(
+    uses: dict[IgnoreRegion, RegionUse], options: WebOptions, emit: Callable[[Finding], None]
+) -> None:
+    """One notice for each ignore region, with its reason, so the report lists it among the
+    exclusions (spec 9.12): where it hid content, or, in its column, that it matched
+    nothing or was applied to no journey. The built-in one only where it hid content."""
+    configured = in_force(options.ignore_regions)
+    for rule, use in uses.items():
+        hid = use.source + use.target + use.unhideable
+        if rule == VOLATILE and not hid:
+            continue
+        reason = rule.reason
+        if rule not in configured:
+            reason += " (as recorded; no longer in web.ignore_regions)"
+        n = len(use.left_out)
+        again = f"record {'them' if n > 1 else 'it'} again"
+        if hid:
+            column, summary = rule.label, f"page content inside {rule.label} not compared: {reason}"
+        elif use.applied:
+            column = f"{rule.label} (matched nothing)"
+            summary = f"ignore region {rule.label} matched nothing in this run"
+        else:
+            column = f"{rule.label} (not applied)"
+            which = "the journeys were" if n > 1 else "the journey was"
+            summary = (
+                f"ignore region {rule.label} not applied: {which} recorded without it; {again}"
+            )
+        if n and use.applied:
+            summary += f"; not applied to {n} journey{'s' * (n > 1)} recorded without it ({again})"
+        if use.unhideable:
+            summary += (
+                f"; in {use.unhideable} step{'s' * (use.unhideable > 1)} an element it matched "
+                "kept its own text, which is compared (display: contents)"
+            )
+        emit(
+            Finding(
+                Comparator.UI,
+                Kind.NOTICE,
+                Severity.INFO,
+                "page region",
+                summary,
+                column=column,
+                detail={
+                    "reason": reason,
+                    "source_selector": rule.on("source"),
+                    "target_selector": rule.on("target"),
+                    "journeys": use.journeys[:50],
+                    "steps_on_source": use.source,
+                    "steps_on_target": use.target,
+                    "steps_unhideable": use.unhideable,
+                    "not_applied": use.left_out[:50],
+                },
+            )
+        )
+
+
 def _journey_done(
     j: Journey,
     run: JourneyRun,
@@ -178,6 +260,7 @@ def _journey_done(
     emit: Callable[[Finding], None],
     assets: Path | None,
     timing: Timing,
+    uses: dict[IgnoreRegion, RegionUse],
 ) -> JourneyResult:
     """Every finding of one replayed journey, and its result."""
     if run.browser_restarted:
@@ -228,6 +311,7 @@ def _journey_done(
                 )
             )
     comparison = compare_journey(j, run, options, emit, assets)
+    _note_regions(uses, j, comparison)
     differences = comparison.differences
     if run.status != "completed":
         failure = _failure_finding(j, run)
@@ -293,16 +377,19 @@ def run_journeys(
 ) -> WebResult:
     """`on_journey` is called after each journey with a function that builds the result
     so far, for a checkpoint to call when one is due. A failure carries that result as
-    `partial_result`: the journeys finished, then the others as not run."""
+    `partial_result`: the journeys finished, then the others as not run. The ignore
+    regions are reported once the replay ends, over the journeys it compared."""
     replayer = Replayer(
         target_url,
         secret_values=secret_values,
         step_timeout_ms=step_timeout_ms,
         executable_path=executable_path,
+        regions=options.ignore_regions,
     )
     workers = max(1, min(workers, len(journeys)))
     done: list[JourneyResult | None] = [None] * len(journeys)
     timing: Timing = defaultdict(lambda: {"source": [0.0, 0], "target": [0.0, 0]})
+    uses: dict[IgnoreRegion, RegionUse] = {}
 
     def result(complete: bool) -> WebResult:
         return WebResult(
@@ -318,7 +405,7 @@ def run_journeys(
 
     def finished(i: int, j: Journey, run: JourneyRun) -> None:
         try:
-            done[i] = _journey_done(j, run, options, emit, assets_dir(j), timing)
+            done[i] = _journey_done(j, run, options, emit, assets_dir(j), timing, uses)
         except Exception as exc:
             # replayed, but its comparison failed: not a journey the run never reached
             reason = f"comparison failed: {type(exc).__name__}: {logs.scrub(str(exc))}"
@@ -332,6 +419,8 @@ def run_journeys(
     except BaseException as exc:
         exc.partial_result = result(False)  # type: ignore[attr-defined]
         raise
+    finally:
+        _region_notices(uses, options, emit)
     return result(True)
 
 
