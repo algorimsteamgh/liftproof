@@ -21,6 +21,7 @@ from liftproof.reconcile.baseline import SNAPSHOT_MODES
 from liftproof.reconcile.engine import ReconcileOptions
 from liftproof.reconcile.plan import IgnoreRule
 from liftproof.reconcile.replication import ReplicationConfig
+from liftproof.reconcile.structure import CHECKS, StructureChecks
 from liftproof.schedule import Schedule, parse_schedules
 
 FORBIDDEN_KEYS = re.compile(
@@ -215,9 +216,15 @@ def _options(
             r.get("where"),
             r.get("source_where"),
             r.get("target_where"),
+            r.get("structure"),
         )
         if rule.rows and rule.column:
             raise ConfigError(f"database.ignore.{i}: a rule leaves out a column or rows, not both")
+        if rule.structure is not None and (rule.structure not in CHECKS or rule.rows):
+            raise ConfigError(
+                f"database.ignore.{i}.structure is one of {', '.join(CHECKS)}, accepted for the "
+                "table or, with column, for what holds that column; it takes no row predicate"
+            )
         for key in ("where", "source_where", "target_where"):
             pred = getattr(rule, key)
             if pred is not None and (not str(pred).strip() or UNSAFE_SQL.search(str(pred))):
@@ -239,6 +246,7 @@ def _options(
         ranges=bool(d.get("ranges", True)),
     )
     opts.replication = ReplicationConfig.from_dict(d.get("replication"))
+    opts.structure = _structure(d.get("structure", True))
     breaker = d.get("circuit_breaker") or {}
     opts.breaker_bucket_ratio = float(breaker.get("bucket_ratio", opts.breaker_bucket_ratio))
     opts.breaker_table_ratio = float(breaker.get("table_ratio", opts.breaker_table_ratio))
@@ -265,6 +273,22 @@ def _options(
         if sampling.get("seed") is not None:
             opts.sample_seed = int(sampling["seed"])
     return opts
+
+
+def _structure(v: Any) -> StructureChecks:
+    """database.structure: true (every check, the default), false, or a map of checks."""
+    if isinstance(v, bool):
+        return StructureChecks(**dict.fromkeys(CHECKS, v))
+    if (
+        not isinstance(v, dict)
+        or set(v) - set(CHECKS)
+        or not all(isinstance(x, bool) for x in v.values())
+    ):
+        raise ConfigError(
+            f"database.structure is true, false or a map of {', '.join(CHECKS)} to true or "
+            "false (each true when left out)"
+        )
+    return StructureChecks(**v)
 
 
 def _web(d: Any) -> WebConfig | None:
@@ -510,6 +534,11 @@ database:
   ranges: true                  # lowest/highest integer key and dates per table, in the report
   business_keys: {{}}           # e.g. orders: [order_number] where keys were renumbered
   workers: 1                    # tables hashed at once; each is another source connection
+  # structure:                  # compared before data; false turns all of it off
+  #   nullability: true
+  #   keys: true                # primary and unique keys
+  #   foreign_keys: true        # false where the target's are added after the load
+  #   indexes: true             # false where the target's are built after the load
   # sampling:                    # large tables: compare a random share of the buckets;
   #   above_rows: 500000000      # the report gives the share and marks the rest not checked
   #   percent: 10
@@ -526,6 +555,9 @@ database:
     #   source_where: "tenant = 'test'"
     #   target_where: "tenant = 'qa'"
     #   reason: test tenant renamed in the target
+    # - table: events               # a structural difference accepted (keys, nullability,
+    #   structure: keys             # foreign_keys or indexes; with column, only what holds it)
+    #   reason: partitioned target; its primary key includes created_at
   # replay_watermarks:          # rows a replay creates are left out of later reconciliations,
   #   orders: id                # told apart by a column that only grows; default: a single
   #   events: created_at        # column primary key (journeys name tables: record --writes)

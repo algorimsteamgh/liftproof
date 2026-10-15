@@ -8,7 +8,7 @@ import datetime as dt
 
 import pytest
 
-from liftproof.adapters.base import HashPlan, TableRef
+from liftproof.adapters.base import ForeignKey, HashPlan, Index, TableRef
 from liftproof.adapters.mysql import MySQLAdapter, prepare
 from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import Verbatim, render
@@ -107,6 +107,30 @@ def test_describe_maps_types(loaded):
     schema = a.describe(TableRef(db, "everything"))
     assert schema.primary_key == ["id"]
     assert {c.name: c.canonical for c in schema.columns} == dict(COLUMNS)
+
+
+def test_describe_reads_nullability_keys_and_indexes(make_mysql_db, mysql_adapter_for):
+    db, cur = make_mysql_db()
+    cur.execute("CREATE TABLE parent (id int PRIMARY KEY, code varchar(20), UNIQUE KEY (code, id))")
+    cur.execute(
+        "CREATE TABLE child (b int, a int, c varchar(100) NOT NULL, d text, pid int, "
+        "pcode varchar(20), PRIMARY KEY (a, b), UNIQUE KEY uq_bac (b, a, c), KEY ix_d (d(10)), "
+        "KEY fx ((lower(c)), a), FULLTEXT KEY ft (d), "
+        "CONSTRAINT fk2 FOREIGN KEY (pcode, pid) REFERENCES parent (code, id))"
+    )
+    s = mysql_adapter_for(db).describe(TableRef(db, "child"))
+    assert s.primary_key == ["a", "b"]  # PRIMARY is no index of the list
+    assert [c.name for c in s.columns if not c.nullable] == ["b", "a", "c"]
+    assert sorted(s.indexes, key=lambda i: i.name) == [
+        Index("fk2", ("pcode", "pid"), False),  # made for the foreign key
+        Index("ft", ("d",), False, "other"),
+        Index("fx", (), False, "expression"),
+        Index("ix_d", ("d",), False),  # a prefix index is an index on its column
+        Index("uq_bac", ("b", "a", "c"), True),
+    ]
+    assert s.foreign_keys == [
+        ForeignKey("fk2", ("pcode", "pid"), TableRef(db, "parent"), ("code", "id"))
+    ]
 
 
 def test_mysql_only_values_render_as_mysql_prints_them():

@@ -13,7 +13,9 @@ from liftproof.canonical import CanonicalType
 class IgnoreRule:
     """Excludes a table, a column, or the rows a predicate matches (spec 9.11). A row
     predicate is SQL in each side's own dialect: `where` for both sides, or
-    `source_where` and `target_where` where the engines differ."""
+    `source_where` and `target_where` where the engines differ. A structure rule accepts
+    a known structural difference instead (spec 9.13): one check of the table, or of what
+    holds its column, is not compared; its data still is."""
 
     table: str  # schema.table or table
     reason: str
@@ -21,6 +23,7 @@ class IgnoreRule:
     where: str | None = None
     source_where: str | None = None
     target_where: str | None = None
+    structure: str | None = None  # nullability | keys | foreign_keys | indexes
 
     def matches_table(self, qualified: str) -> bool:
         t = self.table.lower()
@@ -33,7 +36,11 @@ class IgnoreRule:
 
     @property
     def whole_table(self) -> bool:
-        return self.column is None and not self.rows
+        return self.column is None and not self.rows and not self.structure
+
+    @property
+    def excludes_column(self) -> bool:
+        return bool(self.column) and not self.structure
 
     def predicate(self, side: str) -> str | None:
         return (self.source_where if side == "source" else self.target_where) or self.where
@@ -115,7 +122,7 @@ def plan_table(
     ignored = {
         r.column.lower(): r.reason
         for r in ignore
-        if r.column and r.matches_table(source.table.qualified)
+        if r.excludes_column and r.matches_table(source.table.qualified)
     }
     rows_filter = row_filter(ignore, source.table.qualified, side)  # the reference's rows
     issues: list[ColumnIssue] = []

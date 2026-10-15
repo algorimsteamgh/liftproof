@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from liftproof.adapters.base import HashPlan, TableRef
+from liftproof.adapters.base import ForeignKey, HashPlan, Index, TableRef
 from liftproof.adapters.sqlserver import (
     SQLServerAdapter,
     _pushable_sql,
@@ -197,6 +197,36 @@ def test_describe_maps_types(loaded):
     assert natives["num"] == "decimal(12,4)" and natives["label"] == "varchar(max)"
     assert natives["nlabel"] == "nvarchar(50)" and natives["naive"] == "datetime2(7)"
     assert natives["code"] == "char(6)" and natives["ncode"] == "nchar(4)"
+
+
+def test_describe_reads_nullability_keys_and_indexes(make_sqlserver_db, sqlserver_adapter_for):
+    db, cur = make_sqlserver_db()
+    cur.execute("CREATE TABLE dbo.parent (id int PRIMARY KEY, code varchar(20), "
+                "CONSTRAINT parent_uq UNIQUE (code, id))")  # fmt: skip
+    cur.execute(
+        "CREATE TABLE dbo.child (amount decimal(9,2), code nvarchar(20), c varchar(100) NOT NULL, "
+        "d varchar(100), e int, pid int, pcode varchar(20), "
+        "CONSTRAINT child_pk PRIMARY KEY (code, amount), CONSTRAINT child_uq UNIQUE (c), "
+        "CONSTRAINT fk2 FOREIGN KEY (pcode, pid) REFERENCES dbo.parent (code, id))"
+    )
+    for ddl in ("CREATE INDEX ix_c ON dbo.child (c, e) INCLUDE (d)",
+                "CREATE UNIQUE INDEX ux_d ON dbo.child (d) WHERE d IS NOT NULL",
+                "CREATE NONCLUSTERED COLUMNSTORE INDEX ncc ON dbo.child (e, pid)",
+                "CREATE INDEX ix_off ON dbo.child (e)",
+                "ALTER INDEX ix_off ON dbo.child DISABLE"):  # fmt: skip
+        cur.execute(ddl)
+    s = sqlserver_adapter_for(db).describe(TableRef("dbo", "child"))
+    assert s.primary_key == ["code", "amount"]  # key order
+    assert [c.name for c in s.columns if not c.nullable] == ["amount", "code", "c"]
+    assert sorted(s.indexes, key=lambda i: i.name) == [
+        Index("child_uq", ("c",), True),
+        Index("ix_c", ("c", "e"), False),  # included columns are not keys
+        Index("ncc", ("e", "pid"), False, "other"),
+        Index("ux_d", ("d",), True, "partial"),  # filtered
+    ]  # not a disabled one
+    assert s.foreign_keys == [
+        ForeignKey("fk2", ("pcode", "pid"), TableRef("dbo", "parent"), ("code", "id"))
+    ]
 
 
 def test_type_rules():

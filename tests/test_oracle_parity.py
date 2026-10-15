@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from liftproof.adapters.base import HashPlan, TableRef
+from liftproof.adapters.base import ForeignKey, HashPlan, Index, TableRef
 from liftproof.adapters.oracle import OracleAdapter, _pushable_sql, canonical_type
 from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import render
@@ -308,6 +308,41 @@ def test_describe_maps_types(loaded):
     natives = {c.name: c.native_type for c in s.columns}
     assert natives["NUM"] == "NUMBER(12,4)" and natives["ID"] == "NUMBER(19)"
     assert natives["ANYNUM"] == "NUMBER" and natives["CODE"] == "CHAR(6)"
+
+
+def test_describe_reads_nullability_keys_and_indexes(make_oracle_db, oracle_adapter_for):
+    schema, cur = make_oracle_db()
+    cur.execute("CREATE TABLE parent (id NUMBER(10) PRIMARY KEY, code VARCHAR2(20), "
+                "CONSTRAINT parent_uq UNIQUE (code, id))")  # fmt: skip
+    cur.execute(
+        "CREATE TABLE child (b NUMBER(10), a NUMBER(10), c VARCHAR2(100) NOT NULL, "
+        "d VARCHAR2(100), pid NUMBER(10), pcode VARCHAR2(20), "
+        "CONSTRAINT child_pk PRIMARY KEY (a, b), CONSTRAINT child_uq UNIQUE (b, a, c), "
+        "CONSTRAINT child_du UNIQUE (d) DEFERRABLE INITIALLY DEFERRED, "
+        "CONSTRAINT fk2 FOREIGN KEY (pcode, pid) REFERENCES parent (code, id))"
+    )
+    for ddl in ("CREATE INDEX ix_desc ON child (a DESC, c)",
+                "CREATE INDEX ix_fn ON child (lower(c))",
+                "CREATE BITMAP INDEX ix_bm ON child (pcode)",
+                "CREATE INDEX ix_rev ON child (pid) REVERSE",
+                "CREATE INDEX ix_gone ON child (pid, c)",
+                "ALTER INDEX ix_gone UNUSABLE"):  # fmt: skip
+        cur.execute(ddl)
+    s = oracle_adapter_for().describe(TableRef(schema, "CHILD"))
+    assert s.primary_key == ["A", "B"]
+    assert [c.name for c in s.columns if not c.nullable] == ["B", "A", "C"]
+    assert sorted(s.indexes, key=lambda i: i.name) == [
+        Index("CHILD_DU", ("D",), False),  # its index; the constraint below is the key
+        Index("CHILD_DU", ("D",), True),
+        Index("CHILD_UQ", ("B", "A", "C"), True),
+        Index("IX_BM", ("PCODE",), False, "other"),
+        Index("IX_DESC", ("A", "C"), False),  # a descending column is still a column
+        Index("IX_FN", (), False, "expression"),
+        Index("IX_REV", ("PID",), False),
+    ]  # not the primary key's own index, nor an unusable one
+    assert s.foreign_keys == [
+        ForeignKey("FK2", ("PCODE", "PID"), TableRef(schema, "PARENT"), ("CODE", "ID"))
+    ]
 
 
 def test_canonical_type_rules():

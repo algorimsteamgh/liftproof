@@ -30,12 +30,15 @@ from liftproof.adapters.base import (
     BucketAggregate,
     Column,
     FloatStats,
+    ForeignKey,
     HashPlan,
+    Index,
     Pacer,
     TableRef,
     TableSchema,
     all_of,
     in_list,
+    plain_prefix,
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, Verbatim, column_digest
 from liftproof.canonical import value64 as _value64
@@ -465,29 +468,54 @@ class MySQLAdapter(Adapter):
 
     def describe(self, table: TableRef) -> TableSchema:
         rows = self._query(
-            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.COLUMNS "
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE "
+            "FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION",
             (table.schema, table.name),
         )
         if not rows:
             raise ConfigError(f"table {table} not found")
         cols = []
-        for name, data_type, column_type in rows:
+        for name, data_type, column_type, nullable in rows:
             native = str(column_type).lower()
             ctype = TYPE_MAP.get(str(data_type).lower(), CanonicalType.UNSUPPORTED)
             if native.startswith("tinyint(1)"):
                 ctype = CanonicalType.BOOLEAN  # MySQL's BOOLEAN is TINYINT(1)
-            cols.append(Column(name, native, ctype, fixed_width=data_type == "char"))
-        pk = [
-            r[0]
-            for r in self._query(
-                "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
-                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND CONSTRAINT_NAME = 'PRIMARY' "
-                "ORDER BY ORDINAL_POSITION",
-                (table.schema, table.name),
-            )
-        ]
-        return TableSchema(table, cols, pk)
+            cols.append(Column(name, native, ctype, fixed_width=data_type == "char",
+                               nullable=nullable == "YES"))  # fmt: skip
+        # each index's key parts in order; an expression (functional key part) has no
+        # column name, and a prefix length is ignored
+        found: dict[str, tuple[bool, str, list[str | None]]] = {}
+        for name, non_unique, kind, column in self._query(
+            "SELECT INDEX_NAME, NON_UNIQUE, INDEX_TYPE, COLUMN_NAME "
+            "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+            "ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+            (table.schema, table.name),
+        ):
+            found.setdefault(name, (not int(non_unique), str(kind).upper(), []))[2].append(column)
+        pk: list[str] = []
+        indexes = []
+        for name, (unique, kind, keys) in found.items():
+            if name == "PRIMARY":
+                pk = [str(k) for k in keys]
+            else:
+                shape = "expression" if None in keys else "btree" if kind == "BTREE" else "other"
+                indexes.append(Index(name, plain_prefix(keys), unique, shape))
+        fks: dict[str, list[tuple[str, str, str, str]]] = {}
+        for name, column, schema, ref, ref_column in self._query(
+            "SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, "
+            "REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND REFERENCED_TABLE_NAME IS NOT NULL "
+            "ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+            (table.schema, table.name),
+        ):
+            fks.setdefault(name, []).append((column, schema, ref, ref_column))
+        foreign_keys = [
+            ForeignKey(n, tuple(p[0] for p in ps), TableRef(ps[0][1], ps[0][2]),
+                       tuple(p[3] for p in ps))
+            for n, ps in fks.items()
+        ]  # fmt: skip
+        return TableSchema(table, cols, pk, indexes, foreign_keys)
 
     def _ident(self, table: TableRef) -> str:
         return f"{quote(table.schema)}.{quote(table.name)}"

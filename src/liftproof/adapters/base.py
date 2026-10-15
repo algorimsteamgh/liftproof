@@ -10,6 +10,7 @@ import abc
 import contextlib
 import datetime as dt
 import decimal
+import itertools
 import math
 import re
 import time
@@ -40,13 +41,45 @@ class Column:
     native_type: str
     canonical: CanonicalType
     fixed_width: bool = False
+    nullable: bool | None = None  # None: not known (a baseline from before it was recorded)
+
+
+@dataclass(frozen=True)
+class Index:
+    """An index or unique constraint other than the primary key's own (spec 9.13)."""
+
+    name: str
+    # key columns in key order, as the engine spells them; included columns left out. An
+    # expression index keeps the plain columns before its first expression.
+    columns: tuple[str, ...]
+    unique: bool
+    # btree: a B-tree over plain columns; partial: one with a condition (SQL Server:
+    # filtered); expression: one over expressions; other: GIN, BRIN, hash, full text,
+    # spatial, bitmap, columnstore, XML. Only B-trees compare across engines.
+    kind: str = "btree"
+
+
+def plain_prefix(keys: Iterable[str | None]) -> tuple[str, ...]:
+    """An index's key columns up to its first expression (None)."""
+    return tuple(itertools.takewhile(lambda k: k is not None, keys))
+
+
+@dataclass(frozen=True)
+class ForeignKey:
+    name: str
+    columns: tuple[str, ...]
+    references: TableRef
+    referenced_columns: tuple[str, ...]  # paired with columns, in order
 
 
 @dataclass
 class TableSchema:
     table: TableRef
     columns: list[Column]
-    primary_key: list[str] = field(default_factory=list)
+    primary_key: list[str] = field(default_factory=list)  # in key order
+    # None: not known (a baseline from before they were recorded)
+    indexes: list[Index] | None = None
+    foreign_keys: list[ForeignKey] | None = None
 
     def column(self, name: str) -> Column | None:
         for c in self.columns:

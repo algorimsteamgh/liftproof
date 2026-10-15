@@ -119,6 +119,47 @@ each database the run read, as its connections apply them (`source_protection`: 
 lock timeout rounded up to whole seconds, Oracle's not applicable; no `source` entry when
 the source was not read).
 
+## Schema comparison
+
+Before the data, each table's structure is compared: columns and their types, then
+nullability, keys, foreign keys and indexes. Keys and indexes are matched by their
+columns, names compared without case, never by their own names, which each engine and
+tool makes up its own way.
+
+| Found on the target | Reported |
+|---|---|
+| a NOT NULL, primary key, unique key or foreign key of the reference no longer enforced | medium: the run fails |
+| a unique key enforced only by a partial (SQL Server: filtered) unique index | low |
+| a NOT NULL, unique key or foreign key the reference does not have | low |
+| no B-tree index or primary key starting with the columns of a reference index | low |
+| an index only the target has; a primary key moved while the old key stays unique | notice |
+
+A key is compared as the uniqueness it guarantees: a target that moved its primary key to
+a surrogate column and kept the old key unique still enforces it; a partitioned target
+whose key now includes the partition column does not. A foreign key matches on its
+column pairs and the table it refers to, its schema mapped by `schema_map`. Partial and
+expression indexes and other kinds (GIN, BRIN, hash, full text, spatial, bitmap,
+columnstore, XML) are listed in the report's exclusions, not compared. A table whose
+structure differs is marked so in the report's tables; its status is its data's.
+
+An AWS DMS full load creates tables without secondary indexes or foreign keys. Turn off
+what is built after the load, for the whole project, or accept one difference with a
+reason the report prints next to the coverage figures:
+
+```yaml
+database:
+  structure:                 # true (the default) or false turns every check on or off
+    indexes: false           # nullability, keys, foreign_keys, indexes
+  ignore:
+    - table: events
+      structure: keys        # with column: only what holds that column
+      reason: partitioned target; its primary key includes created_at
+```
+
+A baseline records each table's structure. One taken by an earlier build has none, so
+only primary keys are compared against it, and the report's range block (`structure`)
+names those tables.
+
 ## Record and replay
 
 ```bash

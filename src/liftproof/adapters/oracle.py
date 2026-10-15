@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import decimal
+import re
 import ssl
 from collections.abc import Iterator, Sequence
 from typing import Any
@@ -42,13 +43,16 @@ from liftproof.adapters.base import (
     BucketAggregate,
     Column,
     FloatStats,
+    ForeignKey,
     HashPlan,
+    Index,
     Pacer,
     TableRef,
     TableSchema,
     all_of,
     fetch_batch,
     in_list,
+    plain_prefix,
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest
 from liftproof.canonical import value64 as _value64
@@ -471,7 +475,7 @@ class OracleAdapter(Adapter):
     def describe(self, table: TableRef) -> TableSchema:
         rows = self._query(
             "SELECT COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, "
-            "DATA_SCALE FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME = :2 "
+            "DATA_SCALE, NULLABLE FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME = :2 "
             "ORDER BY COLUMN_ID",
             [table.schema, table.name],
         )
@@ -479,7 +483,7 @@ class OracleAdapter(Adapter):
             raise ConfigError(f"table {table} not found")
         cols = []
         natives = {}
-        for name, data_type, char_len, data_len, precision, scale in rows:
+        for name, data_type, char_len, data_len, precision, scale, nullable in rows:
             precision = int(precision) if precision is not None else None
             scale = int(scale) if scale is not None else None
             length = int(char_len or 0) or int(data_len or 0) or None
@@ -491,20 +495,93 @@ class OracleAdapter(Adapter):
                     native_name(data_type, length, precision, scale),
                     canonical_type(data_type, precision, scale),
                     fixed_width=data_type.upper() in ("CHAR", "NCHAR"),
+                    nullable=nullable != "N",
                 )
             )
         self._natives[table] = natives
-        pk = [
-            r[0]
-            for r in self._query(
-                "SELECT cc.COLUMN_NAME FROM ALL_CONSTRAINTS c JOIN ALL_CONS_COLUMNS cc "
-                "ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME "
-                "WHERE c.OWNER = :1 AND c.TABLE_NAME = :2 AND c.CONSTRAINT_TYPE = 'P' "
-                "ORDER BY cc.POSITION",
-                [table.schema, table.name],
-            )
+        # the primary key, enabled unique keys and enabled foreign keys, each foreign key
+        # with the key it refers to
+        pk: list[str] = []
+        uniques: dict[str, list[str]] = {}
+        refs: dict[str, tuple[tuple[str, str], list[str]]] = {}
+        for name, kind, column, owner, key in self._query(
+            "SELECT c.CONSTRAINT_NAME, c.CONSTRAINT_TYPE, cc.COLUMN_NAME, c.R_OWNER, "
+            "c.R_CONSTRAINT_NAME FROM ALL_CONSTRAINTS c JOIN ALL_CONS_COLUMNS cc "
+            "ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME "
+            "WHERE c.OWNER = :1 AND c.TABLE_NAME = :2 AND (c.CONSTRAINT_TYPE = 'P' "
+            "OR c.CONSTRAINT_TYPE IN ('U', 'R') AND c.STATUS = 'ENABLED') "
+            "ORDER BY c.CONSTRAINT_NAME, cc.POSITION",
+            [table.schema, table.name],
+        ):
+            if kind == "P":
+                pk.append(column)
+            elif kind == "U":
+                uniques.setdefault(name, []).append(column)
+            else:
+                refs.setdefault(name, ((owner, key), []))[1].append(column)
+        # the primary key's own index is the primary key
+        indexes = [i for i in self._indexes(table) if not (i.unique and list(i.columns) == pk)]
+        for name, columns in uniques.items():
+            # a deferrable unique key is enforced through an index that is not unique
+            if not any(i.unique and list(i.columns) == columns for i in indexes):
+                indexes.append(Index(name, tuple(columns), True))
+        keys = self._referenced(sorted({k for k, _ in refs.values()}))
+        fks = [
+            ForeignKey(n, tuple(cs), keys[k][0], tuple(keys[k][1]))
+            for n, (k, cs) in refs.items()
+            if k in keys
         ]
-        return TableSchema(table, cols, pk)
+        return TableSchema(table, cols, pk, indexes, fks)
+
+    def _referenced(
+        self, keys: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], tuple[TableRef, list[str]]]:
+        """The table and columns, in position order, of each (owner, constraint) key that
+        foreign keys refer to. Read on their own: joined into the constraints query, the
+        dictionary views took 60 ms a table rather than 3 (Oracle 23 Free)."""
+        if not keys:
+            return {}
+        where = " OR ".join(
+            f"(OWNER = :{2 * i + 1} AND CONSTRAINT_NAME = :{2 * i + 2})" for i in range(len(keys))
+        )
+        out: dict[tuple[str, str], tuple[TableRef, list[str]]] = {}
+        for owner, name, ref, column in self._query(
+            "SELECT OWNER, CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME FROM ALL_CONS_COLUMNS "
+            f"WHERE {where} ORDER BY POSITION",
+            [x for k in keys for x in k],
+        ):
+            out.setdefault((owner, name), (TableRef(owner, ref), []))[1].append(column)
+        return out
+
+    def _indexes(self, table: TableRef) -> list[Index]:
+        """The usable indexes. A descending column is stored as an expression naming it
+        ("A"), so such an index is still a B-tree over its columns."""
+        found: dict[str, tuple[bool, str, list[str | None]]] = {}
+        for name, uniqueness, itype, column, expression in self._query(
+            "SELECT i.INDEX_NAME, i.UNIQUENESS, i.INDEX_TYPE, ic.COLUMN_NAME, "
+            "ie.COLUMN_EXPRESSION FROM ALL_INDEXES i JOIN ALL_IND_COLUMNS ic "
+            "ON ic.INDEX_OWNER = i.OWNER AND ic.INDEX_NAME = i.INDEX_NAME "
+            "LEFT JOIN ALL_IND_EXPRESSIONS ie ON ie.INDEX_OWNER = ic.INDEX_OWNER "
+            "AND ie.INDEX_NAME = ic.INDEX_NAME AND ie.COLUMN_POSITION = ic.COLUMN_POSITION "
+            "WHERE i.TABLE_OWNER = :1 AND i.TABLE_NAME = :2 AND i.INDEX_TYPE <> 'LOB' "
+            "AND i.STATUS <> 'UNUSABLE' ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION",
+            [table.schema, table.name],
+        ):
+            if expression is not None:
+                named = re.fullmatch(r'"([^"]+)"', str(expression).strip())
+                column = named.group(1) if named else None
+            entry = found.setdefault(name, (uniqueness == "UNIQUE", str(itype), []))
+            entry[2].append(column)
+        indexes = []
+        for name, (unique, itype, keys) in found.items():
+            base = itype.removeprefix("FUNCTION-BASED ")
+            kind = (
+                "other" if base not in ("NORMAL", "NORMAL/REV", "IOT - TOP")
+                else "expression" if None in keys
+                else "btree"
+            )  # fmt: skip
+            indexes.append(Index(name, plain_prefix(keys), unique, kind))
+        return indexes
 
     def _native(self, table: TableRef) -> dict[str, str]:
         if table not in self._natives:

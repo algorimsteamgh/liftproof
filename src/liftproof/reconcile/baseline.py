@@ -32,7 +32,9 @@ from liftproof.adapters.base import (
     Adapter,
     BucketAggregate,
     Column,
+    ForeignKey,
     HashPlan,
+    Index,
     TableRef,
     TableSchema,
 )
@@ -110,6 +112,26 @@ class BaselineTable:
         }
         if self.snapshot:
             d.update(read_at=self.read_at, snapshot=self.snapshot)
+        # structure (spec 9.13), each part only when known: an entry from an older manifest,
+        # saved again by a resume, must not claim every column nullable
+        schema = self.schema
+        if all(c.nullable is not None for c in schema.columns):
+            d["not_null"] = [c.name for c in schema.columns if not c.nullable]
+        if schema.indexes is not None:
+            d["indexes"] = [
+                {"name": i.name, "columns": list(i.columns), "unique": i.unique, "kind": i.kind}
+                for i in schema.indexes
+            ]
+        if schema.foreign_keys is not None:
+            d["foreign_keys"] = [
+                {
+                    "name": f.name,
+                    "columns": list(f.columns),
+                    "references": [f.references.schema, f.references.name],
+                    "referenced_columns": list(f.referenced_columns),
+                }
+                for f in schema.foreign_keys
+            ]
         return d
 
     @classmethod
@@ -118,6 +140,7 @@ class BaselineTable:
         revision = int(d.get("canonical_revision", 0))
         unhashed = {c: (i, why) for c, (i, why) in d.get("unhashed", {}).items()}
         columns = []
+        not_null = set(d["not_null"]) if "not_null" in d else None
         for n, nt, ct, fw in d["columns"]:
             ctype = CanonicalType(ct)
             if revision < 2 and ctype is CanonicalType.UNSUPPORTED and nt.lower() in XML_NATIVE:
@@ -125,8 +148,22 @@ class BaselineTable:
                 # apart; it was never hashed, so it is not compared until taken again
                 ctype = CanonicalType.XML
                 unhashed[n.lower()] = (NOT_IN_BASELINE, REASON_XML)
-            columns.append(Column(n, nt, ctype, fw))
-        schema = TableSchema(ref, columns, list(d["primary_key"]))
+            nullable = None if not_null is None else n not in not_null
+            columns.append(Column(n, nt, ctype, fw, nullable))
+        indexes = None
+        if "indexes" in d:
+            indexes = [
+                Index(i["name"], tuple(i["columns"]), bool(i["unique"]), i["kind"])
+                for i in d["indexes"]
+            ]
+        fks = None
+        if "foreign_keys" in d:
+            fks = [
+                ForeignKey(f["name"], tuple(f["columns"]), TableRef(*f["references"]),
+                           tuple(f["referenced_columns"]))
+                for f in d["foreign_keys"]
+            ]  # fmt: skip
+        schema = TableSchema(ref, columns, list(d["primary_key"]), indexes, fks)
         p = d["plan"]
         plan = HashPlan(
             ref,

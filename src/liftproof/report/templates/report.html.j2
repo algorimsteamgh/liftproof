@@ -91,8 +91,8 @@
   </table>{% endif %}
   {% if r.coverage.exclusions %}
   <p><strong>Exclusions and their reasons</strong></p>
-  <table><tr><th>Object</th><th>Column</th><th>Reason</th></tr>
-  {% for e in r.coverage.exclusions %}<tr><td>{{ e.object }}</td><td>{{ e.column or "whole table" }}</td><td>{{ e.reason }}</td></tr>{% endfor %}
+  <table><tr><th>Object</th><th>Excluded</th><th>Reason</th></tr>
+  {% for e in r.coverage.exclusions %}<tr><td>{{ e.object }}</td><td>{% if e.index %}index {{ e.index }}{% elif e.structure %}{{ e.structure|replace("_"," ") }}{% if e.column %} of column {{ e.column }}{% endif %}{% else %}{{ e.column or "whole table" }}{% endif %}</td><td>{{ e.reason }}</td></tr>{% endfor %}
   </table>{% endif %}
 
   <h2>Differences</h2>
@@ -117,7 +117,7 @@
   <div class="scroll"><table>
     <tr><th>Table</th><th>Status</th><th class="num">Source rows</th><th class="num">Target rows</th><th class="num">Missing</th><th class="num">Only in target</th><th class="num">Changed</th><th>Key</th></tr>
     {% for t in r.tables %}
-    <tr><td><code>{{ t.table }}</code>{% if t.partial %} <span class="sub">(partial)</span>{% endif %}{% if t.sampled_percent is not none %} <span class="sub">(sampled, {{ t.sampled_percent }}% of rows)</span>{% endif %}</td>
+    <tr><td><code>{{ t.table }}</code>{% if t.partial %} <span class="sub">(partial)</span>{% endif %}{% if t.sampled_percent is not none %} <span class="sub">(sampled, {{ t.sampled_percent }}% of rows)</span>{% endif %}{% if t.structure_differences %} <span class="sub">(structure differs)</span>{% endif %}</td>
       <td class="status-{{ t.status }}">{{ t.status|replace("_"," ") }}</td>
       <td class="num">{{ t.source_rows|num }}</td><td class="num">{{ t.target_rows|num }}</td>
       <td class="num">{{ t.missing_rows|num }}</td><td class="num">{{ t.extra_rows|num }}</td>

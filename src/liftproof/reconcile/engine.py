@@ -40,6 +40,7 @@ from liftproof.reconcile.plan import (
     row_filter,
 )
 from liftproof.reconcile.replication import REASON_BEHIND, ReplicationConfig, check
+from liftproof.reconcile.structure import StructureChecks, compare_structure
 
 DB = Comparator.DATABASE
 INFINITY = {"infinity", "-infinity"}
@@ -79,6 +80,8 @@ class ReconcileOptions:
     replay_watermarks: dict[str, str] = field(default_factory=dict)
     # the range block's data ranges (one MIN/MAX statement per table and side)
     ranges: bool = True
+    # nullability, keys, foreign keys and indexes compared before data (spec 9.13)
+    structure: StructureChecks = field(default_factory=StructureChecks)
 
 
 @dataclass
@@ -102,6 +105,8 @@ class TableResult:
     sampled_percent: float | None = None
     # column -> {"role": key|date, "source": [lowest, highest], "target": [...]}
     ranges: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # structural differences found (spec 9.13); the status stays the data's
+    structure_differences: int = 0
 
 
 @dataclass
@@ -113,6 +118,8 @@ class ReconcileResult:
     # each database's cap, pause and timeouts as the run read it; no source when it was
     # not read (spec 9.15)
     protection: dict[str, Any] | None = None
+    # the structure checks the run made, and the tables a baseline recorded no structure of
+    structure: dict[str, Any] | None = None
 
     def status_counts(self) -> Counter:
         return Counter(t.status for t in self.tables)
@@ -245,6 +252,7 @@ class Reconciler:
         target_tables = {t.qualified.lower(): t for t in self.target.list_tables(target_schemas)}
         source_tables = self._selected(source_tables)
         self.planned = [t.qualified for t in source_tables]
+        self.result.structure = self._structure_checks()
         finished = {t.table for t in self.result.tables}
         remaining = [t for t in source_tables if t.qualified not in finished]
         # Resumed against a live source, the remaining tables are read as of now, so
@@ -293,6 +301,19 @@ class Reconciler:
             self._write_table(res, found)
         self.result.tables.sort(key=lambda r: order.get(r.table, len(order)))
         return self.result
+
+    def _structure_checks(self) -> dict[str, Any]:
+        """For the range block: the checks made, and which tables were compared on their
+        primary key alone because the baseline recorded nothing more."""
+        out: dict[str, Any] = self.o.structure.as_dict()
+        entries = self.baseline.tables if self.baseline is not None else {}
+        bare = [q for q in self.planned if q in entries and entries[q].schema.indexes is None]
+        if bare:
+            out["unrecorded"] = (
+                f"baseline {self.baseline.baseline_id} was taken before nullability, keys and "
+                f"indexes were recorded; only primary keys are compared for {', '.join(bare)}"
+            )
+        return out
 
     def _count(self, res: TableResult) -> None:
         """Circuit breaker across tables: most tables differing means a systemic cause."""
@@ -508,6 +529,7 @@ class Reconciler:
                 column=col,
                 detail={"reason": reason},
             )
+        res.structure_differences = self._structure(q, sschema, tschema)
         if tp.partial:
             res.partial = True
             self.emit(
@@ -721,6 +743,33 @@ class Reconciler:
                 detail={"issue": NOT_CANONICALISABLE},
             )
         return res
+
+    def _structure(self, q: str, sschema: TableSchema, tschema: TableSchema) -> int:
+        """Nullability, keys, foreign keys and indexes (spec 9.13), each structure rule
+        named with its reason; the number of differences found."""
+        rules = [r for r in self.o.ignore if r.matches_table(q)]
+        for r in rules:
+            if r.structure:
+                self.emit(
+                    Kind.NOTICE,
+                    Severity.INFO,
+                    q,
+                    f"{r.structure.replace('_', ' ')} not compared: {r.reason}",
+                    column=r.column,
+                    detail={"reason": r.reason, "structure": r.structure},
+                )
+        found = compare_structure(
+            sschema,
+            tschema,
+            self.o.structure,
+            rules=rules,
+            reference_name=self.reference,
+            schema_map={} if self.against_target else self.o.schema_map,
+        )
+        for i in found:
+            self.emit(i.kind, i.severity, q, i.summary, column=i.column, expected=i.expected,
+                      actual=i.actual, detail={"issue": i.issue, **i.detail})  # fmt: skip
+        return sum(i.kind == Kind.DIFFERENCE for i in found)
 
     def _sample(self, q: str, plan: HashPlan, rows: int) -> HashPlan:
         """The random buckets a large table is compared on, the same for a given seed."""

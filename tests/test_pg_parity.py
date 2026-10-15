@@ -8,7 +8,7 @@ from decimal import Decimal
 
 import pytest
 
-from liftproof.adapters.base import HashPlan, TableRef
+from liftproof.adapters.base import ForeignKey, HashPlan, Index, TableRef
 from liftproof.adapters.postgres import PostgresAdapter
 from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import RenderError, Verbatim
@@ -80,6 +80,42 @@ def test_describe_maps_types(make_db, adapter_for):
     assert schema.primary_key == ["id"]
     got = {c.name: c.canonical for c in schema.columns}
     assert got == dict(COLUMNS)
+
+
+def test_describe_reads_nullability_keys_and_indexes(make_db, adapter_for):
+    db, conn = make_db()
+    conn.execute("""
+    CREATE TABLE parent (id int PRIMARY KEY, code text, UNIQUE (code, id));
+    CREATE TABLE period (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+    CREATE TABLE period_2026 PARTITION OF period FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+    CREATE TABLE child (b int, a int, c text NOT NULL, h text, tags int[], at date, pid int,
+      pcode text, PRIMARY KEY (a, b), UNIQUE (b, a, c),
+      FOREIGN KEY (pcode, pid) REFERENCES parent (code, id),
+      FOREIGN KEY (pid, at) REFERENCES period);
+    CREATE INDEX ix_c ON child (c DESC) INCLUDE (h);
+    CREATE INDEX ix_expr ON child (lower(c), a);
+    CREATE INDEX ix_part ON child (a) WHERE a > 0;
+    CREATE INDEX ix_gin ON child USING gin (tags);
+    CREATE INDEX ix_brin ON child USING brin (at);
+    """)
+    s = adapter_for(db).describe(TableRef("public", "child"))
+    assert s.primary_key == ["a", "b"]  # in key order
+    assert [c.name for c in s.columns if not c.nullable] == ["b", "a", "c"]
+    assert s.indexes == [
+        Index("child_b_a_c_key", ("b", "a", "c"), True),
+        Index("ix_brin", ("at",), False, "other"),
+        Index("ix_c", ("c",), False),  # INCLUDE columns are not keys
+        Index("ix_expr", (), False, "expression"),
+        Index("ix_gin", ("tags",), False, "other"),
+        Index("ix_part", ("a",), False, "partial"),
+    ]
+    # one foreign key to the partitioned table, not one more per partition
+    assert s.foreign_keys == [
+        ForeignKey("child_pcode_pid_fkey", ("pcode", "pid"), TableRef("public", "parent"),
+                   ("code", "id")),
+        ForeignKey("child_pid_at_fkey", ("pid", "at"), TableRef("public", "period"),
+                   ("id", "at")),
+    ]  # fmt: skip
 
 
 def test_infinity_is_not_null(make_db, adapter_for):

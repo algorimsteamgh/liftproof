@@ -152,3 +152,33 @@ def test_postgres_infinity_is_a_changed_value(tmp_path, pg_and_mysql, direction)
         ("id = 5", "updated"): ("-infinity", "NULL"),
         ("id = 6", "placed"): ("infinity", "9999-12-31"),
     }
+
+
+
+def test_foreign_keys_and_their_indexes_across_engines(
+    tmp_path, make_db, adapter_for, make_mysql_db, mysql_adapter_for
+):
+    """MySQL indexes every foreign key itself: a notice when it is the target, and an
+    index missing on a PostgreSQL target, where a foreign key has none of its own."""
+    pdb, pc = make_db("fk")
+    pc.execute("CREATE TABLE customers (id int PRIMARY KEY, email varchar(40) NOT NULL UNIQUE);"
+               "CREATE TABLE orders (id int PRIMARY KEY, "
+               "customer_id int NOT NULL REFERENCES customers (id))")  # fmt: skip
+    mdb, mc = make_mysql_db("fk")
+    mc.execute("CREATE TABLE customers (id int PRIMARY KEY, email varchar(40) NOT NULL UNIQUE)")
+    mc.execute("CREATE TABLE orders (id int PRIMARY KEY, customer_id int NOT NULL, "
+               "FOREIGN KEY (customer_id) REFERENCES customers (id))")  # fmt: skip
+    pg, my = adapter_for(pdb), mysql_adapter_for(mdb)
+
+    def structure(findings):
+        return [(f.object.split(".")[1], f.kind, f.detail["issue"]) for f in findings
+                if f.detail.get("issue") and f.kind in (Kind.DIFFERENCE, Kind.NOTICE)]  # fmt: skip
+
+    _, findings = _run(tmp_path / "a", pg, my, ["public"], {"public": mdb})
+    assert structure(findings) == [("orders", Kind.NOTICE, "index_added_in_target")]
+    _, findings = _run(tmp_path / "b", my, pg, [mdb], {mdb: "public"})
+    assert structure(findings) == [("orders", Kind.DIFFERENCE, "index_missing_in_target")]
+    mc.execute("ALTER TABLE orders DROP FOREIGN KEY orders_ibfk_1")  # its index stays
+    _, findings = _run(tmp_path / "c", pg, my, ["public"], {"public": mdb})
+    assert structure(findings) == [("orders", Kind.DIFFERENCE, "foreign_key_missing_in_target"),
+                                   ("orders", Kind.NOTICE, "index_added_in_target")]  # fmt: skip

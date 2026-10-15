@@ -140,10 +140,12 @@ def project_summary(project: Project) -> dict[str, Any]:
                     "where": r.where,
                     "source_where": r.source_where,
                     "target_where": r.target_where,
+                    "structure": r.structure,
                     "reason": r.reason,
                 }
                 for r in o.ignore
             ],
+            "structure": o.structure.as_dict(),
             "business_keys": o.business_keys,
             "show_values": o.show_values,
         },

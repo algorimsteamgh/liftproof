@@ -336,6 +336,7 @@ def _save_results(run_dir: Path, result: ReconcileResult) -> None:
                 "systemic": result.systemic,
                 "replication": result.replication,
                 "sample_seed": result.sample_seed,
+                "structure": result.structure,
                 "tables": [t.__dict__ for t in result.tables],
             },
             indent=2,
@@ -354,6 +355,7 @@ def _load_results(run_dir: Path) -> ReconcileResult:
         d["systemic"],
         d.get("replication"),
         d.get("sample_seed"),
+        structure=d.get("structure"),
     )
 
 
@@ -1094,6 +1096,8 @@ def _report(
                 # lowest and highest key and dates of the rows compared, per side
                 "data_ranges": {t.table: t.ranges for t in result.tables if t.ranges},
                 "replication": result.replication,
+                # the structure compared before data (spec 9.13)
+                "structure": result.structure,
                 "sampling": None
                 if result.sample_seed is None
                 else {

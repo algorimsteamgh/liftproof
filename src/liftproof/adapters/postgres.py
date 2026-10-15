@@ -30,11 +30,14 @@ from liftproof.adapters.base import (
     BucketAggregate,
     Column,
     FloatStats,
+    ForeignKey,
     HashPlan,
+    Index,
     Pacer,
     TableRef,
     TableSchema,
     fetch_batch,
+    plain_prefix,
 )
 from liftproof.canonical import (
     GROUP_SIZE,
@@ -397,25 +400,65 @@ class PostgresAdapter(Adapter):
     def describe(self, table: TableRef) -> TableSchema:
         with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT column_name, data_type, udt_name FROM information_schema.columns "
+                "SELECT column_name, data_type, udt_name, is_nullable "
+                "FROM information_schema.columns "
                 "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
                 (table.schema, table.name),
             )
             cols = []
-            for name, data_type, udt in cur.fetchall():
+            for name, data_type, udt, nullable in cur.fetchall():
                 native = udt if data_type == "USER-DEFINED" else data_type
                 ctype = TYPE_MAP.get(native, CanonicalType.UNSUPPORTED)
-                cols.append(Column(name, native, ctype, fixed_width=native == "character"))
+                cols.append(Column(name, native, ctype, fixed_width=native == "character",
+                                   nullable=nullable == "YES"))  # fmt: skip
             if not cols:
                 raise ConfigError(f"table {table} not found")
+            regclass = sql.Identifier(table.schema, table.name).as_string(self.conn)
+            # each valid index, its key columns in key order (NULL for an expression)
             cur.execute(
-                "SELECT a.attname FROM pg_index i "
-                "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
-                "WHERE i.indrelid = %s::regclass AND i.indisprimary",
-                (sql.Identifier(table.schema, table.name).as_string(self.conn),),
+                "SELECT ic.relname, i.indisunique, i.indisprimary, am.amname, "
+                "i.indexprs IS NOT NULL OR i.indisexclusion, i.indpred IS NOT NULL, "
+                "ARRAY(SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(n, pos) "
+                "LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.n "
+                "WHERE k.pos <= i.indnkeyatts ORDER BY k.pos) "
+                "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+                "JOIN pg_am am ON am.oid = ic.relam "
+                "WHERE i.indrelid = %s::regclass AND i.indisvalid ORDER BY ic.relname",
+                (regclass,),
             )
-            pk = [r[0] for r in cur.fetchall()]
-        return TableSchema(table, cols, pk)
+            pk: list[str] = []
+            indexes = []
+            for name, unique, primary, method, expression, partial, keys in cur.fetchall():
+                if primary:
+                    pk = list(keys)
+                    continue
+                kind = (
+                    "other" if method != "btree"
+                    else "expression" if expression
+                    else "partial" if partial
+                    else "btree"
+                )  # fmt: skip
+                indexes.append(Index(name, plain_prefix(keys), unique, kind))
+            # a foreign key to a partitioned table has a copy per partition: parents only
+            cur.execute(
+                "SELECT c.conname, "
+                "ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY k(n, pos) "
+                "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n "
+                "ORDER BY k.pos), rn.nspname, rc.relname, "
+                "ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY k(n, pos) "
+                "JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.n "
+                "ORDER BY k.pos) "
+                "FROM pg_constraint c JOIN pg_class rc ON rc.oid = c.confrelid "
+                "JOIN pg_namespace rn ON rn.oid = rc.relnamespace "
+                "WHERE c.conrelid = %s::regclass AND c.contype = 'f' AND c.conparentid = 0 "
+                "ORDER BY c.conname",
+                (regclass,),
+            )
+            fks = [
+                ForeignKey(n, tuple(cs), TableRef(s, t), tuple(rs))
+                for n, cs, s, t, rs in cur.fetchall()
+            ]
+        return TableSchema(table, cols, pk, indexes, fks)
 
     def _ident(self, table: TableRef) -> sql.Identifier:
         return sql.Identifier(table.schema, table.name)

@@ -310,6 +310,11 @@ def test_support_bundle_carries_the_run_without_values(tmp_path, dbs, capsys, mo
     env = json.loads(bundle.read("environment.json"))
     assert env["canonical_version"] and env["packages"]["psycopg"]
     assert env["canonical_revision"] == CANONICAL_REVISION
+    # why a structure check was not made: switched off, or a structure rule with its reason
+    every = {"nullability": True, "keys": True, "foreign_keys": True, "indexes": True}
+    assert json.loads(bundle.read("project.json"))["database"]["structure"] == every
+    assert json.loads(bundle.read("run/report.json"))["range"]["structure"] == every
+    assert json.loads(bundle.read("run/db-results.json"))["structure"] == every
     # also in the store, for an operator who has no shell on the instance
     assert (tmp_path / "work/acme/support" / out["bundle"].rsplit("/", 1)[1]).exists()
 

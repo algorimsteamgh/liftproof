@@ -169,7 +169,13 @@ def build_report(
                 if t.partial
             ],
             "exclusions": [
-                {"object": f.object, "column": f.column, "reason": f.detail.get("reason")}
+                {
+                    "object": f.object,
+                    "column": f.column,
+                    "reason": f.detail.get("reason"),
+                    # a structure check or an index not compared, rather than data
+                    **{k: f.detail[k] for k in ("structure", "index") if k in f.detail},
+                }
                 for f in findings
                 if f.kind == Kind.NOTICE and "reason" in f.detail
             ],

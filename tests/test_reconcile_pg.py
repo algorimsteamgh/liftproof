@@ -9,10 +9,11 @@ import json
 import pytest
 
 from liftproof.canonical import CANONICAL_REVISION
-from liftproof.findings import FindingWriter, Kind, read_findings
+from liftproof.findings import FindingWriter, Kind, Severity, read_findings
 from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import REASON_INFINITY, ReconcileOptions, Reconciler
 from liftproof.reconcile.plan import IgnoreRule
+from liftproof.reconcile.structure import StructureChecks
 from liftproof.report.builder import verdict
 
 pytestmark = pytest.mark.postgres
@@ -173,6 +174,108 @@ def test_baseline_then_reconcile(tmp_path, make_db, adapter_for, pair):
     writer.close()
     findings = list(read_findings(tmp_path / "f3"))
     assert [f.locator for f in findings if f.summary == "row missing in target"] == ["id = 7"]
+
+
+def _structure(findings):
+    return sorted((f.object, f.detail["issue"], f.severity) for f in findings
+                  if f.detail.get("issue") and f.kind in (Kind.DIFFERENCE, Kind.NOTICE)
+                  and f.column != "tenant_id")  # fmt: skip
+
+
+def _restructure(sc, tc):
+    """Spec 9.13: what a DMS full load leaves behind, a NOT NULL, a unique key, a foreign
+    key, an index and a primary key short."""
+    tc.execute("ALTER TABLE customers ALTER name DROP NOT NULL;"
+               "ALTER TABLE sessions DROP CONSTRAINT sessions_pkey")  # fmt: skip
+    sc.execute("CREATE UNIQUE INDEX ON customers (email); CREATE INDEX ON orders (customer_id);"
+               "ALTER TABLE orders ADD FOREIGN KEY (customer_id) REFERENCES customers")  # fmt: skip
+
+
+def test_structure_differences_reported(tmp_path, pair):
+    src, tgt, sc, tc = pair
+    _restructure(sc, tc)
+    result, findings = _run(tmp_path / "a", src, tgt)
+    assert _structure(findings) == [
+        ("public.customers", "key_missing_in_target", Severity.MEDIUM),
+        ("public.customers", "nullability_changed", Severity.MEDIUM),
+        ("public.orders", "foreign_key_missing_in_target", Severity.MEDIUM),
+        ("public.orders", "index_missing_in_target", Severity.LOW),
+        ("public.sessions", "key_missing_in_target", Severity.MEDIUM),
+    ]
+    [pk] = [f for f in findings if f.object == "public.sessions" and f.detail.get("issue")]
+    assert (pk.expected, pk.actual) == ("primary key (token)", "none")
+    [fk] = [f for f in findings if f.detail.get("issue") == "foreign_key_missing_in_target"]
+    assert fk.detail["references"] == "public.customers" and fk.detail["columns"] == ["customer_id"]
+    tables = {t.table: t for t in result.tables}
+    assert {t.status for t in tables.values()} == {"matched"}  # the data still matches
+    assert {q: t.structure_differences for q, t in tables.items()} == {
+        "public.customers": 2, "public.orders": 2, "public.audit_log": 0, "public.sessions": 1}
+    assert verdict(findings) == "failed"
+    assert result.structure == {"nullability": True, "keys": True, "foreign_keys": True,
+                                "indexes": True}  # fmt: skip
+
+    # accepted with a reason: named in the exclusions, compared no more
+    rules = [ETL, IgnoreRule("sessions", "rebuilt after the load", structure="keys"),
+             IgnoreRule("customers", "relaxed on purpose", "name", structure="nullability")]
+    result, findings = _run(tmp_path / "b", src, tgt, ignore=rules)
+    assert [t for t in _structure(findings) if t[0] != "public.orders"] == [
+        ("public.customers", "key_missing_in_target", Severity.MEDIUM)]
+    accepted = sorted((f.object, f.column, f.detail["structure"]) for f in findings
+                      if f.detail.get("reason") and f.detail.get("structure"))  # fmt: skip
+    assert accepted == [("public.customers", "name", "nullability"),
+                        ("public.sessions", None, "keys")]  # fmt: skip
+
+
+def test_structure_can_be_switched_off(tmp_path, pair):
+    src, tgt, sc, tc = pair
+    _restructure(sc, tc)
+    off = StructureChecks(False, False, False, False)
+    result, findings = _run(tmp_path, src, tgt, structure=off)
+    assert _structure(findings) == []
+    assert not any(t.structure_differences for t in result.tables)
+    assert set(result.structure.values()) == {False}
+    _, findings = _run(tmp_path / "b", src, tgt, structure=StructureChecks(indexes=False,
+                                                                           foreign_keys=False))
+    assert [i for _, i, _ in _structure(findings)] == ["key_missing_in_target",
+                                                       "nullability_changed",
+                                                       "key_missing_in_target"]  # fmt: skip
+
+
+def test_structure_against_a_baseline(tmp_path, pair):
+    src, tgt, sc, tc = pair
+    tc.execute("ALTER TABLE orders DROP COLUMN tenant_id")
+    manifest = tmp_path / "baseline" / "manifest.json"
+    take_baseline(src, manifest, baseline_id="b1", schemas=["public"], tables=None,
+                  ignore=[ETL], business_keys={}, rows_per_bucket=1000, precision=6)  # fmt: skip
+    entry = json.loads(manifest.read_text())["tables"]["public.customers"]
+    assert entry["not_null"] == ["id", "name"] and entry["indexes"] == []
+    assert entry["foreign_keys"] == []
+    tc.execute("ALTER TABLE customers ALTER name DROP NOT NULL")
+
+    def compare(name, baseline):
+        writer = FindingWriter(tmp_path / name, name)
+        opts = ReconcileOptions(rows_per_bucket=1000, ignore=[ETL])
+        result = Reconciler(tgt, writer, opts, baseline=baseline).run()
+        writer.close()
+        return result, list(read_findings(tmp_path / name))
+
+    result, findings = compare("f1", Baseline.load(manifest))
+    assert _structure(findings) == [("public.customers", "nullability_changed", Severity.MEDIUM)]
+    assert "unrecorded" not in result.structure
+
+    # a manifest from before structure was recorded: the primary key alone is compared
+    doc = json.loads(manifest.read_text())
+    for entry in doc["tables"].values():
+        for key in ("not_null", "indexes", "foreign_keys"):
+            del entry[key]
+    manifest.write_text(json.dumps(doc))
+    tc.execute("ALTER TABLE sessions DROP CONSTRAINT sessions_pkey")
+    result, findings = compare("f2", Baseline.load(manifest))
+    assert _structure(findings) == [("public.sessions", "key_missing_in_target", Severity.MEDIUM)]
+    assert result.structure["unrecorded"].startswith(
+        "baseline b1 was taken before nullability, keys and indexes were recorded; only "
+        "primary keys are compared for public.audit_log, public.customers"
+    )
 
 
 CONTRACTS = """
