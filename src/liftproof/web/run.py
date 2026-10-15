@@ -45,6 +45,9 @@ class JourneyResult:
     recorded_wall_ms: float | None = None
     replayed_wall_ms: float | None = None
     browser_crashes: int = 0  # attempts the browser process exited during (spec 18)
+    # pages compared as text (snapshot kept), by shape (structure) and by structure once
+    # the kept snapshot expired; empty for a journey never compared
+    ui_compared: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -245,11 +248,16 @@ def _journey_done(
         status = "failed" if run.failure_kind != "not_found" else "different"
     else:
         status = "different" if differences else "passed"
-    return _result(j, run, status, differences, run.error)
+    return _result(j, run, status, differences, run.error, comparison.ui_compared)
 
 
 def _result(
-    j: Journey, run: JourneyRun, status: str, differences: int, reason: str | None
+    j: Journey,
+    run: JourneyRun,
+    status: str,
+    differences: int,
+    reason: str | None,
+    ui_compared: dict[str, int] | None = None,
 ) -> JourneyResult:
     return JourneyResult(
         journey=j.journey_id,
@@ -266,6 +274,7 @@ def _result(
         recorded_wall_ms=j.wall_ms,
         replayed_wall_ms=run.wall_ms,
         browser_crashes=run.browser_crashes,
+        ui_compared=dict(ui_compared or {}),
     )
 
 

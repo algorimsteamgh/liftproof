@@ -43,7 +43,7 @@ def recorded(browser_available, tmp_path_factory):
     assets_dir = tmp_path_factory.mktemp("assets")
     with ShopApp() as app:
         journey, assets = Recorder(
-            app.url, policy=BodyPolicy(["/api/*"]), headless=True
+            app.url, policy=BodyPolicy(["/api/*"], snapshots=["/orders/*"]), headless=True
         ).record("checkout", start="/login", story="ORD-14", drive=drive)
     for sha, body in assets.items():
         (assets_dir / sha).write_bytes(body)
@@ -76,7 +76,7 @@ def with_step(journey, action, **step):
 
 
 def test_recording_redacts_and_correlates(recorded):
-    journey, _ = recorded
+    journey, assets = recorded
     text = json.dumps(journey.to_dict())
     assert PASSWORD not in text
     [(token, binding)] = journey.secrets.items()
@@ -90,6 +90,14 @@ def test_recording_redacts_and_correlates(recorded):
     kept = {e.url: e.body_asset for s in journey.steps for e in s.exchanges}
     assert kept["/login"] is None  # default deny: HTML documents are hash and shape only
     assert kept["/api/orders"] is not None
+    # page snapshots too: the order page (step 6) was opted in, the others are structure
+    assert all(s.region is None and s.region_sha256 and s.region_shape for s in journey.steps)
+    assert [s.n for s in journey.steps if s.region_asset] == [6]
+    assert journey.steps[5].region_asset == f"assets/{journey.steps[5].region_sha256}"
+    assert "Back to orders" in (assets / journey.steps[5].region_sha256).read_text()
+    assert "Back to orders" not in text and 'heading "' not in text  # no snapshot text
+    assert journey.steps[2].region_shape.splitlines() == [  # the password filled in
+        "- text: *", '- textbox "*": *', "- text: *", '- textbox "*": *', '- button "*"']
     roundtrip = Journey.from_dict(json.loads(text))
     assert roundtrip.to_dict() == journey.to_dict()
 
@@ -99,6 +107,7 @@ def test_unchanged_target_replays_clean(recorded):
     result, findings = replay(journey, assets, "same")
     [j] = result.journeys
     assert j.status == "passed", [f.summary for f in findings]
+    assert j.ui_compared == {"text": 1, "shape": 5, "expired": 0}
     assert not [f for f in findings if f.kind in (Kind.DIFFERENCE, Kind.ERROR)]
     assert result.endpoints and all(e["target_ms"] is not None for e in result.endpoints)
 
@@ -116,6 +125,24 @@ def test_changed_target_reports_exactly_the_changes(recorded):
     # ids the replay created and 10.50 against 10.5 are not differences
     assert not [f for f in findings if f.column in ("$.id", "$.total")]
     assert all(f.story == "ORD-14" for f in findings if f.kind == Kind.DIFFERENCE)
+
+
+def test_a_page_not_kept_is_compared_by_structure(recorded, tmp_path):
+    """Default deny (spec 5): the changed status on the order page is not reported when
+    its snapshot was not kept, nor once the kept one has expired; the API still is."""
+    journey, assets = recorded
+    j = copy.deepcopy(journey)
+    j.steps[5].region_asset = None
+    result, findings = replay(j, assets, "changed")
+    got = {(f.comparator, f.object, f.summary) for f in findings if f.kind == Kind.DIFFERENCE}
+    assert (Comparator.API, "POST /api/orders", "value of $.status differs") in got
+    assert not [f for f in findings if f.summary.startswith("page ")]
+    assert result.journeys[0].ui_compared == {"text": 0, "shape": 6, "expired": 0}
+    result, findings = replay(journey, tmp_path, "changed")  # no asset: the bucket expired it
+    assert result.journeys[0].ui_compared == {"text": 0, "shape": 5, "expired": 1}
+    [notice] = [f for f in findings if f.kind == Kind.NOTICE]
+    assert notice.detail == {"snapshots_expired": 1, "bodies_expired": 2}
+    assert not [f for f in findings if f.summary.startswith("page ")]
 
 
 @pytest.mark.parametrize("resolved", [True, False])
@@ -457,6 +484,8 @@ def test_cli_bind_and_replay(recorded, tmp_path, monkeypatch, capsys, variant, e
     assert report["coverage"]["journeys_success_pct"] == (100.0 if variant == "same" else 0.0)
     assert report["traceability"][0]["story"] == "ORD-14"
     assert report["timings"]["journeys"][0]["target_ms"] is not None
+    assert report["journeys"][0]["ui_compared"] == {"text": 1, "shape": 5, "expired": 0}
+    assert report["coverage"]["ui_compared"] == report["journeys"][0]["ui_compared"]
     assert PASSWORD not in (work / "shop" / "runs" / "r-web" / "report.html").read_text()
 
 

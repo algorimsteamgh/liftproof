@@ -2,22 +2,25 @@
 
 A journey is data, never a script. It holds the steps the engineer took, the network
 exchanges behind each step, what the touched page region looked like, timings, the
-correlation rules, and the binding of each redaction token to a secret. Bodies are kept
-out of the journey file: an opted in body is an asset referenced by hash, and everything
-else is reduced to a hash and a shape (default deny, spec 5).
+correlation rules, and the binding of each redaction token to a secret. Bodies and page
+snapshots are kept out of the journey file: an opted in one is an asset referenced by
+hash, which the bucket expires, and everything else is reduced to a hash and a shape
+(default deny, spec 5).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from liftproof.errors import ConfigError
 
-JOURNEY_FORMAT = "1.0"
+JOURNEY_FORMAT = "1.1"
+REGION_SHAPE_VERSION = 1  # of region_shape(): shapes made by another are not compared
 TOKEN_PREFIX = "@@REDACTED_"  # noqa: S105 - the marker, not a secret
 
 
@@ -58,9 +61,14 @@ class Step:
     value: str | None = None
     non_idempotent: bool = False  # the step's requests changed state (POST, PUT, PATCH, DELETE)
     exchanges: list[Exchange] = field(default_factory=list)
-    region: str | None = None  # accessible tree of the region the step touched, after it ran
+    # the accessible tree of the region the step touched, after it ran, inline: journeys
+    # recorded before 1.1 only
+    region: str | None = None
     page_url: str | None = None  # where the browser was after the step
     duration_ms: float | None = None
+    region_sha256: str | None = None
+    region_shape: str | None = None  # region_shape() of the region: structure, no content
+    region_asset: str | None = None  # assets/<sha256>, present only when the page was opted in
 
 
 @dataclass
@@ -108,6 +116,7 @@ class Journey:
     # journey an engineer drove it includes their pauses
     wall_ms: float | None = None
     format: str = JOURNEY_FORMAT
+    region_shape_version: int | None = None
 
     @property
     def non_idempotent(self) -> bool:
@@ -154,6 +163,7 @@ class Journey:
             browser=d.get("browser"),
             wall_ms=d.get("wall_ms"),
             format=d.get("format", JOURNEY_FORMAT),
+            region_shape_version=d.get("region_shape_version"),
         )
 
     def save(self, path: Path) -> Path:
@@ -194,3 +204,50 @@ def shape(value: Any) -> Any:
     if value is None:
         return "null"
     return "string"
+
+
+# Playwright's ARIA roles, the text node, and the properties it lists under an element
+ARIA_ROLES = frozenset(
+    """
+alert alertdialog application article banner blockquote button caption cell checkbox code
+columnheader combobox complementary contentinfo definition deletion dialog directory
+document emphasis feed figure form generic grid gridcell group heading img insertion link
+list listbox listitem log main mark marquee math meter menu menubar menuitem
+menuitemcheckbox menuitemradio navigation none note option paragraph presentation
+progressbar radio radiogroup region row rowgroup rowheader scrollbar search searchbox
+separator slider spinbutton status strong subscript superscript switch tab table tablist
+tabpanel term textbox time timer toolbar tooltip tree treegrid treeitem text /url
+/placeholder
+""".split()
+)
+ARIA_STATE = re.compile(
+    r"active|disabled|expanded|selected|(checked|pressed)(=mixed)?|invalid(=grammar|=spelling)?"
+    r"|level=\d+"
+)
+_ARIA_KEY = r'(?P<role>/?[a-z]+)(?P<name> "(?:[^"\\]|\\.)*"| /.*/)?(?P<states>(?: \[[^\]]*\])*)'
+_ARIA_LINE = re.compile(
+    rf"(?P<indent> *)- (?:'(?P<quoted>(?:[^']|'')*)'|{_ARIA_KEY})(?P<colon>:(?P<text> .+)?)?"
+)
+_ARIA_QUOTED_KEY = re.compile(_ARIA_KEY)
+
+
+def region_shape(snapshot: str) -> str:
+    """The structure of a page snapshot (Playwright's aria snapshot) without its content:
+    each element's role at its depth, its states, and whether it has a name, text or
+    children. Names and text become *, and a line with no known role becomes ?, so
+    nothing the page showed survives, whatever the snapshot holds."""
+    lines = []
+    for line in snapshot.splitlines():
+        key = m = _ARIA_LINE.fullmatch(line)
+        if m is not None and m["quoted"] is not None:  # YAML quotes a key holding ": "
+            key = _ARIA_QUOTED_KEY.fullmatch(m["quoted"].replace("''", "'"))
+        if m is None or key is None or key["role"] not in ARIA_ROLES:
+            lines.append(line[: len(line) - len(line.lstrip(" "))] + "?")
+            continue
+        name = ' "*"' if key["name"] else ""
+        states = "".join(
+            f" [{s}]" for s in re.findall(r"\[([^\]]*)\]", key["states"]) if ARIA_STATE.fullmatch(s)
+        )
+        colon = (":" if m["colon"] else "") + (" *" if m["text"] else "")
+        lines.append(f"{m['indent']}- {key['role']}{name}{states}{colon}")
+    return "\n".join(lines)

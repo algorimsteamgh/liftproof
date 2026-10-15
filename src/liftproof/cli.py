@@ -855,8 +855,14 @@ def journey_index(store: Store, workdir: Path) -> list[str]:
 
 
 def _load_journey(store: Store, workdir: Path, journey_id: str) -> Journey:
+    """The journey as the store holds it: one recorded again, or bound, on another machine
+    replaces this instance's copy, which is used alone only when the store has none."""
     path = _journey_dir(workdir) / f"{journey_id}.json"
-    if not path.exists() and not store.get_file(f"journeys/{journey_id}.json", path):
+    key = f"journeys/{journey_id}.json"
+    written = store.modified(key).get(key)
+    if written is not None:
+        _copy_if_newer(store, key, path, written)
+    elif not path.exists():
         raise ConfigError(f"journey {journey_id} not found; record it with liftproof record")
     journey = Journey.load(path)
     for c in journey.correlations:
@@ -864,14 +870,24 @@ def _load_journey(store: Store, workdir: Path, journey_id: str) -> Journey:
             correlate.check_chain(c.transforms, c.encodings)
         except ValueError as exc:
             raise ConfigError(f"journey {journey_id}, correlation {c.name}: {exc}") from None
-    assets = _journey_dir(workdir) / journey_id / "assets"
-    for step in journey.steps:
-        for ex in step.exchanges:
-            if ex.body_asset:
-                local = assets / ex.body_asset.split("/")[-1]
-                if not local.exists():
-                    store.get_file(f"journeys/{journey_id}/{ex.body_asset}", local)
     return journey
+
+
+def _fetch_assets(store: Store, workdir: Path, journey: Journey) -> None:
+    """The bodies and page snapshots a replay compares with, as the store holds them now.
+    The bucket expires them (spec 5), so a copy this instance holds of one the store no
+    longer has is deleted: the replay then compares without it, as any instance would."""
+    prefix = f"journeys/{journey.journey_id}/"
+    held = store.modified(f"{prefix}assets/")
+    assets = _journey_dir(workdir) / journey.journey_id / "assets"
+    refs = {ex.body_asset for s in journey.steps for ex in s.exchanges}
+    refs |= {s.region_asset for s in journey.steps}
+    for ref in sorted(r for r in refs if r):
+        local = assets / ref.split("/")[-1]
+        if prefix + ref not in held:
+            local.unlink(missing_ok=True)
+        elif not local.exists():
+            store.get_file(prefix + ref, local)
 
 
 def _save_journey(store: Store, workdir: Path, journey: Journey, assets: dict[str, bytes]) -> Path:
@@ -883,6 +899,8 @@ def _save_journey(store: Store, workdir: Path, journey: Journey, assets: dict[st
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(body)
         store.put_file(f"journeys/{journey.journey_id}/assets/{sha}", local)
+        if isinstance(store, S3Store):
+            local.unlink()  # the bucket's copy, which expires, is the only one (spec 5)
     return path
 
 
@@ -919,6 +937,8 @@ def _replay_into(
     ]
     if not journeys:
         raise ConfigError("no journeys recorded for this project; record one with liftproof record")
+    for j in journeys:
+        _fetch_assets(store, workdir, j)
     options = WebOptions(
         compare_headers=web.compare_headers,
         ignore_json_paths=web.ignore_json_paths,
@@ -972,7 +992,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     store = _store(project, Path(args.workdir))
     recorder = Recorder(
         web.source_url,
-        policy=BodyPolicy(web.capture_bodies),
+        policy=BodyPolicy(web.capture_bodies, web.capture_snapshots),
         headless=False,
         executable_path=web.chromium_path,
     )
@@ -985,6 +1005,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         journey.writes_tables = [t.strip() for t in args.writes.split(",") if t.strip()]
     path = _save_journey(store, workdir, journey, assets)
     unconfirmed = [c.name for c in journey.correlations if not c.confirmed]
+    kept = sum(1 for s in journey.steps if s.region_asset)
     _out(
         args,
         {
@@ -994,9 +1015,13 @@ def cmd_record(args: argparse.Namespace) -> int:
             "correlations": [c.name for c in journey.correlations],
             "unconfirmed_correlations": unconfirmed,
             "unbound_tokens": journey.unbound_tokens(),
+            "snapshots_kept": kept,
+            "snapshots_structure_only": len(journey.steps) - kept,
         },
         f"recorded {journey.journey_id}: {len(journey.steps)} steps, "
         f"{len(journey.correlations)} correlations ({len(unconfirmed)} to confirm)\n"
+        f"page snapshots kept for {kept} of {len(journey.steps)} steps (web.capture_snapshots); "
+        "the others are compared by structure\n"
         + "".join(
             f"bind {t} ({journey.secrets[t].field}): liftproof bind --project {args.project} "
             f"--journey {journey.journey_id} --token {t} --secret-arn ARN --key KEY\n"

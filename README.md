@@ -69,6 +69,20 @@ run; a field only some orders have, or a value where every one was null, is what
 data looks like too, so it is a low difference. In `web.ignore_json_paths`, `[*]` is
 every element: `GET /api/orders $.orders[*].updated_at`.
 
+The page each step ends on is compared as text (its accessible tree, with dates, ids and
+`web.ignore_text` masked) only when its path matches a `web.capture_snapshots` pattern,
+such as `["/orders/*"]`: page snapshots are default deny, like bodies. Every other page
+is compared by structure: the roles, states (checked, disabled, expanded, level) and
+nesting of its elements and whether each has a name or text, never the text itself. A
+missing button or an unticked box is reported there; a relabelled button or a changed
+status is not, and `web.ignore_text` has nothing to mask. Kept snapshots and bodies go to
+the bucket under `journeys/<id>/assets/` and expire after its asset retention
+(`asset_retention_days`, `AssetRetentionDays` in CloudFormation); a later replay then
+compares that page by structure and that response by shape, and says so in a notice.
+The report's journey table counts the pages compared each way. Replay and `bind` read
+the journey from the bucket, so one recorded again on another machine replaces the
+instance's copy.
+
 ## Files
 
 ```bash

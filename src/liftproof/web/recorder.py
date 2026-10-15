@@ -4,7 +4,7 @@ The engineer opens the source application through a Chromium window that Liftpro
 controls and carries out a real journey. Three layers are captured at once: the
 interactions (with several locators per element), the network traffic behind them, and
 timings. Sensitive values are swapped for random tokens before anything is written, and
-response bodies are kept only for URL patterns the project opted in to.
+response bodies and page snapshots are kept only for URL patterns the project opted in to.
 """
 
 from __future__ import annotations
@@ -30,7 +30,16 @@ from liftproof.web.browser import (
     region_snapshot,
     step_settled,
 )
-from liftproof.web.journey import TOKEN_PREFIX, Journey, Locator, SecretBinding, Step
+from liftproof.web.journey import (
+    REGION_SHAPE_VERSION,
+    TOKEN_PREFIX,
+    Journey,
+    Locator,
+    SecretBinding,
+    Step,
+    region_shape,
+    sha256,
+)
 
 CAPTURE_JS = resources.files("liftproof.web").joinpath("capture.js").read_text("utf-8")
 
@@ -172,14 +181,30 @@ class RecordingSession:
             end = c.started + (ex.duration_ms or 0.0)
             steps[idx].duration_ms = max(steps[idx].duration_ms or 0.0, end - self._times[idx])
         for s in steps:
-            s.region = self._scrub(s.region)  # a textbox shows its value in the tree
+            self._reduce_region(s, assets)
             s.non_idempotent = any(e.method in WRITE_METHODS for e in s.exchanges)
             if s.duration_ms is not None:
                 s.duration_ms = round(max(s.duration_ms, 0.0), 1)
+        self.journey.region_shape_version = REGION_SHAPE_VERSION
         later = [[s.url or "", s.value or ""] for s in steps]
         self.journey.correlations = correlate.detect(traffic, later)
         self._sensitive.clear()
         return self.journey, assets
+
+    def _reduce_region(self, step: Step, assets: dict[str, bytes]) -> None:
+        """Default deny, as for bodies (spec 5): the snapshot's text is kept, as an asset
+        the bucket expires, only for a page the project opted in to; every snapshot is a
+        hash and its structure in the journey file."""
+        text = self._scrub(step.region)  # a textbox shows its value in the tree
+        step.region = None
+        if text is None:
+            return
+        raw = text.encode("utf-8")
+        step.region_sha256 = sha256(raw)
+        step.region_shape = region_shape(text)
+        if self.policy.keeps_snapshot(step.page_url or ""):
+            step.region_asset = f"assets/{step.region_sha256}"
+            assets[step.region_sha256] = raw
 
 
 class Recorder:

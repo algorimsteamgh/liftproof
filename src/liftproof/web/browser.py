@@ -1,7 +1,7 @@
 """Browser plumbing shared by the recorder and the replay engine.
 
-Network capture, header redaction, body policy (default deny, spec 5), endpoint
-normalisation and the snapshot of the page region a step touched.
+Network capture, header redaction, what is kept as content (default deny, spec 5),
+endpoint normalisation and the snapshot of the page region a step touched.
 """
 
 from __future__ import annotations
@@ -50,12 +50,17 @@ def launch(playwright: Any, *, headless: bool = True, executable_path: str | Non
 
 @dataclass
 class BodyPolicy:
-    """Which response bodies are kept as content. Everything else: hash and shape."""
+    """Which response bodies, and which pages' snapshots, are kept as content (spec 5).
+    Everything else: hash and shape. Both are URL path glob patterns."""
 
-    capture: list[str] = field(default_factory=list)  # URL path glob patterns
+    capture: list[str] = field(default_factory=list)
+    snapshots: list[str] = field(default_factory=list)  # matched on the page a step ended on
 
     def keeps(self, path: str) -> bool:
         return any(fnmatch.fnmatch(path, p) for p in self.capture)
+
+    def keeps_snapshot(self, url: str) -> bool:
+        return any(fnmatch.fnmatch(url.split("?", 1)[0], p) for p in self.snapshots)
 
 
 def path_of(url: str) -> str:

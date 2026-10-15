@@ -64,6 +64,8 @@ class LocalStore(Store):
         base = self.root / prefix
         if not base.exists():
             return []
+        if base.is_file():  # a whole key, which an S3 prefix lists too
+            return [prefix]
         return sorted(
             p.relative_to(self.root).as_posix()
             for p in base.rglob("*")

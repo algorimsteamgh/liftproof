@@ -5,6 +5,7 @@ import gc
 import json
 import threading
 import weakref
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -14,9 +15,19 @@ from liftproof.findings import Kind, Severity
 from liftproof.report.builder import PASSED_WITH_DIFFERENCES, build_report, render_html, verdict
 from liftproof.web import correlate, replay
 from liftproof.web import run as webrun
-from liftproof.web.browser import Captured, NetworkLog, Write, normalise_path
+from liftproof.web.browser import BodyPolicy, Captured, NetworkLog, Write, normalise_path
 from liftproof.web.compare import Comparison, WebOptions, compare_journey
-from liftproof.web.journey import Correlation, Exchange, Journey, Step, shape
+from liftproof.web.journey import (
+    REGION_SHAPE_VERSION,
+    Correlation,
+    Exchange,
+    Journey,
+    Step,
+    region_shape,
+    sha256,
+    shape,
+)
+from liftproof.web.recorder import RecordingSession
 from liftproof.web.replay import JourneyRun, Replayer, StepRun
 from liftproof.web.run import REASON_STOPPED, WebResult, run_journeys
 from tests import fakereplay
@@ -763,3 +774,174 @@ def test_the_failure_after_a_stale_value_names_it(monkeypatch):
     assert "failed" not in u.summary
     assert not [f for f in findings if "unresolved_correlations" in f.detail
                 and f.kind == Kind.ERROR]  # fmt: skip
+
+
+# ------------------------------------------------------- page snapshots (spec 5, decision 99)
+SNAPSHOT = """\
+- main:
+  - heading "Order 4021" [level=1]
+  - 'heading "Order: 4021 for Alice" [level=2]'
+  - 'heading "Alice''s order: 4021" [level=2]'
+  - heading "It's \\"quoted\\" [x]" [level=3]
+  - textbox "Username": alice
+  - textbox "Email":
+    - /placeholder: alice@example.com
+  - checkbox "Agree" [checked=mixed] [disabled]
+  - link "Back to orders":
+    - /url: /orders/4021?x=1
+  - paragraph: "Total: 10.50 EUR"
+  - img "Alice Smith" [alt=Alice Smith] [ref=e12]
+  - Alice
+  - heading [level=4]
+  - text: Alice Smith"""
+
+
+def test_region_shape_keeps_structure_not_content():
+    got = region_shape(SNAPSHOT)
+    assert got.splitlines() == [
+        "- main:",
+        '  - heading "*" [level=1]',
+        '  - heading "*" [level=2]',  # YAML quotes a key holding ": "
+        '  - heading "*" [level=2]',
+        '  - heading "*" [level=3]',
+        '  - textbox "*": *',
+        '  - textbox "*":',
+        "    - /placeholder: *",
+        '  - checkbox "*" [checked=mixed] [disabled]',
+        '  - link "*":',
+        "    - /url: *",
+        "  - paragraph: *",
+        '  - img "*"',  # attributes Playwright does not use for state are dropped
+        "  ?",  # no known role: nothing of the line is kept
+        "  - heading [level=4]",
+        "  - text: *",
+    ]
+    for content in ("4021", "Alice", "alice", "quoted", "orders", "10.50", "e12", "Agree"):
+        assert content not in got
+
+
+def _session(policy):
+    page = SimpleNamespace(route=lambda *a: None, on=lambda *a: None, is_closed=lambda: True)
+    return RecordingSession(page, Journey("j1", "http://source.invalid"), policy, 0)
+
+
+def test_snapshots_are_kept_only_for_pages_opted_in():
+    s = _session(BodyPolicy(["/api/*"], snapshots=["/orders/*"]))
+    token = s._token("Password", "s3cret-pass")
+    s.journey.steps = [
+        Step(1, "goto", url="/login", page_url="/login",
+             region='- textbox "Password": s3cret-pass\n- button "Sign in"'),
+        Step(2, "click", page_url="/orders/4021?tab=1",
+             region='- heading "Order 4021 for s3cret-pass" [level=1]'),
+    ]  # fmt: skip
+    s._times = [0.0, 1.0]
+    journey, assets = s.finish()
+    login, order = journey.steps
+    assert (login.region, order.region) == (None, None)
+    assert login.region_shape == '- textbox "*": *\n- button "*"'
+    scrubbed = f'- textbox "Password": {token}\n- button "Sign in"'
+    assert (login.region_sha256, login.region_asset) == (sha256(scrubbed.encode()), None)
+    kept = f'- heading "Order 4021 for {token}" [level=1]'.encode()
+    assert (order.region_sha256, order.region_asset) == (sha256(kept), f"assets/{sha256(kept)}")
+    assert assets == {sha256(kept): kept}
+    assert journey.region_shape_version == REGION_SHAPE_VERSION
+    text = json.dumps(journey.to_dict())
+    assert not [t for t in ("s3cret-pass", "Order 4021", "Sign in") if t in text]
+    assert Journey.from_dict(json.loads(text)).to_dict() == journey.to_dict()
+
+
+ORDER_PAGE = "\n".join([
+    '- heading "Order 7" [level=1]', '- checkbox "Gift wrap" [checked]', "- text: DISPATCHED",
+    '- button "Cancel"'])  # fmt: skip
+
+
+def _page_journey(**step):
+    return Journey("j", "http://source.invalid", region_shape_version=REGION_SHAPE_VERSION,
+                   steps=[Step(1, "goto", url="/orders/7", **step)])  # fmt: skip
+
+
+def _pages(journey, region, assets_dir=None, exchanges=()):
+    run = JourneyRun("j", status="completed", attempts=1,
+                     steps=[StepRun(1, "goto", "ok", region=region, exchanges=list(exchanges))])
+    findings = []
+    cmp = compare_journey(journey, run, WebOptions(), findings.append, assets_dir)
+    return findings, cmp.ui_compared
+
+
+def test_a_page_not_kept_is_compared_by_structure():
+    j = _page_journey(region_shape=region_shape(ORDER_PAGE))
+    # other text and other values: the same structure
+    other = ORDER_PAGE.replace("DISPATCHED", "dispatched").replace("Order 7", "Order 9")
+    assert _pages(j, other) == ([], {"text": 0, "shape": 1, "expired": 0})
+    for page, expected, actual in [
+        (ORDER_PAGE.replace('\n- button "Cancel"', ""), '- button "*"', ""),
+        (ORDER_PAGE.replace(" [checked]", ""), '- checkbox "*" [checked]', '- checkbox "*"'),
+    ]:
+        [f], counts = _pages(j, page)
+        assert (f.kind, f.severity, f.object, f.summary) == (
+            Kind.DIFFERENCE, MEDIUM, "j step 1", "page structure differs after the step")
+        assert (f.expected, f.actual, f.detail["compared"]) == (expected, actual, "shape")
+        assert counts == {"text": 0, "shape": 1, "expired": 0}
+
+
+def test_a_kept_snapshot_is_compared_as_text_until_it_expires(tmp_path):
+    raw = ORDER_PAGE.encode()
+    body = json.dumps({"id": 7, "status": "DISPATCHED"}).encode()
+    (tmp_path / sha256(raw)).write_bytes(raw)
+    (tmp_path / sha256(body)).write_bytes(body)
+    j = _page_journey(region_shape=region_shape(ORDER_PAGE), region_sha256=sha256(raw),
+                      region_asset=f"assets/{sha256(raw)}", exchanges=[
+                          Exchange("GET", "/api/orders/7", 200, body_asset=f"assets/{sha256(body)}",
+                                   body_shape=shape(json.loads(body)))])  # fmt: skip
+    answer = _captured("GET", "/api/orders/7", 200, {"id": 7, "status": "OPEN"})
+    relabelled = ORDER_PAGE.replace('"Cancel"', '"Cancel order"')
+    findings, counts = _pages(j, relabelled, tmp_path, [answer])
+    assert sorted((f.summary, f.detail.get("compared")) for f in findings) == [
+        ("page content differs after the step", "text"), ("value of $.status differs", None)]
+    assert counts == {"text": 1, "shape": 0, "expired": 0}
+    # the bucket expired both, and fetching the journey's assets dropped the copies here
+    for f in tmp_path.iterdir():
+        f.unlink()
+    [notice], counts = _pages(j, relabelled, tmp_path, [answer])  # the same structure, shape
+    assert counts == {"text": 0, "shape": 0, "expired": 1}
+    assert (notice.kind, notice.severity, notice.object, notice.detail) == (
+        Kind.NOTICE, Severity.INFO, "j", {"snapshots_expired": 1, "bodies_expired": 1})
+    assert notice.summary.endswith("compared 1 page by structure and 1 response by shape")
+    findings, _ = _pages(j, relabelled.replace(" [checked]", ""), tmp_path, [answer])
+    assert [f.summary for f in findings if f.kind == Kind.DIFFERENCE] == [
+        "page structure differs after the step"]
+
+
+def test_a_journey_recorded_with_its_snapshots_inline_compares_their_text():
+    d = Journey("j", "http://source.invalid", steps=[Step(1, "goto", url="/orders/7")]).to_dict()
+    for k in ("region_sha256", "region_shape", "region_asset"):
+        del d["steps"][0][k]
+    del d["region_shape_version"]
+    d["format"], d["steps"][0]["region"] = "1.0", ORDER_PAGE
+    j = Journey.from_dict(d)
+    findings, counts = _pages(j, ORDER_PAGE.replace('"Cancel"', '"Cancel order"'))
+    assert [f.summary for f in findings] == ["page content differs after the step"]
+    assert counts == {"text": 1, "shape": 0, "expired": 0}
+
+
+def test_a_structure_made_by_another_version_is_not_compared():
+    j = _page_journey(region_shape=region_shape(ORDER_PAGE))
+    j.region_shape_version = REGION_SHAPE_VERSION + 1
+    [f], counts = _pages(j, '- heading "Orders"')
+    assert (f.kind, f.severity, f.object, f.detail["steps"]) == (Kind.NOT_CHECKED, LOW, "j", 1)
+    assert "record the journey again" in f.summary
+    assert counts == {"text": 0, "shape": 0, "expired": 0}
+
+
+def test_the_report_says_how_pages_were_compared():
+    compared = webrun.JourneyResult("checkout", "ORD-14", "passed", 6, 6, 1, 0, 0, 1.0, 1.0,
+                                    ui_compared={"text": 1, "shape": 4, "expired": 1})
+    before = asdict(webrun.JourneyResult("login", None, "passed", 2, 2, 1, 0, 0, 1.0, 1.0))
+    del before["ui_compared"]  # a run reported before pages were counted
+    web = WebResult.from_dict({"journeys": [asdict(compared), before]})
+    report = build_report(run_id="r", project="p", mode="replay", started_at="t",
+                          finished_at="t", db=None, findings=[], metadata={},
+                          range_block={}, web=web)  # fmt: skip
+    assert report["coverage"]["ui_compared"] == {"text": 1, "shape": 4, "expired": 1}
+    assert [j["ui_compared"] for j in report["journeys"]] == [compared.ui_compared, {}]
+    assert ">1 / 5 (1 expired)</td>" in render_html(report)

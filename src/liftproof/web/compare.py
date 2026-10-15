@@ -1,8 +1,9 @@
 """User interface and API comparison (PRD F4, F5; Technical Spec 7, 8).
 
 UI: the accessible tree of the region each step touched, compared as text after
-volatile values (dates, times, generated ids, correlated values) are masked. Never
-pixels.
+volatile values (dates, times, generated ids, correlated values) are masked, where the
+project kept the page's snapshot (web.capture_snapshots); every other page, and a kept
+one the bucket has since expired, by structure: roles, states and nesting. Never pixels.
 
 API: for every request the journey made, status exactly, response shape structurally
 (an array by the union of its elements' shapes, so $.orders[*].total is one field),
@@ -31,7 +32,15 @@ from typing import Any
 from liftproof.findings import Comparator, Finding, Kind, Severity
 from liftproof.web import correlate
 from liftproof.web.browser import REDACTED, Captured, endpoints, normalise_path
-from liftproof.web.journey import Correlation, Exchange, Journey, shape
+from liftproof.web.journey import (
+    REGION_SHAPE_VERSION,
+    Correlation,
+    Exchange,
+    Journey,
+    Step,
+    region_shape,
+    shape,
+)
 from liftproof.web.replay import JourneyRun
 
 DEFAULT_VOLATILE = [
@@ -121,6 +130,18 @@ def _read(c: Correlation, cap: Captured) -> tuple[str, str | None]:
     return ("found", new) if new else ("transform_failed", raw)
 
 
+def _diff(a: list[str], b: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """The lines that changed between two snapshots, then those only on each side."""
+    diff = [
+        line
+        for line in difflib.unified_diff(a, b, "source", "target", lineterm="", n=0)
+        if line[:1] in "+-" and not line.startswith(("+++", "---"))
+    ]
+    removed = [d[1:].strip() for d in diff if d.startswith("-")]
+    added = [d[1:].strip() for d in diff if d.startswith("+")]
+    return diff, removed, added
+
+
 def _steps(ns: list[int]) -> str:
     return f"step {ns[0]}" if len(ns) == 1 else f"steps {', '.join(map(str, ns[:-1]))} and {ns[-1]}"
 
@@ -175,6 +196,11 @@ class Comparison:
         self.emit_finding = emit
         self.asset = asset
         self.differences = 0
+        # how each page was compared: text (its snapshot kept), shape (by structure), or
+        # expired (kept, but gone from the bucket, so by structure)
+        self.ui_compared = dict.fromkeys(("text", "shape", "expired"), 0)
+        self.bodies_expired = 0
+        self.shapes_outdated = 0  # recorded by another version of region_shape()
         # correlated values on both sides -> {name}
         self.masks: dict[str, str] = {}
         for c in journey.correlations:
@@ -408,19 +434,33 @@ class Comparison:
             text = re.sub(pattern, "<ignored>", text)
         return text
 
+    def page(self, step: Step, replayed: str | None) -> None:
+        """The region a step touched, after it ran: as text when its snapshot is held (an
+        asset the page was opted in for, or inline in a journey recorded before 1.1),
+        otherwise by structure."""
+        if replayed is None:
+            return
+        text = step.region
+        if text is None and step.region_asset:
+            raw = self.asset(step.region_asset)
+            text = raw.decode("utf-8", "replace") if raw is not None else None
+        if text is not None:
+            self.ui_compared["text"] += 1
+            self.ui(text, replayed, step.n)
+        elif step.region_shape is not None:
+            if self.j.region_shape_version != REGION_SHAPE_VERSION:
+                self.shapes_outdated += 1
+                return
+            self.ui_compared["expired" if step.region_asset else "shape"] += 1
+            self.ui_shape(step.region_shape, replayed, step.n)
+
     def ui(self, recorded: str | None, replayed: str | None, step: int) -> None:
         if recorded is None or replayed is None:
             return
         a, b = self.mask(recorded).splitlines(), self.mask(replayed).splitlines()
         if a == b:
             return
-        diff = [
-            line
-            for line in difflib.unified_diff(a, b, "source", "target", lineterm="", n=0)
-            if line[:1] in "+-" and not line.startswith(("+++", "---"))
-        ]
-        removed = [d[1:].strip() for d in diff if d.startswith("-")]
-        added = [d[1:].strip() for d in diff if d.startswith("+")]
+        diff, removed, added = _diff(a, b)
         self.emit(
             Comparator.UI,
             Kind.DIFFERENCE,
@@ -432,11 +472,73 @@ class Comparison:
             expected=self._value(removed[0] if removed else ""),
             actual=self._value(added[0] if added else ""),
             detail={
+                "compared": "text",
                 "lines_only_on_source": len(removed),
                 "lines_only_on_target": len(added),
                 **({"diff": diff[:40]} if self.o.show_values else {}),
             },
         )
+
+    def ui_shape(self, recorded: str, replayed: str, step: int) -> None:
+        """A page whose text was not kept, by structure (region_shape). Its lines hold no
+        values, so they are shown as they are; masks and ignore_text have no text here."""
+        a, b = recorded.splitlines(), region_shape(replayed).splitlines()
+        if a == b:
+            return
+        diff, removed, added = _diff(a, b)
+        self.emit(
+            Comparator.UI,
+            Kind.DIFFERENCE,
+            Severity.MEDIUM,
+            f"{self.j.journey_id} step {step}",
+            "page structure differs after the step",
+            step,
+            expected=removed[0] if removed else "",
+            actual=added[0] if added else "",
+            detail={
+                "compared": "shape",
+                "lines_only_on_source": len(removed),
+                "lines_only_on_target": len(added),
+                "diff": diff[:40],
+            },
+        )
+
+    def report_unkept(self) -> None:
+        """What the journey could not compare as recorded: content kept at recording that
+        the bucket has since expired (compared by structure and shape instead), and page
+        structures recorded by another build (not compared)."""
+        pages, bodies = self.ui_compared["expired"], self.bodies_expired
+        if pages or bodies:
+            what = [
+                f"{n} {noun}{'s' * (n > 1)} by {how}"
+                for n, noun, how in ((pages, "page", "structure"), (bodies, "response", "shape"))
+                if n
+            ]
+            # no "reason" key: a notice with one is listed as an exclusion
+            self.emit(
+                Comparator.UI,
+                Kind.NOTICE,
+                Severity.INFO,
+                self.j.journey_id,
+                "content kept at recording has expired (asset retention); compared "
+                + " and ".join(what),
+                detail={"snapshots_expired": pages, "bodies_expired": bodies},
+            )
+        if self.shapes_outdated:
+            n = self.shapes_outdated
+            self.emit(
+                Comparator.UI,
+                Kind.NOT_CHECKED,
+                Severity.LOW,
+                self.j.journey_id,
+                f"page structure after {n} step{'s' * (n > 1)} not compared: recorded by "
+                "another version of liftproof; record the journey again",
+                detail={
+                    "steps": n,
+                    "region_shape_version": self.j.region_shape_version,
+                    "this_version": REGION_SHAPE_VERSION,
+                },
+            )
 
     # ------------------------------------------------------------------- API
     def _endpoint(self, ex: Exchange) -> str:
@@ -513,6 +615,8 @@ class Comparison:
                     actual=b,
                 )
         recorded_body = self.asset(rec.body_asset) if rec.body_asset else None
+        if rec.body_asset and recorded_body is None:
+            self.bodies_expired += 1  # the bucket has expired it: compared by shape
         if recorded_body is not None and rep.json is not None:
             try:
                 expected = json.loads(recorded_body)
@@ -676,7 +780,8 @@ def compare_journey(
     assets_dir: Path | None,
 ) -> Comparison:
     """Emit every UI and API finding for one replayed journey, and one for each
-    correlation it left unresolved; returns the comparison, which counts the differences."""
+    correlation it left unresolved; returns the comparison, which counts the differences
+    and how each page was compared."""
 
     def asset(ref: str) -> bytes | None:
         if assets_dir is None:
@@ -702,7 +807,8 @@ def compare_journey(
                 expected=json.dumps(sr.degraded_from),
                 actual=json.dumps(sr.used_locator),
             )
-        cmp.ui(step.region, sr.region, step.n)
+        cmp.page(step, sr.region)
         cmp.api(step.exchanges, sr.exchanges, step.n)
     cmp.report_unresolved()
+    cmp.report_unkept()
     return cmp

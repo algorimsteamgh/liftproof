@@ -143,15 +143,17 @@
   <h2>Journeys</h2>
   {% set unresolved = r.findings | selectattr("detail.correlation", "defined") | list %}
   <div class="scroll"><table>
-    <tr><th>Journey</th><th>Story</th><th>Status</th><th class="num">Steps run</th><th class="num">Differences</th><th class="num">Attempts</th><th class="num">Flakes</th></tr>
+    <tr><th>Journey</th><th>Story</th><th>Status</th><th class="num">Steps run</th><th class="num">Differences</th><th class="num">Attempts</th><th class="num">Flakes</th><th class="num">Pages as text / structure</th></tr>
     {% for j in r.journeys %}
     {% set names = unresolved | selectattr("journey", "equalto", j.journey) | map(attribute="detail.correlation") | list %}
     <tr><td><code>{{ j.journey }}</code>{% if names %}<br><span class="sub">unresolved correlations: {{ names|join(", ") }}</span>{% endif %}</td><td>{{ j.story or "" }}</td>
       <td class="status-{{ j.status }}">{{ j.status|replace("_"," ") }}{% if j.browser_crashes %} (browser crashed{% if j.browser_crashes > 1 %} {{ j.browser_crashes }} times{% endif %}){% endif %}</td>
       <td class="num">{{ j.steps_run }} of {{ j.steps }}</td><td class="num">{{ j.differences }}</td>
-      <td class="num">{{ j.attempts }}</td><td class="num">{{ j.flakes }}</td></tr>
+      <td class="num">{{ j.attempts }}</td><td class="num">{{ j.flakes }}</td>
+      <td class="num">{% if j.ui_compared %}{{ j.ui_compared.text or 0 }} / {{ (j.ui_compared.shape or 0) + (j.ui_compared.expired or 0) }}{% if j.ui_compared.expired %} ({{ j.ui_compared.expired }} expired){% endif %}{% endif %}</td></tr>
     {% endfor %}
   </table></div>
+  <p class="sub">The page after each step is compared as text where <code>web.capture_snapshots</code> kept its snapshot, and otherwise by structure: roles, states and nesting, without the text. A kept snapshot past the bucket's asset retention has expired and is compared by structure.</p>
   <h2>Response times, source and AWS</h2>
   <p class="sub">Recorded for comparison only; a slower response is never a pass or fail condition on its own.</p>
   <div class="scroll"><table>

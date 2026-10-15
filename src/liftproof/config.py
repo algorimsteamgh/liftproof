@@ -61,12 +61,14 @@ class StoreConfig:
 @dataclass
 class WebConfig:
     """Record and replay settings (spec 5 to 8). Bodies are kept only for capture_bodies
-    URL patterns; everything else is reduced to a hash and a shape."""
+    URL patterns, and page snapshots only for capture_snapshots patterns (matched on the
+    page a step ended on); everything else is reduced to a hash and a shape."""
 
     source_url: str
     target_url: str | None = None
     journeys: list[str] | None = None  # default: every recorded journey
     capture_bodies: list[str] = field(default_factory=list)
+    capture_snapshots: list[str] = field(default_factory=list)
     compare_headers: list[str] = field(default_factory=list)
     ignore_json_paths: list[str] = field(default_factory=list)
     ignore_text: list[str] = field(default_factory=list)
@@ -255,6 +257,7 @@ def _web(d: Any) -> WebConfig | None:
         target_url=d.get("target_url"),
         journeys=strings("journeys") or None,
         capture_bodies=strings("capture_bodies"),
+        capture_snapshots=strings("capture_snapshots"),
         compare_headers=strings("compare_headers"),
         ignore_json_paths=strings("ignore_json_paths"),
         ignore_text=strings("ignore_text"),
@@ -442,6 +445,8 @@ web:                            # record and replay; omit for database only proj
   source_url: https://app.example.internal
   target_url: https://app.example.com
   capture_bodies: ["/api/*"]    # bodies kept for value comparison; others: hash and shape
+  capture_snapshots: []         # pages whose text is kept for comparison, e.g. ["/orders/*"];
+                                # others: hash and structure. Kept ones expire with the bucket
   compare_headers: []           # only these response headers are compared
   ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag";
                                 # [*] is every element: "$.orders[*].updated_at"
