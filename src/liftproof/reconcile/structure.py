@@ -8,7 +8,8 @@ is kept when the target enforces uniqueness of the same columns or of fewer of t
 primary key moved to a surrogate column, with the old key still unique, is no difference.
 An index is compared as a B-tree: it is there when a B-tree index or the primary key of
 the target starts with its columns, in order. Partial and expression indexes, and other
-kinds (GIN, full text, bitmap), are named, not compared.
+kinds (GIN, full text, bitmap), are named, not compared; a partial unique index is a key
+lost when the target enforces uniqueness of neither its columns nor fewer of them.
 """
 
 from __future__ import annotations
@@ -99,12 +100,12 @@ def compare_structure(
         return check in on and cs <= names[1 - side] and not cs & (excluded | accepted[check])
 
     ref = reference_name
-    keys, lost = _keys(reference, target, compared, ref)
+    keys, lost, gone = _keys(reference, target, compared, ref)
     out = _nullability(reference, target, compared, ref, lost) + keys
     if reference.foreign_keys is not None and target.foreign_keys is not None:
         out += _foreign_keys(reference, target, compared, ref, schema_map or {})
     if reference.indexes is not None and target.indexes is not None:
-        out += _indexes(reference, target, compared)
+        out += _indexes(reference, target, compared, gone)
     return out
 
 
@@ -164,11 +165,13 @@ def _within(columns: Iterable[str], group: list[Unique]) -> Unique | None:
 
 def _keys(
     reference: TableSchema, target: TableSchema, compared: Compared, ref: str
-) -> tuple[list[StructureIssue], set[str]]:
+) -> tuple[list[StructureIssue], set[str], set[Index]]:
     """The unique keys of the reference the target no longer enforces, and the target's
-    the reference did not; also the columns of a primary key lost."""
+    the reference did not; also the columns of a primary key lost and the partial unique
+    indexes of the reference lost."""
     out: list[StructureIssue] = []
     lost: set[str] = set()
+    gone: set[Index] = set()
     # with the target's unique keys unknown, only a primary key is held against it
     ours = _unique(reference, ("btree",) if target.indexes is not None else ())
     theirs = _unique(target, ("btree",))
@@ -227,7 +230,31 @@ def _keys(
             )
         )
     if reference.indexes is None or target.indexes is None:
-        return out, lost
+        return out, lost, gone
+    # a partial unique key is unique only where its condition holds: any unique key of the
+    # target on its columns or fewer may keep it, condition not compared; none loses it
+    for label, columns, index in _unique(reference, ("partial",)):
+        if (
+            index is None
+            or not compared("keys", columns, 0)
+            or _within(columns, ours) is not None  # reported as the key that implies it
+            or _within(columns, theirs + partial) is not None
+        ):
+            continue
+        gone.add(index)
+        key = f"partial {label} ({_list(columns)})"
+        detail = {"constraint": f"partial {label}", "columns": list(columns), "index": index.name}
+        out.append(
+            StructureIssue(
+                "key_missing_in_target",
+                Kind.DIFFERENCE,
+                Severity.MEDIUM,
+                f"{key} is not enforced on the target",
+                expected=key,
+                actual="not unique",
+                detail=detail,
+            )
+        )
     implied = ours + _unique(reference, ("partial",))
     for label, columns, _ in theirs:
         if compared("keys", columns, 1) and _within(columns, implied) is None:
@@ -242,7 +269,7 @@ def _keys(
                     detail={"constraint": label, "columns": list(columns)},
                 )
             )
-    return out, lost
+    return out, lost, gone
 
 
 def _foreign_keys(
@@ -302,15 +329,16 @@ def _orders(schema: TableSchema) -> list[tuple[str, ...]]:
 
 
 def _indexes(
-    reference: TableSchema, target: TableSchema, compared: Compared
+    reference: TableSchema, target: TableSchema, compared: Compared, gone: set[Index]
 ) -> list[StructureIssue]:
     """The reference's B-tree indexes the target has no B-tree for, those the target has
-    and the reference does not, and the reference's indexes that are not compared. A
-    unique index is compared as a key, so only as an order here."""
+    and the reference does not, and the reference's indexes that are not compared, but
+    for the partial unique ones in `gone`, reported as keys lost. A unique index is compared
+    as a key, so only as an order here."""
     out: list[StructureIssue] = []
     for i in reference.indexes or []:
         check = "keys" if i.unique else "indexes"
-        if i.kind != "btree" and compared(check, i.columns, 0):
+        if i.kind != "btree" and i not in gone and compared(check, i.columns, 0):
             out.append(
                 StructureIssue(
                     "index_not_compared",

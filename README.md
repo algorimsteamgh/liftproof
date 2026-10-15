@@ -139,8 +139,10 @@ a surrogate column and kept the old key unique still enforces it; a partitioned 
 whose key now includes the partition column does not. A foreign key matches on its
 column pairs and the table it refers to, its schema mapped by `schema_map`. Partial and
 expression indexes and other kinds (GIN, BRIN, hash, full text, spatial, bitmap,
-columnstore, XML) are listed in the report's exclusions, not compared. A table whose
-structure differs is marked so in the report's tables; its status is its data's.
+columnstore, XML) are listed in the report's exclusions, not compared; but a partial
+unique index is a unique key lost when the target has no unique key on its columns or on
+fewer of them. A table whose structure differs is marked so in the report's tables; its
+status is its data's.
 
 An AWS DMS full load creates tables without secondary indexes or foreign keys. Turn off
 what is built after the load, for the whole project, or accept one difference with a

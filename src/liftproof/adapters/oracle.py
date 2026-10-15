@@ -554,8 +554,10 @@ class OracleAdapter(Adapter):
         return out
 
     def _indexes(self, table: TableRef) -> list[Index]:
-        """The usable indexes. A descending column is stored as an expression naming it
-        ("A"), so such an index is still a B-tree over its columns."""
+        """The usable indexes: a partitioned one keeps its status per partition or
+        subpartition, and one unusable leaves the index out. A descending column is stored
+        as an expression naming it ("A"), so such an index is still a B-tree over its
+        columns."""
         found: dict[str, tuple[bool, str, list[str | None]]] = {}
         for name, uniqueness, itype, column, expression in self._query(
             "SELECT i.INDEX_NAME, i.UNIQUENESS, i.INDEX_TYPE, ic.COLUMN_NAME, "
@@ -564,7 +566,12 @@ class OracleAdapter(Adapter):
             "LEFT JOIN ALL_IND_EXPRESSIONS ie ON ie.INDEX_OWNER = ic.INDEX_OWNER "
             "AND ie.INDEX_NAME = ic.INDEX_NAME AND ie.COLUMN_POSITION = ic.COLUMN_POSITION "
             "WHERE i.TABLE_OWNER = :1 AND i.TABLE_NAME = :2 AND i.INDEX_TYPE <> 'LOB' "
-            "AND i.STATUS <> 'UNUSABLE' ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION",
+            "AND i.STATUS <> 'UNUSABLE' AND (i.PARTITIONED = 'NO' OR NOT EXISTS "
+            "(SELECT 1 FROM ALL_IND_PARTITIONS p WHERE p.INDEX_OWNER = i.OWNER "
+            "AND p.INDEX_NAME = i.INDEX_NAME AND p.STATUS = 'UNUSABLE') AND NOT EXISTS "
+            "(SELECT 1 FROM ALL_IND_SUBPARTITIONS p WHERE p.INDEX_OWNER = i.OWNER "
+            "AND p.INDEX_NAME = i.INDEX_NAME AND p.STATUS = 'UNUSABLE')) "
+            "ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION",
             [table.schema, table.name],
         ):
             if expression is not None:

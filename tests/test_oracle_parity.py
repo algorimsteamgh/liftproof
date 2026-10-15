@@ -345,6 +345,27 @@ def test_describe_reads_nullability_keys_and_indexes(make_oracle_db, oracle_adap
     ]
 
 
+def test_describe_leaves_out_indexes_with_unusable_partitions(make_oracle_db, oracle_adapter_for):
+    """A partitioned index keeps its status per partition (ALL_INDEXES says N/A), or per
+    subpartition when the table is composite partitioned."""
+    schema, cur = make_oracle_db()
+    for ddl in (
+        "CREATE TABLE part (id NUMBER(10), at DATE NOT NULL, v NUMBER(10), w NUMBER(10), "
+        "CONSTRAINT part_pk PRIMARY KEY (id, at)) PARTITION BY RANGE (at) "
+        "SUBPARTITION BY HASH (id) SUBPARTITIONS 2 "
+        "(PARTITION p1 VALUES LESS THAN (DATE '2026-01-01'), "
+        "PARTITION p2 VALUES LESS THAN (MAXVALUE))",
+        "CREATE INDEX part_v ON part (v) LOCAL",
+        "CREATE INDEX part_w ON part (w) GLOBAL PARTITION BY HASH (w) (PARTITION w1, PARTITION w2)",
+        "CREATE INDEX part_vw ON part (v, w) LOCAL",
+        "ALTER INDEX part_v UNUSABLE",  # each subpartition
+        "ALTER INDEX part_w MODIFY PARTITION w2 UNUSABLE",  # one partition is enough
+    ):
+        cur.execute(ddl)
+    s = oracle_adapter_for().describe(TableRef(schema, "PART"))
+    assert s.indexes == [Index("PART_VW", ("V", "W"), False)]
+
+
 def test_canonical_type_rules():
     assert canonical_type("NUMBER", None, 0) is T.INTEGER  # INTEGER
     assert canonical_type("NUMBER", 5, -2) is T.INTEGER

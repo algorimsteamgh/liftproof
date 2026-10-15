@@ -119,6 +119,26 @@ def test_a_filtered_unique_index_keeps_a_nullable_unique_key_at_low():
     [named] = compare_structure(ms, pg)
     assert (named.issue, named.kind, named.detail["structure"]) == ("index_not_compared", NOTE,
                                                                    "keys")  # fmt: skip
+    assert _issues(ms, ms) == [("index_not_compared", INFO, NOTE)]
+
+
+def test_a_partial_unique_key_the_target_enforces_no_way_is_lost():
+    """Whatever its condition, a target with no unique key on those columns refuses none of
+    the duplicates the reference refused."""
+    ms = _t("id", ("email", True), indexes=[Index("ux_email", ("email",), True, "partial")])
+    [lost] = compare_structure(ms, _t("id", ("email", True), indexes=[]))
+    assert (lost.issue, lost.kind, lost.severity) == ("key_missing_in_target", DIFF, MEDIUM)
+    assert lost.summary == "partial unique key ux_email (email) is not enforced on the target"
+    assert (lost.expected, lost.actual) == ("partial unique key ux_email (email)", "not unique")
+    assert lost.detail == {"constraint": "partial unique key ux_email", "columns": ["email"],
+                           "index": "ux_email"}  # fmt: skip
+    # unknown on the target (an older baseline), switched off, or implied by a full key
+    assert _issues(ms, _t("id", ("email", True), known=False)) == []
+    assert _issues(ms, _t("id", ("email", True)), checks=StructureChecks(keys=False)) == []
+    full, part = Index("uq_email", ("email",), True), Index("ux", ("email", "a"), True, "partial")
+    both = _t("id", ("email", True), "a", indexes=[full, part])
+    assert _issues(both, _t("id", ("email", True), "a", indexes=[])) == [
+        ("key_missing_in_target", MEDIUM, DIFF), ("index_not_compared", INFO, NOTE)]  # fmt: skip
 
 
 def test_an_index_is_there_when_a_target_btree_starts_with_its_columns():
