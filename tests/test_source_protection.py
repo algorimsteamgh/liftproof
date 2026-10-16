@@ -464,7 +464,7 @@ def test_a_capped_sql_server_connection_hashes_alike_on_one_core(
 
 
 @pytest.mark.oracle
-def test_oracle_accepts_the_settings_and_reads_serially(oracle_adapter_for):
+def test_oracle_accepts_the_settings_and_reads_serially(oracle_available, oracle_adapter_for):
     a = oracle_adapter_for(lock_timeout_ms=200, rows_per_second=1000, pause_ms=20)
     settings = a.session_settings()
     assert settings["lock_timeout"].startswith("not applicable")

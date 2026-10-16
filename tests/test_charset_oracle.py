@@ -257,4 +257,61 @@ def test_a_national_character_key_outside_the_database_set_is_drilled_into(tmp_p
     result, findings = _reconcile(tmp_path, a, schema, pg)
     [nkeys] = [t for t in result.tables if t.table.upper().endswith(".NKEYS")]
     assert nkeys.changed_rows == 3
-    assert _shown(findings, "NKEYS") == {("V", "Ω7, ☕"), ("V", "plain8, ☕"), ("V", "Ω9, a")}
+    # keys in canonical order (F, K), as the locator names them
+    assert _shown(findings, "NKEYS") == {("V", "☕, Ω7"), ("V", "☕, plain8"), ("V", "a, Ω9")}
+
+
+class _Cursor:
+    """Records what fetch_rows sends and answers with fixed rows."""
+
+    def __init__(self, sent, rows):
+        self.sent, self.rows = sent, rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def setinputsizes(self, *sizes):
+        self.sent.append(("sizes", sizes))
+
+    def execute(self, q, args):
+        self.sent.append(("execute", q, list(args)))
+
+    def fetchall(self):
+        return self.rows
+
+
+class _Conn:
+    def __init__(self, rows):
+        self.sent, self.rows = [], rows
+
+    def cursor(self):
+        return _Cursor(self.sent, self.rows)
+
+
+def test_national_key_binds_line_up_with_their_placeholders():
+    """Runs without a server: a key of VARCHAR2, NCHAR and NVARCHAR2 columns binds each
+    national value, and only those, as NVARCHAR, in the order of the placeholders."""
+    import oracledb
+
+    table = TableRef("S", "T")
+    a = object.__new__(oracle.OracleAdapter)
+    a._natives = {table: {"CODE": "VARCHAR2", "F": "NCHAR", "K": "NVARCHAR2", "V": "VARCHAR2"}}
+    a.conn = _Conn([("a", "☕", "Ω7", "a", "☕   ", "Ω7", "v7")])
+    plan = HashPlan(table, [("CODE", T.TEXT), ("F", T.CHAR), ("K", T.TEXT), ("V", T.TEXT)],
+                    ["CODE", "F", "K"], 1)  # fmt: skip
+    rows = a.fetch_rows(plan, [("a", "☕", "Ω7"), ("b", "x", "y")])
+    assert rows == {("a", "☕", "Ω7"): ["a", "☕   ", "Ω7", "v7"]}
+    [(_, sizes), (_, q, args)] = a.conn.sent
+    nv = oracledb.DB_TYPE_NVARCHAR
+    assert sizes == (None, nv, nv, None, nv, nv)
+    assert args == ["a", "☕", "Ω7", "b", "x", "y"]
+    keys = 'TO_CHAR("CODE"), RTRIM("F", \' \'), "K"'
+    assert q.startswith(f"SELECT {keys}, ")
+    assert q.endswith(f"WHERE ({keys}) IN ((:1, :2, :3), (:4, :5, :6))")
+
+    a.conn = _Conn([])
+    a.fetch_rows(HashPlan(table, plan.columns, ["CODE"], 1), [("a",)])
+    assert [s[0] for s in a.conn.sent] == ["execute"]  # no national key: no sizes set
