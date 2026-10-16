@@ -104,13 +104,18 @@ def test_schedule_config_rules(tmp_path):
 # --------------------------------------------------------------------- run lock
 def test_local_lock_excludes_a_second_run(tmp_path):
     path = tmp_path / "locks" / "run.lock"
+    assert LocalRunLock(path, "r-x", "report").holder() is None
     with LocalRunLock(path, "r-1", "validate"):
         with pytest.raises(RunInProgress) as exc, LocalRunLock(path, "r-2", "reconcile"):
             pass
         assert exc.value.holder["run_id"] == "r-1"
         assert "r-1 (validate)" in str(exc.value)
+        assert LocalRunLock(path, "r-x", "report").holder()["run_id"] == "r-1"
+    assert LocalRunLock(path, "r-x", "report").holder() is None
     with LocalRunLock(path, "r-3", "validate"):  # released: free again
         pass
+    path.write_text(json.dumps({"run_id": "r-dead"}))  # a process that died holds nothing
+    assert LocalRunLock(path, "r-x", "report").holder() is None
 
 
 @pytest.fixture
@@ -132,11 +137,13 @@ def test_s3_lock(s3):
     def lock(run_id, lease=900):
         return S3RunLock(s3, "acme-runs", key, run_id, "validate", lease, put_args={})
 
+    assert lock("r-x").holder() is None
     first = lock("r-1")
     with first:
         with pytest.raises(RunInProgress) as exc, lock("r-2"):
             pass
         assert exc.value.holder["run_id"] == "r-1"
+        assert lock("r-x").holder()["run_id"] == "r-1"
         first.renew()  # the heartbeat: a conditional put on our own ETag
         stale = lock("r-1")
         stale.etag = '"not-the-current-etag"'
@@ -148,6 +155,7 @@ def test_s3_lock(s3):
     # a lost run's lock is taken over once its lease has expired
     lost = lock("r-lost", lease=-1)
     lost.acquire()
+    assert lock("r-x").holder() is None
     taker = lock("r-new")
     with taker:
         assert taker.body["took_over"] == "r-lost"

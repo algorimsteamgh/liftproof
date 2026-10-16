@@ -152,6 +152,15 @@ def project_summary(project: Project) -> dict[str, Any]:
             "source_url": project.web.source_url,
             "target_url": project.web.target_url,
             "journeys": project.web.journeys,
+            "ignore_regions": [
+                {
+                    "selector": r.selector,
+                    "source_selector": r.source_selector,
+                    "target_selector": r.target_selector,
+                    "reason": r.reason,
+                }
+                for r in project.web.ignore_regions
+            ],
         },
         "file_sets": [f.name for f in project.files],
         "schedules": [

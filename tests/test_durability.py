@@ -1,6 +1,7 @@
 """Nothing irreplaceable stays on the instance (spec 3, 9.16 and 18). A reconciliation or
 a baseline that loses its instance halfway resumes on a replacement pointed at the same
-bucket, and the replacement finds the projects, journeys and run history again.
+bucket, a replay leaves the journeys it finished for the report, and the replacement
+finds the projects, journeys and run history again.
 
 "Losing the instance" here is an exception that no handler in the product catches,
 followed by deleting the whole work directory; the replacement gets a new one.
@@ -8,7 +9,9 @@ followed by deleting the whole work directory; the replacement gets a new one.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
+import os
 import shutil
 from collections import Counter
 
@@ -22,7 +25,11 @@ from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_RUN_FAILED
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, read_findings
 from liftproof.reconcile import baseline as baseline_mod
 from liftproof.reconcile.engine import REASON_STOPPED, Reconciler
+from liftproof.report.builder import who_ran_it
 from liftproof.store import S3Store
+from liftproof.web import run as webrun
+from liftproof.web.run import JourneyResult, WebResult
+from tests import fakereplay
 from tests.conftest import PG
 
 BUCKET = "acme-mvt"
@@ -315,6 +322,202 @@ def test_a_failed_segment_copy_does_not_stop_the_run(tmp_path):
     uploads(seg)  # fails, logged
     assert uploads.done == set()
     assert uploads.catch_up([seg]) and uploads.done == {seg.name}
+
+
+@pytest.fixture
+def web_project(tmp_path):
+    """Web only, four journeys recorded on this instance, each finding one difference."""
+    path = tmp_path / "projects" / "acme.yaml"
+    path.parent.mkdir()
+    path.write_text(yaml.safe_dump({"project": "acme", "web": {
+        "source_url": "http://source.invalid", "target_url": "http://target.invalid"}}))
+    return path
+
+
+def _journeys_on(work, *ids: str) -> None:
+    for jid in ids:
+        fakereplay.journey(jid).save(work / "acme" / "journeys" / f"{jid}.json")
+
+
+def _stop_replay_at(monkeypatch, journey_id: str, error: BaseException) -> None:
+    def replay_one(j):
+        if j.journey_id == journey_id:
+            raise error
+        return fakereplay.replayed(j)
+
+    fakereplay.no_browser(monkeypatch, replay_one)
+
+
+def test_a_lost_replay_reports_what_it_finished_on_a_replacement(tmp_path, web_project,
+                                                                  monkeypatch, s3):  # fmt: skip
+    first, second = tmp_path / "first", tmp_path / "second"
+    _journeys_on(first, "j1", "j2", "j3", "j4")
+    _checkpoint_times(monkeypatch, True, True)  # after j1 and after j2
+    _stop_replay_at(monkeypatch, "j3", InstanceLost())
+    monkeypatch.setenv("LIFTPROOF_INVOKED_BY", "ui:Hema")
+    with pytest.raises(InstanceLost):
+        _main("replay", "--project", str(web_project), "--workdir", str(first), "--run-id", "r1",
+              "--show-values", "--scheduled", "nightly")  # fmt: skip
+    shutil.rmtree(first)
+    monkeypatch.delenv("LIFTPROOF_INVOKED_BY")
+
+    saved = json.loads(s3.get_object(Bucket=BUCKET, Key="acme/runs/r1/web-results.json")["Body"]
+                       .read())  # fmt: skip
+    assert not saved["complete"]
+    assert [(j["journey"], j["status"]) for j in saved["journeys"]] == [
+        ("j1", "different"), ("j2", "different"), ("j3", "not_run"), ("j4", "not_run")]
+    stored = tmp_path / "from-store"
+    stored.mkdir()
+    for key in _keys(s3, "acme/runs/r1/findings-"):
+        s3.download_file(BUCKET, key, str(stored / key.rsplit("/", 1)[1]))
+    assert {f.journey for f in read_findings(stored) if f.kind == Kind.DIFFERENCE} == {"j1", "j2"}
+
+    # the replacement holds nothing of the run; its report comes from the store
+    code = _main("report", "--project", str(web_project), "--workdir", str(second),
+                 "--run", "r1")  # fmt: skip
+    assert code == EXIT_RUN_FAILED
+    report = json.loads((second / "acme/runs/r1/report.json").read_text())
+    assert (report["mode"], report["verdict"], report["failure"]) == (
+        "replay", "failed", cli.UNFINISHED)
+    started = json.loads((second / "acme/runs/r1" / ckpt.RUN_INFO).read_text())["started_at"]
+    assert report["run"]["started_at"] == started
+    assert report["run"]["finished_at"] >= started
+    # as it ran: page text was shown, and the schedule started it, not the rebuild
+    assert report["classification"] == "contains row values" and report["run"]["values_shown"]
+    assert report["run"]["invoked_by"].startswith("ui:Hema@")
+    assert report["run"]["schedule"] == "nightly"
+    assert report["run"]["regenerated"]["by"] == who_ran_it()
+    assert report["coverage"]["journeys_coverage_pct"] == 50
+    assert [j["status"] for j in report["journeys"]] == ["different"] * 2 + ["not_run"] * 2
+    assert report["coverage"]["not_covered"] == [
+        {"object": "journey j3", "reason": webrun.REASON_STOPPED},
+        {"object": "journey j4", "reason": webrun.REASON_STOPPED}]
+    assert {f["journey"] for f in report["findings"] if f["kind"] == "difference"} == {"j1", "j2"}
+    assert "acme/runs/r1/report.json" in _keys(s3, "acme/runs/r1/")
+
+
+def test_a_report_waits_for_its_run_to_end(tmp_path, web_project, monkeypatch, capsys, s3):
+    here, there = tmp_path / "here", tmp_path / "there"
+    _journeys_on(here, "j1", "j2", "j3", "j4")
+    report = ["report", "--project", str(web_project), "--workdir", str(there), "--run", "r1"]
+    asked: list[tuple[int, bool]] = []  # its exit code, and whether a report was stored
+
+    def replay_one(j):
+        if j.journey_id == "j3":  # another instance asks for the report while the run goes
+            code = _main(*report)
+            asked.append((code, "acme/runs/r1/report.json" in _keys(s3, "acme/runs/r1/")))
+        return fakereplay.replayed(j)
+
+    fakereplay.no_browser(monkeypatch, replay_one)
+    assert _main("replay", "--project", str(web_project), "--workdir", str(here),
+                 "--run-id", "r1") == EXIT_DIFFERENCES  # fmt: skip
+    assert asked == [(EXIT_RUN_FAILED, False)]
+    assert "run r1 is in progress" in capsys.readouterr().err
+    assert not (there / "acme/runs/r1").exists()
+
+    # once it has ended, the other instance regenerates the run's own report
+    assert _main(*report) == EXIT_DIFFERENCES
+    stored = json.loads(s3.get_object(Bucket=BUCKET, Key="acme/runs/r1/report.json")["Body"]
+                        .read())  # fmt: skip
+    assert stored["failure"] is None and "regenerated" in stored["run"]
+    assert [j["status"] for j in stored["journeys"]] == ["different"] * 4
+
+
+def test_a_report_follows_a_run_resumed_elsewhere(tmp_path, project, monkeypatch, s3):
+    first, second, third = tmp_path / "first", tmp_path / "second", tmp_path / "third"
+    original = Reconciler._table
+    _checkpoint_times(monkeypatch, True, True, False)
+    _lose_instance_at(monkeypatch, "t3", [])
+    with pytest.raises(InstanceLost):
+        _main("reconcile", "--project", str(project), "--workdir", str(first), "--run-id", "r1")
+    shutil.rmtree(first)
+    argv = ["--project", str(project), "--workdir", str(second)]
+    assert _main("report", *argv, "--run", "r1") == EXIT_RUN_FAILED  # what the run left
+    listed = tmp_path / "listing" / "acme" / "runs"  # an instance listing the run history
+    store = cli._store(cli.load_project(project), second)
+    cli.sync_reports(store, listed)
+    an_hour_ago = dt.datetime.now(dt.UTC).timestamp() - 3600
+    for f in [*(second / "acme/runs/r1").iterdir(), listed / "r1/report.json"]:
+        os.utime(f, (an_hour_ago, an_hour_ago))
+
+    # resumed elsewhere: the copies those two instances hold are now older than the store's
+    monkeypatch.setattr(Reconciler, "_table", original)
+    assert _main("reconcile", "--project", str(project), "--workdir", str(third),
+                 "--resume") == EXIT_DIFFERENCES  # fmt: skip
+    cli.sync_reports(store, listed)
+    assert json.loads((listed / "r1/report.json").read_text())["failure"] is None
+    assert _main("report", *argv, "--run", "r1") == EXIT_DIFFERENCES
+    report = json.loads((second / "acme/runs/r1/report.json").read_text())
+    assert report["failure"] is None
+    assert [t["status"] for t in report["tables"]] == ["different"] * 4
+    ids = [f["finding_id"] for f in report["findings"]]
+    assert len(ids) == len(set(ids))  # the segment the resume voided is read empty
+    stored = json.loads(s3.get_object(Bucket=BUCKET, Key="acme/runs/r1/report.json")["Body"]
+                        .read())  # fmt: skip
+    assert stored["failure"] is None
+
+
+@pytest.mark.usefixtures("s3")
+def test_a_failed_replay_reports_what_it_finished(tmp_path, web_project, monkeypatch):
+    work = tmp_path / "w"
+    _journeys_on(work, "j1", "j2", "j3", "j4")
+    _stop_replay_at(monkeypatch, "j3", RuntimeError("Browser has been closed"))
+    argv = ["--project", str(web_project), "--workdir", str(work)]
+    assert _main("replay", *argv, "--run-id", "r2") == EXIT_RUN_FAILED
+    report = json.loads((work / "acme/runs/r2/report.json").read_text())
+    assert report["coverage"]["journeys_coverage_pct"] == 50
+    assert report["counts"]["journeys"] == 4 and report["counts"]["not_checked"] == 2
+    assert {f["journey"] for f in report["findings"] if f["kind"] == "difference"} == {"j1", "j2"}
+    assert any(f["summary"].startswith("run did not complete: RuntimeError")
+               for f in report["findings"])  # fmt: skip
+    journeys = [c for c in report["coverage"]["not_covered"] if c["object"].startswith("journey")]
+    assert journeys == [{"object": "journey j3", "reason": webrun.REASON_STOPPED},
+                        {"object": "journey j4", "reason": webrun.REASON_STOPPED}]  # fmt: skip
+    # regenerating carries the run's own "stopped" entries over, and none is a journey's
+    assert _main("report", *argv, "--run", "r2") == EXIT_RUN_FAILED
+    again = json.loads((work / "acme/runs/r2/report.json").read_text())
+    assert again["coverage"]["not_covered"] == report["coverage"]["not_covered"]
+
+
+def test_a_replay_checkpoint_waits_for_its_findings(tmp_path):
+    class Flaky(S3Store):
+        def __init__(self, failures):
+            self.failures, self.keys = failures, []
+
+        def put_file(self, key, path):
+            if self.failures:
+                self.failures -= 1
+                from liftproof.errors import RunFailed
+
+                raise RunFailed("S3 write failed")
+            self.keys.append(key)
+
+    store = Flaky(failures=2)  # the segment as it closes, and again as the checkpoint checks
+    uploads = ckpt.SegmentUploads(store, "r")
+    writer = FindingWriter(tmp_path, "r", on_segment=uploads)
+    checkpoint = ckpt.ReplayCheckpoint(store, tmp_path, "r", writer, uploads)
+    writer.write(Finding(Comparator.UI, Kind.DIFFERENCE, 50, "j1 step 1", "x", journey="j1"))
+    result = WebResult([JourneyResult("j1", None, "different", 1, 1, 1, 0, 1, 40.0, 60.0)],
+                       complete=False)  # fmt: skip
+    checkpoint.save(result)
+    assert store.keys == [] and not (tmp_path / ckpt.WEB_RESULTS).exists()
+    checkpoint.save(result)
+    assert store.keys == ["runs/r/findings-00001.jsonl", "runs/r/web-results.json"]
+    assert WebResult.from_dict(json.loads((tmp_path / ckpt.WEB_RESULTS).read_text())) == result
+
+
+def test_a_copy_from_the_store_keeps_when_it_was_written(tmp_path, s3):
+    s3.put_object(Bucket=BUCKET, Key="acme/runs/r1/run.json", Body=b"{}")
+    written = dt.datetime(2026, 10, 1, 9, 30, tzinfo=dt.UTC)
+
+    class Client:  # moto stamps objects with the time they were put
+        def get_object(self, **kw):
+            return {**s3.get_object(**kw), "LastModified": written}
+
+    local = tmp_path / "r1" / "run.json"
+    assert S3Store(BUCKET, "acme", client=Client()).get_file("runs/r1/run.json", local)
+    assert local.stat().st_mtime == written.timestamp()
+    assert cli._last_activity(local.parent) == "2026-10-01T09:30:00Z"  # a stopped run's end
 
 
 def test_list_keys(s3):

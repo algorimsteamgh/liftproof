@@ -45,10 +45,57 @@ liftproof validate --project acme.yaml                  # reconcile, then replay
 ```
 
 `record` opens a Chromium window on `web.source_url`; carry out the journey and close the
-window. Passwords become random tokens before anything is written; `bind` points each
-token at a Secrets Manager secret for replay. Values the server generates (order ids,
+window. Typing an address, Back, Forward and Reload in that window are steps too; a
+navigation the page makes itself (a link, a form, a redirect) is part of the step that
+caused it. `record` warns about a step to check: an address on another site, which replay
+opens from the instance, a Reload or Back that sent a form again (Chromium does not ask),
+and a Back whose count it could not be sure of. Passwords become random tokens before
+anything is written; `bind` points each token at a Secrets Manager secret for replay. Values the server generates (order ids,
 CSRF tokens, ASP.NET view state) are detected as correlations, substituted forward at
-replay, and never reported as differences.
+replay, and never reported as differences. A correlation the replay could not carry
+forward (its rule found nothing in the target's response, the value would not decode, the
+request that returns it never came) is named in the report with why, and each difference
+it explains says so, so you know which rule to fix. A candidate nobody confirmed is named
+once the target sent a different value and a request where recording saw it reused sent
+the recorded one. A header rule cannot read a redacted header (`x-csrf-token`,
+`authorization`): take the value from the body. A journey that fails to replay is a
+finding and the replay goes on with the next. If the browser crashes, the journey it was
+running is retried once in a new browser, then recorded as an error; the report's journey
+table says which journeys hit a crash. A retry never submits a write twice: once a
+journey has sent one (a sign in, an order), only a transport or timing failure or a crash
+runs it again, and not even that after the target answered one of its writes with an
+error.
+
+Each response is compared by status and by shape, and value by value only for bodies
+kept under `web.capture_bodies`. The shape goes into arrays: a field missing from every
+order the target returned (`$.orders[*].total`), or a number turned string, fails the
+run; a field only some orders have, or a value where every one was null, is what other
+data looks like too, so it is a low difference. In `web.ignore_json_paths`, `[*]` is
+every element: `GET /api/orders $.orders[*].updated_at`.
+
+The page each step ends on is compared as text (its accessible tree, with dates, ids and
+`web.ignore_text` masked) only when its path matches a `web.capture_snapshots` pattern,
+such as `["/orders/*"]`: page snapshots are default deny, like bodies. Every other page
+is compared by structure: the roles, states (checked, disabled, expanded, level) and
+nesting of its elements and whether each has a name or text, never the text itself. A
+missing button or an unticked box is reported there; a relabelled button or a changed
+status is not, and `web.ignore_text` has nothing to mask. Kept snapshots and bodies go to
+the bucket under `journeys/<id>/assets/` and expire after its asset retention
+(`asset_retention_days`, `AssetRetentionDays` in CloudFormation); a later replay then
+compares that page by structure and that response by shape, and says so in a notice.
+The report's journey table counts the pages compared each way. Replay and `bind` read
+the journey from the bucket, so one recorded again on another machine replaces the
+instance's copy, and a replay deletes the instance's copies of what the bucket has expired.
+
+Parts of a page expected to differ (a greeting with the user's name, recently viewed
+items, an advert) are left out with `web.ignore_regions`: a CSS selector and a reason,
+which the report prints, such as `{selector: ".recently-viewed", reason: personalised}`,
+or `source_selector` and `target_selector` where the markup differs. Any element the
+application marks `data-liftproof-volatile` is left out the same way. A rule leaves its
+part out of the text and the structure on both sides, so a journey is compared with the
+rules it was recorded with: a rule added later applies once the journey is recorded
+again, and the report says which journeys that is. A selector that matches the page's
+main element leaves nothing to compare, and the step is reported as not checked.
 
 ## Files
 
@@ -87,8 +134,9 @@ pipelines start runs through the SSM document; see [docs/pipelines.md](docs/pipe
 
 Nothing irreplaceable stays on the instance. Every run copies its project file to the
 bucket; a reconciliation sends its findings there at least every minute and checkpoints
-its finished tables, and a baseline checkpoints its manifest the same way. On a
-replacement instance pointed at the same bucket, `mvt-restore.service` writes the
+its finished tables, a replay writes each journey's findings as the journey finishes and
+checkpoints the finished journeys, and a baseline checkpoints its manifest the same way.
+On a replacement instance pointed at the same bucket, `mvt-restore.service` writes the
 project files back at first boot, `liftproof runs` and the UI list every run and journey
 in the bucket, and an interrupted run carries on from its last checkpoint:
 
@@ -104,6 +152,14 @@ resumed. Against a live source, the tables compared after the resume are read as
 resume. The lost instance's run lock expires 15 minutes after its last renewal; until
 then a resume is refused with exit code 2. A run that fails rather than stops names each
 table, file set and journey it never reached as not checked.
+
+A replay is never resumed, as its journeys created data on the target. The journeys it
+finished keep their findings and results; those it had not finished are listed as not
+run. `liftproof report --run ID` builds the report of a run that stopped, on any instance,
+from what reached the bucket, and that report reads as failed; it keeps who started the
+run, its schedule and whether it showed row values, and adds when it was rebuilt. A run
+still going is not reported (exit code 2): it writes its own report as it ends, and a lost
+run can be reported once its lock expires.
 
 ## Exit codes
 
@@ -131,7 +187,8 @@ and the earliest and latest value of each date and time column of the rows compa
 (`data_ranges`). Those are aggregates of integer keys and dates only; a text key's ends
 appear only with `show_values`. `database.ranges: false` turns them off, saving one
 MIN/MAX statement per table and side. `liftproof report --run ID` rebuilds the HTML and
-JSON from the run's findings and keeps what the run was (its reference, window, schedule
+JSON from the run's findings (copying from the bucket what this instance does not hold,
+or holds an older copy of) and keeps what the run was (its reference, window, schedule
 and who ran it), adding when it was regenerated.
 
 ## Tests

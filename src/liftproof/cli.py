@@ -48,7 +48,7 @@ from liftproof.report.builder import build_report, who_ran_it, write_reports
 from liftproof.runlock import RunInProgress
 from liftproof.store import LocalStore, S3Store, Store
 from liftproof.web import correlate
-from liftproof.web.journey import Journey
+from liftproof.web.journey import Journey, check_steps
 from liftproof.web.run import WebResult
 
 log = logging.getLogger("liftproof.cli")
@@ -620,6 +620,8 @@ def _run(
     and must not then be reconciled or compared against), then one report over every
     finding."""
     project = _project(args)
+    if web and (database or files):
+        _check_regions(project)
     store = _store(project, Path(args.workdir))
     run_id = args.run_id or _new_id("r")
     if getattr(args, "resume", False) and not args.run_id:
@@ -631,6 +633,23 @@ def _run(
         args, project, store, run_id, mode,
         lambda: _run_locked(args, mode, project, store, run_id, database, web, files),
     )  # fmt: skip
+
+
+def _check_regions(project: Project) -> None:
+    """A selector the browser refuses stops the run before it starts: found by the replay,
+    after a reconciliation, the error would end the run with no report of what it did. A
+    browser that does not start is left for the replay to report, as it would."""
+    from liftproof.web.browser import check_regions
+
+    web = project.web
+    if web is None or not web.ignore_regions:
+        return
+    try:
+        check_regions(web.ignore_regions, web.chromium_path)
+    except ConfigError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the replay reports it
+        log.warning("web.ignore_regions not checked before the run: %s", exc)
 
 
 # Findings reach the store at least this often while a run goes (spec 3).
@@ -688,6 +707,21 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     )  # fmt: skip
     if progress is not None:
         _void_later_segments(store, run_dir, run_id, progress.segments)
+    values_shown = bool(
+        getattr(args, "show_values", False)
+        or project.database.show_values
+        or (files and any(c.show_content for c in project.files))
+    )
+    # what the run is, for a report rebuilt after it stopped, on any instance
+    run_info = {"mode": mode, "started_at": started, "invoked_by": who_ran_it(),
+                "values_shown": values_shown}  # fmt: skip
+    if getattr(args, "scheduled", None):
+        run_info["schedule"] = args.scheduled
+    if progress is not None:
+        run_info["resumed_at"] = progress.resumed_at
+    info = run_dir / ckpt.RUN_INFO
+    info.write_text(json.dumps(run_info), encoding="utf-8")
+    ckpt.keep(store, f"runs/{run_id}/{ckpt.RUN_INFO}", info)
     checkpoint = None
     if mode == "reconcile":
         progress = progress or ckpt.RunProgress(
@@ -716,7 +750,12 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
             files_result = _files_into(args, project, writer)
         if web:
             stage = Comparator.UI
-            web_result = _replay_into(args, project, store, workdir, writer)
+            replay = ckpt.ReplayCheckpoint(store, run_dir, run_id, writer, uploads)
+            try:
+                web_result = _replay_into(args, project, store, workdir, writer, replay)
+            except BaseException as exc:
+                web_result = getattr(exc, "partial_result", None)
+                raise
     except ConfigError:
         raise
     except LiftproofError as exc:
@@ -739,7 +778,7 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
         if result is not None:
             _save_results(run_dir, result)
         if web_result is not None:
-            (run_dir / "web-results.json").write_text(
+            (run_dir / ckpt.WEB_RESULTS).write_text(
                 json.dumps(web_result.to_dict(), indent=2), encoding="utf-8"
             )
         if files_result is not None:
@@ -771,11 +810,8 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
         scheduled=getattr(args, "scheduled", None),
         not_reached=not_reached,
         resumed_at=progress.resumed_at if progress is not None else None,
-        values_shown=bool(
-            getattr(args, "show_values", False)
-            or project.database.show_values
-            or (files and any(c.show_content for c in project.files))
-        ),
+        invoked_by=run_info["invoked_by"],
+        values_shown=values_shown,
     )
     for f in sorted(run_dir.iterdir()):
         if f.name not in uploads.done:  # segments went up as they closed
@@ -838,23 +874,51 @@ def journey_index(store: Store, workdir: Path) -> list[str]:
 
 
 def _load_journey(store: Store, workdir: Path, journey_id: str) -> Journey:
+    """The journey as the store holds it: one recorded again, or bound, on another machine
+    replaces this instance's copy, which is used alone only when the store has none."""
     path = _journey_dir(workdir) / f"{journey_id}.json"
-    if not path.exists() and not store.get_file(f"journeys/{journey_id}.json", path):
+    key = f"journeys/{journey_id}.json"
+    written = store.modified(key).get(key)
+    if written is not None:
+        _copy_if_newer(store, key, path, written)
+    elif not path.exists():
         raise ConfigError(f"journey {journey_id} not found; record it with liftproof record")
     journey = Journey.load(path)
+    # what this build cannot replay as recorded refuses to load, not to replay
     for c in journey.correlations:
         try:
             correlate.check_chain(c.transforms, c.encodings)
         except ValueError as exc:
             raise ConfigError(f"journey {journey_id}, correlation {c.name}: {exc}") from None
-    assets = _journey_dir(workdir) / journey_id / "assets"
-    for step in journey.steps:
-        for ex in step.exchanges:
-            if ex.body_asset:
-                local = assets / ex.body_asset.split("/")[-1]
-                if not local.exists():
-                    store.get_file(f"journeys/{journey_id}/{ex.body_asset}", local)
+    try:
+        check_steps(journey)
+    except ValueError as exc:
+        raise ConfigError(f"journey {journey_id}, {exc}") from None
     return journey
+
+
+def _fetch_assets(store: Store, workdir: Path, journeys: list[Journey]) -> None:
+    """The bodies and page snapshots a replay compares with, as the store holds them now.
+    The bucket expires them (spec 5), so every copy this instance holds of one the store
+    no longer has is deleted, for each journey the store holds, replayed now or not: the
+    replay then compares without it, as any instance would. A journey only this instance
+    holds (recorded before the project had a bucket) keeps what it kept."""
+    held = store.modified("journeys/")
+    base = _journey_dir(workdir)
+    for assets in base.glob("*/assets"):
+        jid = assets.parent.name
+        if f"journeys/{jid}.json" in held:
+            for local in assets.iterdir():
+                if local.is_file() and f"journeys/{jid}/assets/{local.name}" not in held:
+                    local.unlink()
+    for journey in journeys:
+        prefix = f"journeys/{journey.journey_id}/"
+        refs = {ex.body_asset for s in journey.steps for ex in s.exchanges}
+        refs |= {s.region_asset for s in journey.steps}
+        for ref in sorted(r for r in refs if r and prefix + r in held):
+            local = base / journey.journey_id / "assets" / ref.split("/")[-1]
+            if not local.exists():
+                store.get_file(prefix + ref, local)
 
 
 def _save_journey(store: Store, workdir: Path, journey: Journey, assets: dict[str, bytes]) -> Path:
@@ -866,6 +930,8 @@ def _save_journey(store: Store, workdir: Path, journey: Journey, assets: dict[st
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(body)
         store.put_file(f"journeys/{journey.journey_id}/assets/{sha}", local)
+        if isinstance(store, S3Store):
+            local.unlink()  # the bucket's copy, which expires, is the only one (spec 5)
     return path
 
 
@@ -882,8 +948,15 @@ def _journey_secrets(journey: Journey) -> dict[str, str]:
 
 
 def _replay_into(
-    args: argparse.Namespace, project: Project, store: Store, workdir: Path, writer: FindingWriter
+    args: argparse.Namespace,
+    project: Project,
+    store: Store,
+    workdir: Path,
+    writer: FindingWriter,
+    checkpoint: ckpt.ReplayCheckpoint | None = None,
 ) -> WebResult:
+    """The replay of a run. Each journey's findings are written as it finishes; with a
+    checkpoint, the finished journeys reach the store as the replay goes."""
     from liftproof.web.compare import WebOptions
     from liftproof.web.run import run_journeys
 
@@ -895,10 +968,12 @@ def _replay_into(
     ]
     if not journeys:
         raise ConfigError("no journeys recorded for this project; record one with liftproof record")
+    _fetch_assets(store, workdir, journeys)
     options = WebOptions(
         compare_headers=web.compare_headers,
         ignore_json_paths=web.ignore_json_paths,
         ignore_text=web.ignore_text,
+        ignore_regions=web.ignore_regions,
         show_values=bool(args.show_values or project.database.show_values),
     )
     marks = _replay_watermarks(project, journeys, writer)
@@ -913,6 +988,7 @@ def _replay_into(
             step_timeout_ms=web.step_timeout_ms,
             executable_path=web.chromium_path,
             workers=web.parallel_journeys,
+            on_journey=checkpoint.journey_done if checkpoint is not None else None,
         )
     finally:
         if marks is not None:
@@ -938,7 +1014,7 @@ def _record_replay_windows(marks, store: Store, workdir: Path, writer: FindingWr
 
 
 def cmd_record(args: argparse.Namespace) -> int:
-    from liftproof.web.browser import BodyPolicy
+    from liftproof.web.browser import VOLATILE, BodyPolicy
     from liftproof.web.recorder import Recorder
 
     project = _project(args)
@@ -947,9 +1023,10 @@ def cmd_record(args: argparse.Namespace) -> int:
     store = _store(project, Path(args.workdir))
     recorder = Recorder(
         web.source_url,
-        policy=BodyPolicy(web.capture_bodies),
+        policy=BodyPolicy(web.capture_bodies, web.capture_snapshots),
         headless=False,
         executable_path=web.chromium_path,
+        regions=web.ignore_regions,
     )
     print(
         "Recording. Carry out the journey in the browser window, then close the window.",
@@ -960,6 +1037,15 @@ def cmd_record(args: argparse.Namespace) -> int:
         journey.writes_tables = [t.strip() for t in args.writes.split(",") if t.strip()]
     path = _save_journey(store, workdir, journey, assets)
     unconfirmed = [c.name for c in journey.correlations if not c.confirmed]
+    kept = sum(1 for s in journey.steps if s.region_asset)
+    # the steps each ignore region hid content in on the source, which is read only now: a
+    # selector that matched nothing there is worth knowing before the source is gone
+    hid = {
+        source: sum(source in (*s.region_hidden, s.region_ignored) for s in journey.steps)
+        for r in journey.ignore_regions
+        if (source := r.on("source"))
+    }
+    hid = {s: n for s, n in hid.items() if n or s != VOLATILE.selector}
     _out(
         args,
         {
@@ -969,9 +1055,20 @@ def cmd_record(args: argparse.Namespace) -> int:
             "correlations": [c.name for c in journey.correlations],
             "unconfirmed_correlations": unconfirmed,
             "unbound_tokens": journey.unbound_tokens(),
+            "snapshots_kept": kept,
+            "snapshots_structure_only": len(journey.steps) - kept,
+            "ignore_regions_hid": hid,
+            "warnings": recorder.warnings,
         },
         f"recorded {journey.journey_id}: {len(journey.steps)} steps, "
         f"{len(journey.correlations)} correlations ({len(unconfirmed)} to confirm)\n"
+        f"page snapshots kept for {kept} of {len(journey.steps)} steps (web.capture_snapshots); "
+        "the others are compared by structure\n"
+        + "".join(
+            f"ignore region {s} hid content in {n} of {len(journey.steps)} steps\n"
+            for s, n in hid.items()
+        )
+        + "".join(f"warning: {w}\n" for w in recorder.warnings)
         + "".join(
             f"bind {t} ({journey.secrets[t].field}): liftproof bind --project {args.project} "
             f"--journey {journey.journey_id} --token {t} --secret-arn ARN --key KEY\n"
@@ -1026,13 +1123,16 @@ def _report(
     scheduled=None,
     not_reached=None,
     resumed_at=None,
+    invoked_by=None,
     values_shown=None,
     finished_at=None,
     prior=None,
+    regenerated=False,
 ) -> dict[str, Any]:
     """`prior` is the run's own report when one is regenerated: what the run was (its
     reference, window, schedule, who ran it, versions) is taken from it as recorded,
-    never restated from today's project file."""
+    never restated from today's project file. A run that wrote no report is
+    `regenerated` from what it recorded as it started."""
     findings = list(read_findings(run_dir))
     o = project.database
     finished_at = finished_at or _now()
@@ -1041,9 +1141,11 @@ def _report(
                                web_result, files_result, failure, template, prior)  # fmt: skip
     range_block: dict[str, Any] = {"run_window": f"{started} to {finished_at}"}
     metadata: dict[str, Any] = {
-        "invoked_by": who_ran_it(),
+        "invoked_by": invoked_by or who_ran_it(),
         "values_shown": bool(o.show_values if values_shown is None else values_shown),
     }
+    if regenerated:
+        metadata["regenerated"] = _regenerated()
     if scheduled:
         metadata["schedule"] = scheduled
     if resumed_at:
@@ -1123,7 +1225,7 @@ def _rewrite_report(project, run_id, mode, run_dir, findings, result, started, w
     run = dict(prior.get("run", {}))
     finished = run.pop("finished_at", None) or _now()
     run.pop("started_at", None)
-    run["regenerated"] = {"at": _now(), "by": who_ran_it(), "product_version": __version__}
+    run["regenerated"] = _regenerated()
     not_reached = [
         c for c in prior.get("coverage", {}).get("not_covered", [])
         if c.get("reason") == STOPPED
@@ -1146,6 +1248,10 @@ def _rewrite_report(project, run_id, mode, run_dir, findings, result, started, w
     )
     write_reports(report, run_dir, Path(template) if template else None)
     return report
+
+
+def _regenerated() -> dict[str, str]:
+    return {"at": _now(), "by": who_ran_it(), "product_version": __version__}
 
 
 def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
@@ -1208,13 +1314,11 @@ def cmd_runs(args: argparse.Namespace) -> int:
 
 def sync_reports(store: Store, runs_dir: Path) -> None:
     """Copy the reports of runs this instance does not hold (another instance's, or a
-    replaced one's) from the store."""
-    for key in store.list_keys("runs/"):
+    replaced one's), or holds an older copy of, from the store."""
+    for key, written in store.modified("runs/").items():
         parts = key.split("/")
         if len(parts) == 3 and parts[2] == "report.json":
-            local = runs_dir / parts[1] / "report.json"
-            if not local.exists():
-                store.get_file(key, local)
+            _copy_if_newer(store, key, runs_dir / parts[1] / "report.json", written)
 
 
 def run_history(runs_dir: Path) -> list[dict[str, Any]]:
@@ -1305,18 +1409,31 @@ def cmd_ui_login(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+UNFINISHED = "the run stopped before writing its report; this one is rebuilt from what it left"
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     project = _project(args)
     workdir = Path(args.workdir) / project.name
     run_dir = workdir / "runs" / args.run
+    store = _store(project, Path(args.workdir))
+    holder = store.run_lock(args.run, "report").holder()
+    if holder and holder.get("run_id") == args.run:
+        raise RunFailed(
+            f"run {args.run} is in progress on {holder.get('host', '?')} since "
+            f"{holder.get('acquired_at', '?')} and writes its report as it ends; a run whose "
+            f"instance was lost is reported once its lock expires ({holder.get('expires_at')})"
+        )
+    _fetch_run(store, run_dir, args.run)
     if not run_dir.exists():
-        raise ConfigError(f"run {args.run} not found under {workdir / 'runs'}")
+        raise ConfigError(f"run {args.run} not found under {workdir / 'runs'} or in the store")
     prior = (
         json.loads((run_dir / "report.json").read_text())
         if (run_dir / "report.json").exists()
         else {}
     )
-    store = _store(project, Path(args.workdir))
+    info_file = run_dir / ckpt.RUN_INFO
+    info = json.loads(info_file.read_text(encoding="utf-8")) if info_file.exists() else {}
     baseline = None
     progress_file = run_dir / ckpt.PROGRESS
     if not prior and progress_file.exists():
@@ -1326,13 +1443,13 @@ def cmd_report(args: argparse.Namespace) -> int:
         if progress.baseline:
             baseline = _baseline_by_id(store, workdir, progress.baseline)
     else:
-        started = prior.get("run", {}).get("started_at", _now())
-    web_file = run_dir / "web-results.json"
+        started = prior.get("run", {}).get("started_at") or info.get("started_at") or _now()
+    web_file = run_dir / ckpt.WEB_RESULTS
     files_file = run_dir / "files-results.json"
     report = _report(
         project,
         args.run,
-        prior.get("mode", "reconcile"),
+        prior.get("mode") or info.get("mode", "reconcile"),
         run_dir,
         _load_results(run_dir) if (run_dir / "db-results.json").exists() else None,
         started,
@@ -1349,12 +1466,34 @@ def cmd_report(args: argparse.Namespace) -> int:
             if files_file.exists()
             else None
         ),
-        failure=prior.get("failure"),
+        failure=prior.get("failure") if prior else UNFINISHED,
         template=args.template,
+        # what a run that wrote no report recorded as it started
+        scheduled=info.get("schedule"),
+        resumed_at=info.get("resumed_at"),
+        invoked_by=info.get("invoked_by"),
+        values_shown=info.get("values_shown"),
+        regenerated=not prior,
     )
     for name in ("report.html", "report.json"):
         store.put_file(f"runs/{args.run}/{name}", run_dir / name)
     return _conclude(args, report, store, args.run)
+
+
+def _fetch_run(store: Store, run_dir: Path, run_id: str) -> None:
+    """The run's files this instance does not hold, or holds an older copy of, from the
+    store: the run may have stopped, or been resumed, on another instance."""
+    for key, written in store.modified(f"runs/{run_id}/").items():
+        parts = key.split("/")
+        if len(parts) == 3:
+            _copy_if_newer(store, key, run_dir / parts[2], written)
+
+
+def _copy_if_newer(store: Store, key: str, local: Path, written: float) -> None:
+    """A copy from the store takes the object's time, so it is copied again only once
+    the object has been written since."""
+    if not local.exists() or local.stat().st_mtime < written:
+        store.get_file(key, local)
 
 
 def _last_activity(run_dir: Path) -> str:
@@ -1493,9 +1632,22 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
     if project.web is not None and store is not None:
         workdir = Path(args.workdir) / project.name
         for jid in _journey_ids(args, project, workdir, store):
+            loaded: list[Journey] = []
 
-            def _tokens(j=jid):
-                journey = _load_journey(store, workdir, j)
+            def _loads(j=jid, into=loaded):
+                into.append(_load_journey(store, workdir, j))
+                return f"{len(into[0].steps)} steps"
+
+            check(
+                f"journey {jid} loads",
+                _loads,
+                "record the journey with liftproof record; one recorded by a newer version of "
+                "liftproof needs that version here",
+            )
+            if not loaded:
+                continue
+
+            def _tokens(journey=loaded[0]):
                 values = _journey_secrets(journey)
                 return f"{len(values)} secret(s) resolve" if values else "no secrets needed"
 
@@ -1518,6 +1670,20 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
             return f"chromium {version}"
 
         check("browser starts", _browser, "the AMI ships Chromium; set web.chromium_path")
+        if project.web.ignore_regions:
+
+            def _regions():
+                from liftproof.web.browser import check_regions
+
+                check_regions(project.web.ignore_regions, project.web.chromium_path)
+                return f"{len(project.web.ignore_regions)} ignore region(s)"
+
+            check(
+                "web.ignore_regions are CSS selectors",
+                _regions,
+                "write each as document.querySelector takes it; Playwright's text= and >> "
+                "are not CSS",
+            )
     for fs in project.files:
         for which in ("source", "target"):
 
