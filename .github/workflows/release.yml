@@ -91,7 +91,7 @@ jobs:
         run: |
           infra/scripts/scan-ami.sh "$(cat ami-id.txt)" "${{ vars.LIFTPROOF_BUILD_SUBNET }}" \
             "${{ vars.LIFTPROOF_BUILD_SG }}" liftproof-ami-builder
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: always()
         with:
           name: perf-results
