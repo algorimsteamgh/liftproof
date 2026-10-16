@@ -155,6 +155,11 @@ def build_report(
             # those replayed. Reported separately on purpose (spec 12).
             "journeys_coverage_pct": _pct(j_attempted, len(journeys)),
             "journeys_success_pct": _pct(jstatus["passed"], j_attempted),
+            # how the pages after each step were compared: text, or structure (decision 99)
+            "ui_compared": {
+                k: sum(j.ui_compared.get(k, 0) for j in journeys)
+                for k in ("text", "shape", "expired")
+            },
             "files_coverage_pct": _pct(f_attempted, f_total),
             "files_success_pct": _pct(f_matched, f_attempted),
             "not_covered": not_covered,

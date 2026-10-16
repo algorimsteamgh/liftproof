@@ -361,6 +361,20 @@ def test_mysql_to_postgresql_project_defaults(tmp_path):
     assert p.database.schema_map == {"shop": "public"}
 
 
+def test_page_snapshots_are_kept_only_where_asked(tmp_path):
+    from liftproof.config import load_project
+    from liftproof.errors import ConfigError
+
+    f = tmp_path / "p.yaml"
+    f.write_text("project: p\nweb: {source_url: http://a}\n")
+    assert load_project(f).web.capture_snapshots == []  # default deny (spec 5)
+    f.write_text("project: p\nweb: {source_url: http://a, capture_snapshots: [/orders/*]}\n")
+    assert load_project(f).web.capture_snapshots == ["/orders/*"]
+    f.write_text("project: p\nweb: {source_url: http://a, capture_snapshots: /orders/*}\n")
+    with pytest.raises(ConfigError, match="web.capture_snapshots must be a list"):
+        load_project(f)
+
+
 def test_oracle_home_schema_is_the_login(tmp_path):
     from liftproof.config import load_project
 
