@@ -17,7 +17,7 @@ dependencies = [
   "pypdf>=5",
   # rsa: caching_sha2_password logins without TLS. Below 1.2: 1.2.3 fails the full
   # caching_sha2_password exchange (AttributeError in _request_authentication).
-  "pymysql[rsa]>=1.1.1,<1.2",
+  "pymysql[rsa]>=1.1.1,<1.3",
   # thin mode: no Oracle client libraries on the image
   "oracledb>=2.5,<27",
   # pure Python TDS: no ODBC driver on the image; pyOpenSSL is its TLS layer
