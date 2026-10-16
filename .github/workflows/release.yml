@@ -29,6 +29,10 @@ jobs:
     # on the tagged commit, not only the pull request that came before it
     uses: ./.github/workflows/ci.yml
 
+  charset:
+    # spec 19: the character set fixtures, against a WE8MSWIN1252 Oracle
+    uses: ./.github/workflows/charset.yml
+
   reviewed:
     runs-on: ubuntu-24.04
     steps:
@@ -48,7 +52,7 @@ jobs:
           fi
 
   ami:
-    needs: [performance, tests, reviewed]
+    needs: [performance, tests, charset, reviewed]
     runs-on: ubuntu-24.04
     # No `environment:` here. A job in an environment gets the OIDC subject
     # repo:<repo>:environment:<name>, which the release role's trust policy does not

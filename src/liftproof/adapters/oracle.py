@@ -15,7 +15,8 @@ fallback (the parity tests hold them to that):
 - TO_CHAR switches to scientific notation for numbers it cannot print in 40 characters,
   so a row holding such a number does too.
 
-Tables with a LOB or JSON column are hashed application side.
+Tables with a LOB, JSON or XMLTYPE column are hashed application side; an XMLTYPE value is
+read as XMLSERIALIZE writes it, unindented.
 
 Oracle stores the empty string as NULL. A text value that is empty on the other engine
 and NULL in Oracle is a real difference and is reported as one; see
@@ -26,10 +27,11 @@ In Oracle a schema is a user, so TableRef.schema is the owner, normally in upper
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import decimal
+import re
 import ssl
-import time
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -41,38 +43,28 @@ from liftproof.adapters.base import (
     BucketAggregate,
     Column,
     FloatStats,
+    ForeignKey,
     HashPlan,
+    Index,
+    Pacer,
     TableRef,
     TableSchema,
     all_of,
+    fetch_batch,
     in_list,
+    plain_prefix,
 )
-from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest
+from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, Verbatim, column_digest
 from liftproof.canonical import value64 as _value64
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
 
-TYPE_MAP: dict[str, CanonicalType] = {
-    "FLOAT": CanonicalType.FLOAT,  # binary precision NUMBER; targets store it as a double
-    "BINARY_FLOAT": CanonicalType.FLOAT,
-    "BINARY_DOUBLE": CanonicalType.FLOAT,
-    "VARCHAR2": CanonicalType.TEXT,
-    "NVARCHAR2": CanonicalType.TEXT,
-    "VARCHAR": CanonicalType.TEXT,
-    "CLOB": CanonicalType.TEXT,
-    "NCLOB": CanonicalType.TEXT,
-    "CHAR": CanonicalType.CHAR,
-    "NCHAR": CanonicalType.CHAR,
-    "DATE": CanonicalType.TIMESTAMP,  # an Oracle DATE carries a time of day
-    "RAW": CanonicalType.BINARY,
-    "BLOB": CanonicalType.BINARY,
-    "JSON": CanonicalType.JSON,
-    "BOOLEAN": CanonicalType.BOOLEAN,  # 23ai
-}
-
 LOB_TYPES = {"CLOB", "NCLOB", "BLOB"}
+NATIONAL_TYPES = {"NVARCHAR2", "NCHAR"}
 TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
 PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {
     CanonicalType.JSON,
+    CanonicalType.XML,
     CanonicalType.UUID,
     CanonicalType.TIME,  # Oracle has no TIME type
 }
@@ -93,16 +85,7 @@ def quote(name: str) -> str:
 
 
 def canonical_type(data_type: str, precision: int | None, scale: int | None) -> CanonicalType:
-    t = data_type.upper()
-    if t == "NUMBER":
-        if scale is not None and scale <= 0:
-            return CanonicalType.INTEGER  # NUMBER(p), NUMBER(p,0), INTEGER
-        return CanonicalType.DECIMAL  # NUMBER(p,s) and unconstrained NUMBER
-    if t.startswith("TIMESTAMP"):
-        if "TIME ZONE" in t:
-            return CanonicalType.TIMESTAMPTZ  # WITH TIME ZONE and WITH LOCAL TIME ZONE
-        return CanonicalType.TIMESTAMP
-    return TYPE_MAP.get(t, CanonicalType.UNSUPPORTED)
+    return DEFAULT_TYPE_MAP.canonical("oracle", native_name(data_type, None, precision, scale))
 
 
 def native_name(data_type: str, length: int | None, precision: int | None, scale: int | None):
@@ -145,13 +128,20 @@ def render_sql(col: str, ctype: CanonicalType, precision: int, native: str = "")
                 f"ELSE REGEXP_REPLACE(TO_CHAR({col}), '^(-?)\\.', '\\10.') END"
             )
         case CanonicalType.BOOLEAN:
+            if native == "NUMBER":  # NUMBER(p) compared as boolean (type map)
+                return f"CASE WHEN {col} <> 0 THEN '1' WHEN {col} = 0 THEN '0' END"
             return f"CASE WHEN {col} THEN '1' WHEN NOT {col} THEN '0' END"
         case CanonicalType.TEXT:
             return f"TO_CHAR({col})"
         case CanonicalType.CHAR:
             return f"RTRIM(TO_CHAR({col}), ' ')"
         case CanonicalType.DATE:
-            return f"TO_CHAR({col}, 'YYYY-MM-DD')"
+            # a DATE compared as date (type map): one with a time of day renders as a
+            # timestamp, which no date equals (see prepare)
+            return (
+                f"CASE WHEN {col} = TRUNC({col}) THEN TO_CHAR({col}, 'YYYY-MM-DD') "
+                f"ELSE TO_CHAR({col}, 'YYYY-MM-DD\"T\"HH24:MI:SS') END"
+            )
         case CanonicalType.BINARY:
             return f"LOWER(RAWTOHEX({col}))"
         case CanonicalType.TIMESTAMP | CanonicalType.TIMESTAMPTZ:
@@ -234,6 +224,11 @@ def prepare(value: Any, ctype: CanonicalType) -> Any:
         return None
     if ctype is CanonicalType.TIMESTAMPTZ and isinstance(value, dt.datetime):
         return value.replace(tzinfo=dt.UTC)  # selected in UTC (see _select_sql)
+    if ctype is CanonicalType.DATE and isinstance(value, dt.datetime):
+        # a DATE compared as date: a time of day has no date rendering
+        if value.time() == dt.time():
+            return value.date()
+        return Verbatim(value.isoformat(timespec="seconds"))
     if ctype is CanonicalType.JSON and isinstance(value, (dict, list)):
         return _json_value(value)
     return value
@@ -290,8 +285,10 @@ class OracleAdapter(Adapter):
         sslmode: str = "verify-full",
         sslrootcert: str | None = None,
         statement_timeout_ms: int = 0,
+        lock_timeout_ms: int = 0,
         read_only: bool = True,
         rows_per_second: int = 0,
+        pause_ms: int = 0,
         connect_timeout: int = 10,
     ) -> None:
         self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
@@ -316,13 +313,22 @@ class OracleAdapter(Adapter):
         if statement_timeout_ms:
             self.conn.call_timeout = int(statement_timeout_ms)
         self.read_only = read_only
-        self.rows_per_second = rows_per_second
+        self.pacer = Pacer(rows_per_second, pause_ms)
         with self.conn.cursor() as cur:
             for name, value in SESSION.items():
                 cur.execute(f"ALTER SESSION SET {name} = {value}")
+            if rows_per_second:  # one core: the cap is per connection
+                cur.execute("ALTER SESSION DISABLE PARALLEL QUERY")
         self.require_version(self.conn.version)
         self._settings = {k: v.strip("'") for k, v in SESSION.items()}
         self._settings["call_timeout_ms"] = str(statement_timeout_ms)
+        # Queries read the version current when they started and take no row or table
+        # lock, so no writer makes one wait: lock_timeout_ms has nothing to set.
+        self._settings["lock_timeout"] = "not applicable: Oracle queries take no locks"
+        self.lock_timeout_ms = "not applicable"
+        if rows_per_second:
+            self._settings["parallel_query"] = "disabled"
+        self._settings.update(rows_per_second=str(rows_per_second), pause_ms=str(pause_ms))
         # Oracle has no read only session. The adapter only ever reads, a snapshot is a
         # READ ONLY transaction, and doctor checks the login holds no write privilege.
         self._settings["snapshot"] = "SET TRANSACTION READ ONLY"
@@ -455,7 +461,7 @@ class OracleAdapter(Adapter):
     def describe(self, table: TableRef) -> TableSchema:
         rows = self._query(
             "SELECT COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, "
-            "DATA_SCALE FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME = :2 "
+            "DATA_SCALE, NULLABLE FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME = :2 "
             "ORDER BY COLUMN_ID",
             [table.schema, table.name],
         )
@@ -463,32 +469,113 @@ class OracleAdapter(Adapter):
             raise ConfigError(f"table {table} not found")
         cols = []
         natives = {}
-        for name, data_type, char_len, data_len, precision, scale in rows:
+        for name, data_type, char_len, data_len, precision, scale, nullable in rows:
             precision = int(precision) if precision is not None else None
             scale = int(scale) if scale is not None else None
             length = int(char_len or 0) or int(data_len or 0) or None
             data_type = str(data_type)
             natives[name] = data_type.upper()
+            native = native_name(data_type, length, precision, scale)
             cols.append(
                 Column(
                     name,
-                    native_name(data_type, length, precision, scale),
-                    canonical_type(data_type, precision, scale),
+                    native,
+                    DEFAULT_TYPE_MAP.canonical(self.engine, native),
                     fixed_width=data_type.upper() in ("CHAR", "NCHAR"),
+                    nullable=nullable != "N",
                 )
             )
         self._natives[table] = natives
-        pk = [
-            r[0]
-            for r in self._query(
-                "SELECT cc.COLUMN_NAME FROM ALL_CONSTRAINTS c JOIN ALL_CONS_COLUMNS cc "
-                "ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME "
-                "WHERE c.OWNER = :1 AND c.TABLE_NAME = :2 AND c.CONSTRAINT_TYPE = 'P' "
-                "ORDER BY cc.POSITION",
-                [table.schema, table.name],
-            )
+        # the primary key, enabled unique keys and enabled foreign keys, each foreign key
+        # with the key it refers to
+        pk: list[str] = []
+        uniques: dict[str, list[str]] = {}
+        refs: dict[str, tuple[tuple[str, str], list[str]]] = {}
+        for name, kind, column, owner, key in self._query(
+            "SELECT c.CONSTRAINT_NAME, c.CONSTRAINT_TYPE, cc.COLUMN_NAME, c.R_OWNER, "
+            "c.R_CONSTRAINT_NAME FROM ALL_CONSTRAINTS c JOIN ALL_CONS_COLUMNS cc "
+            "ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME "
+            "WHERE c.OWNER = :1 AND c.TABLE_NAME = :2 AND (c.CONSTRAINT_TYPE = 'P' "
+            "OR c.CONSTRAINT_TYPE IN ('U', 'R') AND c.STATUS = 'ENABLED') "
+            "ORDER BY c.CONSTRAINT_NAME, cc.POSITION",
+            [table.schema, table.name],
+        ):
+            if kind == "P":
+                pk.append(column)
+            elif kind == "U":
+                uniques.setdefault(name, []).append(column)
+            else:
+                refs.setdefault(name, ((owner, key), []))[1].append(column)
+        # the primary key's own index is the primary key
+        indexes = [i for i in self._indexes(table) if not (i.unique and list(i.columns) == pk)]
+        for name, columns in uniques.items():
+            # a deferrable unique key is enforced through an index that is not unique
+            if not any(i.unique and list(i.columns) == columns for i in indexes):
+                indexes.append(Index(name, tuple(columns), True))
+        keys = self._referenced(sorted({k for k, _ in refs.values()}))
+        fks = [
+            ForeignKey(n, tuple(cs), keys[k][0], tuple(keys[k][1]))
+            for n, (k, cs) in refs.items()
+            if k in keys
         ]
-        return TableSchema(table, cols, pk)
+        return TableSchema(table, cols, pk, indexes, fks)
+
+    def _referenced(
+        self, keys: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], tuple[TableRef, list[str]]]:
+        """The table and columns, in position order, of each (owner, constraint) key that
+        foreign keys refer to. Read on their own: joined into the constraints query, the
+        dictionary views took 60 ms a table rather than 3 (Oracle 23 Free)."""
+        if not keys:
+            return {}
+        where = " OR ".join(
+            f"(OWNER = :{2 * i + 1} AND CONSTRAINT_NAME = :{2 * i + 2})" for i in range(len(keys))
+        )
+        out: dict[tuple[str, str], tuple[TableRef, list[str]]] = {}
+        for owner, name, ref, column in self._query(
+            "SELECT OWNER, CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME FROM ALL_CONS_COLUMNS "
+            f"WHERE {where} ORDER BY POSITION",
+            [x for k in keys for x in k],
+        ):
+            out.setdefault((owner, name), (TableRef(owner, ref), []))[1].append(column)
+        return out
+
+    def _indexes(self, table: TableRef) -> list[Index]:
+        """The usable indexes: a partitioned one keeps its status per partition or
+        subpartition, and one unusable leaves the index out. A descending column is stored
+        as an expression naming it ("A"), so such an index is still a B-tree over its
+        columns."""
+        found: dict[str, tuple[bool, str, list[str | None]]] = {}
+        for name, uniqueness, itype, column, expression in self._query(
+            "SELECT i.INDEX_NAME, i.UNIQUENESS, i.INDEX_TYPE, ic.COLUMN_NAME, "
+            "ie.COLUMN_EXPRESSION FROM ALL_INDEXES i JOIN ALL_IND_COLUMNS ic "
+            "ON ic.INDEX_OWNER = i.OWNER AND ic.INDEX_NAME = i.INDEX_NAME "
+            "LEFT JOIN ALL_IND_EXPRESSIONS ie ON ie.INDEX_OWNER = ic.INDEX_OWNER "
+            "AND ie.INDEX_NAME = ic.INDEX_NAME AND ie.COLUMN_POSITION = ic.COLUMN_POSITION "
+            "WHERE i.TABLE_OWNER = :1 AND i.TABLE_NAME = :2 AND i.INDEX_TYPE <> 'LOB' "
+            "AND i.STATUS <> 'UNUSABLE' AND (i.PARTITIONED = 'NO' OR NOT EXISTS "
+            "(SELECT 1 FROM ALL_IND_PARTITIONS p WHERE p.INDEX_OWNER = i.OWNER "
+            "AND p.INDEX_NAME = i.INDEX_NAME AND p.STATUS = 'UNUSABLE') AND NOT EXISTS "
+            "(SELECT 1 FROM ALL_IND_SUBPARTITIONS p WHERE p.INDEX_OWNER = i.OWNER "
+            "AND p.INDEX_NAME = i.INDEX_NAME AND p.STATUS = 'UNUSABLE')) "
+            "ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION",
+            [table.schema, table.name],
+        ):
+            if expression is not None:
+                named = re.fullmatch(r'"([^"]+)"', str(expression).strip())
+                column = named.group(1) if named else None
+            entry = found.setdefault(name, (uniqueness == "UNIQUE", str(itype), []))
+            entry[2].append(column)
+        indexes = []
+        for name, (unique, itype, keys) in found.items():
+            base = itype.removeprefix("FUNCTION-BASED ")
+            kind = (
+                "other" if base not in ("NORMAL", "NORMAL/REV", "IOT - TOP")
+                else "expression" if None in keys
+                else "btree"
+            )  # fmt: skip
+            indexes.append(Index(name, plain_prefix(keys), unique, kind))
+        return indexes
 
     def _native(self, table: TableRef) -> dict[str, str]:
         if table not in self._natives:
@@ -538,7 +625,8 @@ class OracleAdapter(Adapter):
             f"FROM ({self._hash_query(plan, pushable)})){sample} GROUP BY b"
         )
         out = {int(b): BucketAggregate(int(c), int(t)) for b, c, t in self._query(q)}
-        if pushable:
+        if pushable:  # another read of the table (spec 9.15)
+            self.pacer.again()
             self._bucket_aggregates_fallback(plan, where=f"NOT ({pushable})", into=out)
         return out
 
@@ -547,8 +635,12 @@ class OracleAdapter(Adapter):
         cols = []
         for n, t in plan.columns:
             c = quote(n)
-            # oracledb drops the zone of TIMESTAMP WITH TIME ZONE: read it as UTC
-            cols.append(_utc(natives.get(n, ""), c) if t is CanonicalType.TIMESTAMPTZ else c)
+            if t is CanonicalType.TIMESTAMPTZ:
+                c = _utc(natives.get(n, ""), c)  # oracledb drops the zone: read it as UTC
+            elif natives.get(n) == "XMLTYPE":
+                # as text, unindented: binary XML storage pretty prints by default
+                c = f"XMLSERIALIZE(CONTENT {c} AS CLOB NO INDENT)"
+            cols.append(c)
         return ", ".join(cols)
 
     def _stream(self, plan: HashPlan, where: str | None = None) -> Iterator[list[Any]]:
@@ -556,14 +648,11 @@ class OracleAdapter(Adapter):
         q = f"SELECT {self._select_sql(plan)} FROM {self._ident(plan.table)}" + (
             f" WHERE {where}" if where else ""
         )
-        interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         types = [t for _, t in plan.columns]
         with self.conn.cursor() as cur:
-            cur.arraysize = 1000
+            cur.arraysize = fetch_batch(plan, 1000)
             cur.execute(q)
-            for row in cur:
-                if interval:
-                    time.sleep(interval)
+            for row in self.pacer.each(cur):
                 yield [prepare(v, t) for v, t in zip(row, types, strict=True)]
 
     def _bucket_aggregates_fallback(
@@ -575,14 +664,16 @@ class OracleAdapter(Adapter):
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = into if into is not None else {}
         sample = None if plan.sample is None else set(plan.sample)
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            b = _value64(kh) % plan.buckets
-            if sample is not None and b not in sample:
-                continue
-            agg = out.setdefault(b, BucketAggregate(0, 0))
-            agg.count += 1
-            agg.total += _value64(rh)
+        # closed at once when a value cannot be hashed, so the connection reads on
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, sample)
+                if placed is None:
+                    continue
+                b, rh = placed
+                agg = out.setdefault(b, BucketAggregate(0, 0))
+                agg.count += 1
+                agg.total += _value64(rh)
         return out
 
     def _fallback_row_hashes(
@@ -590,11 +681,11 @@ class OracleAdapter(Adapter):
     ) -> list[tuple[tuple[Any, ...], str]]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = []
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            if _value64(kh) % plan.buckets in wanted:
-                rendered = hasher.rendered(row)
-                out.append((tuple(rendered[i] for i in plan.key_positions), rh))
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, wanted)
+                if placed is not None:
+                    out.append((hasher.key_values(row), placed[1]))
         return out
 
     def row_hashes(
@@ -613,16 +704,35 @@ class OracleAdapter(Adapter):
             f"WHERE {in_list(bucket, sorted(wanted), IN_LIST)}"
         )
         rows = [(tuple(r[2:]), r[0]) for r in self._query(q)]
-        if pushable:
+        if pushable:  # another read of the table (spec 9.15)
+            self.pacer.again()
             rows += self._fallback_row_hashes(plan, wanted, where=f"NOT ({pushable})")
         yield from rows
+
+    def _match_sql(self, plan: HashPlan) -> list[tuple[str, bool]]:
+        """Each key's expression for fetch_rows, and whether it is national (bound as
+        NVARCHAR). A national text key is matched as itself: TO_CHAR, like a VARCHAR2 bind,
+        converts it to the database character set, where a character outside that set
+        (Ω in WE8MSWIN1252) becomes a replacement character and the row is never found."""
+        natives = self._native(plan.table)
+        types = dict(plan.columns)
+        out = []
+        for k in plan.key_columns:
+            if natives.get(k) in NATIONAL_TYPES and types[k] in TEXT_TYPES:
+                expr = quote(k) if types[k] is CanonicalType.TEXT else f"RTRIM({quote(k)}, ' ')"
+                out.append((expr, True))
+            else:
+                out.append((self._render(plan, k, types[k]), False))
+        return out
 
     def fetch_rows(
         self, plan: HashPlan, keys: Sequence[tuple[Any, ...]]
     ) -> dict[tuple[Any, ...], list[Any]]:
         if not keys or not plan.key_columns:
             return {}
-        key_exprs = self._key_sql(plan)
+        match = self._match_sql(plan)
+        key_exprs = ", ".join(e for e, _ in match)
+        sizes = [oracledb.DB_TYPE_NVARCHAR if national else None for _, national in match]
         nk = len(plan.key_columns)
         types = [t for _, t in plan.columns]
         out: dict[tuple[Any, ...], list[Any]] = {}
@@ -633,11 +743,16 @@ class OracleAdapter(Adapter):
                 for i in range(len(chunk))
             )
             q = (
-                f"SELECT {', '.join(key_exprs)}, {self._select_sql(plan)} "
-                f"FROM {self._ident(plan.table)} WHERE ({', '.join(key_exprs)}) IN ({tuples})"
+                f"SELECT {key_exprs}, {self._select_sql(plan)} "
+                f"FROM {self._ident(plan.table)} WHERE ({key_exprs}) IN ({tuples})"
             )
             args = [v for k in chunk for v in k]
-            for r in self._query(q, args):
+            with self.conn.cursor() as cur:
+                if any(national for _, national in match):
+                    cur.setinputsizes(*(sizes * len(chunk)))
+                cur.execute(q, args)
+                rows = cur.fetchall()
+            for r in rows:
                 out[tuple(r[:nk])] = [prepare(v, t) for v, t in zip(r[nk:], types, strict=True)]
         return out
 

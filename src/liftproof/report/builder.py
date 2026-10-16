@@ -20,7 +20,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, PackageLoader, select_autoescape
 
 from liftproof import __version__, aws
-from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical import CANONICAL_REVISION, CANONICAL_VERSION, HASH_ALGORITHM
 from liftproof.findings import Finding, Kind, Severity
 from liftproof.reconcile.engine import ReconcileResult
 
@@ -174,7 +174,13 @@ def build_report(
                 if t.partial
             ],
             "exclusions": [
-                {"object": f.object, "column": f.column, "reason": f.detail.get("reason")}
+                {
+                    "object": f.object,
+                    "column": f.column,
+                    "reason": f.detail.get("reason"),
+                    # a structure check or an index not compared, rather than data
+                    **{k: f.detail[k] for k in ("structure", "index") if k in f.detail},
+                }
                 for f in findings
                 if f.kind == Kind.NOTICE and "reason" in f.detail
             ],
@@ -214,6 +220,7 @@ def build_report(
             "finished_at": finished_at,
             "product_version": __version__,
             "canonical_version": CANONICAL_VERSION,
+            "canonical_revision": CANONICAL_REVISION,
             "hash_algorithm": HASH_ALGORITHM,
             "aws_sdk": aws.sdk_versions(),
             **metadata,

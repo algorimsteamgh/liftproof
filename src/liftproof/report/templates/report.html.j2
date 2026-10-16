@@ -18,6 +18,7 @@
   .passed { color: var(--ok); } .passed_with_differences { color: var(--warn); }
   .failed { color: var(--bad); }
   .sub { color: var(--muted); }
+  .consistency { color: var(--warn); font-weight: 600; }
   .classification { display:inline-block; margin-top:10px; padding:3px 10px; border-radius:99px;
                     background:var(--panel); border:1px solid var(--line); font-size:12px; }
   .tiles { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap:12px; }
@@ -47,6 +48,7 @@
   <p class="verdict {{ r.verdict }}">{{ {"passed":"Passed","passed_with_differences":"Passed with differences","failed":"Failed"}[r.verdict] }}</p>
   <div class="sub">Run {{ r.run_id }} · {{ r.mode }} · {{ r.run.started_at }} to {{ r.run.finished_at }}</div>
   {% if r.failure %}<p class="failed"><strong>The run did not complete:</strong> {{ r.failure }}</p>{% endif %}
+  {% set cx = r.range.cross_table_consistency %}{% if cx and not cx.held %}<p class="consistency">{{ cx.summary }}</p>{% endif %}
   <div class="classification">Classification: {{ r.classification }}</div>
 
   <h2>Counts</h2>
@@ -89,8 +91,8 @@
   </table>{% endif %}
   {% if r.coverage.exclusions %}
   <p><strong>Exclusions and their reasons</strong></p>
-  <table><tr><th>Object</th><th>Column or selector</th><th>Reason</th></tr>
-  {% for e in r.coverage.exclusions %}<tr><td>{{ e.object }}</td><td>{{ e.column or "whole table" }}</td><td>{{ e.reason }}</td></tr>{% endfor %}
+  <table><tr><th>Object</th><th>Excluded</th><th>Reason</th></tr>
+  {% for e in r.coverage.exclusions %}<tr><td>{{ e.object }}</td><td>{% if e.index %}index {{ e.index }}{% elif e.structure %}{{ e.structure|replace("_"," ") }}{% if e.column %} of column {{ e.column }}{% endif %}{% else %}{{ e.column or "whole table" }}{% endif %}</td><td>{{ e.reason }}</td></tr>{% endfor %}
   </table>{% endif %}
 
   <h2>Differences</h2>
@@ -115,7 +117,7 @@
   <div class="scroll"><table>
     <tr><th>Table</th><th>Status</th><th class="num">Source rows</th><th class="num">Target rows</th><th class="num">Missing</th><th class="num">Only in target</th><th class="num">Changed</th><th>Key</th></tr>
     {% for t in r.tables %}
-    <tr><td><code>{{ t.table }}</code>{% if t.partial %} <span class="sub">(partial)</span>{% endif %}{% if t.sampled_percent is not none %} <span class="sub">(sampled, {{ t.sampled_percent }}% of rows)</span>{% endif %}</td>
+    <tr><td><code>{{ t.table }}</code>{% if t.partial %} <span class="sub">(partial)</span>{% endif %}{% if t.sampled_percent is not none %} <span class="sub">(sampled, {{ t.sampled_percent }}% of rows)</span>{% endif %}{% if t.structure_differences %} <span class="sub">(structure differs)</span>{% endif %}</td>
       <td class="status-{{ t.status }}">{{ t.status|replace("_"," ") }}</td>
       <td class="num">{{ t.source_rows|num }}</td><td class="num">{{ t.target_rows|num }}</td>
       <td class="num">{{ t.missing_rows|num }}</td><td class="num">{{ t.extra_rows|num }}</td>

@@ -21,9 +21,9 @@ records that it is not consistent, and doctor says so.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import ssl
-import time
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -36,7 +36,10 @@ from liftproof.adapters.base import (
     BucketAggregate,
     Column,
     FloatStats,
+    ForeignKey,
     HashPlan,
+    Index,
+    Pacer,
     TableRef,
     TableSchema,
     all_of,
@@ -44,44 +47,11 @@ from liftproof.adapters.base import (
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest
 from liftproof.canonical import value64 as _value64
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
 
-TYPE_MAP: dict[str, CanonicalType] = {
-    "tinyint": CanonicalType.INTEGER,
-    "smallint": CanonicalType.INTEGER,
-    "int": CanonicalType.INTEGER,
-    "bigint": CanonicalType.INTEGER,
-    "decimal": CanonicalType.DECIMAL,
-    "numeric": CanonicalType.DECIMAL,
-    "money": CanonicalType.DECIMAL,
-    "smallmoney": CanonicalType.DECIMAL,
-    "real": CanonicalType.FLOAT,
-    "float": CanonicalType.FLOAT,
-    "bit": CanonicalType.BOOLEAN,
-    "varchar": CanonicalType.TEXT,
-    "nvarchar": CanonicalType.TEXT,
-    "text": CanonicalType.TEXT,
-    "ntext": CanonicalType.TEXT,
-    "sysname": CanonicalType.TEXT,
-    "char": CanonicalType.CHAR,
-    "nchar": CanonicalType.CHAR,
-    "date": CanonicalType.DATE,
-    "time": CanonicalType.TIME,
-    "datetime": CanonicalType.TIMESTAMP,
-    "datetime2": CanonicalType.TIMESTAMP,
-    "smalldatetime": CanonicalType.TIMESTAMP,
-    "datetimeoffset": CanonicalType.TIMESTAMPTZ,
-    "binary": CanonicalType.BINARY,
-    "varbinary": CanonicalType.BINARY,
-    "image": CanonicalType.BINARY,
-    "timestamp": CanonicalType.BINARY,  # rowversion
-    "uniqueidentifier": CanonicalType.UUID,
-    "json": CanonicalType.JSON,  # SQL Server 2025 and Azure SQL
-    # xml, sql_variant, geography, geometry, hierarchyid: unsupported (not checked)
-}
-
 TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
-PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON}
+PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON, CanonicalType.XML}
 MONEY = {"money", "smallmoney"}
 MAX_PARAMS = 2000  # SQL Server allows 2100 parameters per request
 TWO64 = "18446744073709551616"
@@ -111,7 +81,7 @@ def quote(name: str) -> str:
 
 
 def canonical_type(data_type: str) -> CanonicalType:
-    return TYPE_MAP.get(data_type.lower(), CanonicalType.UNSUPPORTED)
+    return DEFAULT_TYPE_MAP.canonical("sqlserver", data_type)
 
 
 def native_name(data_type: str, max_length: int, precision: int, scale: int) -> str:
@@ -235,7 +205,10 @@ def _excluding(predicate: str | None) -> str | None:
 
 def prepare(value: Any, ctype: CanonicalType) -> Any:
     """python-tds already returns what the reference renderer expects: Decimal for exact
-    numbers, zone aware datetimes for datetimeoffset, UUID, bytes."""
+    numbers, zone aware datetimes for datetimeoffset, UUID, bytes. A bit compared as a
+    number (type map) is 1 or 0."""
+    if isinstance(value, bool) and ctype in (CanonicalType.INTEGER, CanonicalType.DECIMAL):
+        return int(value)
     return value
 
 
@@ -298,8 +271,10 @@ class SQLServerAdapter(Adapter):
         sslmode: str = "verify-full",
         sslrootcert: str | None = None,
         statement_timeout_ms: int = 0,
+        lock_timeout_ms: int = 0,
         read_only: bool = True,
         rows_per_second: int = 0,
+        pause_ms: int = 0,
         connect_timeout: int = 10,
     ) -> None:
         self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
@@ -322,11 +297,16 @@ class SQLServerAdapter(Adapter):
             ) from exc
         self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
-        self.rows_per_second = rows_per_second
+        self.pacer = Pacer(rows_per_second, pause_ms)
+        # one core: the cap is per connection, and SQL Server has no session MAXDOP
+        self._hint = " OPTION (MAXDOP 1)" if rows_per_second else ""
         self._natives: dict[TableRef, dict[str, str]] = {}
         self._in_snapshot = False  # before anything that can close() the adapter
+        # SQL Server's 0 is "never wait"; no limit is -1
+        self.lock_timeout_ms = int(lock_timeout_ms)
+        stmts = [*SESSION, f"SET LOCK_TIMEOUT {self.lock_timeout_ms or -1}"]
         with self.conn.cursor() as cur:
-            for stmt in SESSION:
+            for stmt in stmts:
                 cur.execute(stmt)
         version, edition = self._query(
             "SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar), "
@@ -336,10 +316,11 @@ class SQLServerAdapter(Adapter):
             self.version = f"{version} ({AZURE_EDITIONS[edition]})"
         else:
             self.require_version(version)
-        self._settings = {
-            s.removeprefix("SET ").split(" ", 1)[0]: s.split(" ")[-1] for s in SESSION
-        }
+        self._settings = {s.removeprefix("SET ").split(" ", 1)[0]: s.split(" ")[-1] for s in stmts}
         self._settings["statement_timeout_ms"] = str(statement_timeout_ms)
+        if rows_per_second:
+            self._settings["MAXDOP"] = "1"
+        self._settings.update(rows_per_second=str(rows_per_second), pause_ms=str(pause_ms))
         # SQL Server has no read only session. The adapter only ever reads, and doctor
         # checks the login holds no write permission.
 
@@ -354,6 +335,7 @@ class SQLServerAdapter(Adapter):
         return dict(self._settings, version=self.version)
 
     def _query(self, q: str, args: Sequence[Any] | None = None) -> list[tuple[Any, ...]]:
+        q += self._hint  # every statement sent here is one SELECT
         with self.conn.cursor() as cur:
             if args:
                 cur.execute(q, tuple(args))
@@ -479,7 +461,7 @@ class SQLServerAdapter(Adapter):
     def describe(self, table: TableRef) -> TableSchema:
         rows = self._query(
             "SELECT c.name, CASE WHEN ty.is_user_defined = 1 THEN TYPE_NAME(c.system_type_id) "
-            "ELSE ty.name END, c.max_length, c.precision, c.scale "
+            "ELSE ty.name END, c.max_length, c.precision, c.scale, c.is_nullable "
             "FROM sys.columns c JOIN sys.types ty ON ty.user_type_id = c.user_type_id "
             "WHERE c.object_id = OBJECT_ID(%s) ORDER BY c.column_id",
             [self._ident(table)],
@@ -488,30 +470,62 @@ class SQLServerAdapter(Adapter):
             raise ConfigError(f"table {table} not found")
         cols = []
         natives = {}
-        for name, data_type, max_length, precision, scale in rows:
+        for name, data_type, max_length, precision, scale, nullable in rows:
             data_type = str(data_type).lower()
             natives[name] = data_type
+            native = native_name(data_type, int(max_length), int(precision), int(scale))
             cols.append(
                 Column(
                     name,
-                    native_name(data_type, int(max_length), int(precision), int(scale)),
-                    canonical_type(data_type),
+                    native,
+                    DEFAULT_TYPE_MAP.canonical(self.engine, native),
                     fixed_width=data_type in ("char", "nchar"),
+                    nullable=bool(nullable),
                 )
             )
         self._natives[table] = natives
-        pk = [
-            r[0]
-            for r in self._query(
-                "SELECT c.name FROM sys.indexes i JOIN sys.index_columns ic "
-                "ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
-                "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
-                "WHERE i.object_id = OBJECT_ID(%s) AND i.is_primary_key = 1 "
-                "ORDER BY ic.key_ordinal",
-                [self._ident(table)],
-            )
-        ]
-        return TableSchema(table, cols, pk)
+        # each enabled index's key columns in key order (a columnstore index has only
+        # included ones); types 1 and 2 are B-trees, clustered or not
+        found: dict[str, tuple[bool, bool, str, list[str]]] = {}
+        for name, unique, primary, itype, filtered, column in self._query(
+            "SELECT i.name, i.is_unique, i.is_primary_key, i.type, i.has_filter, c.name "
+            "FROM sys.indexes i JOIN sys.index_columns ic "
+            "ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+            "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+            "WHERE i.object_id = OBJECT_ID(%s) AND i.is_hypothetical = 0 "
+            "AND i.is_disabled = 0 AND (ic.is_included_column = 0 OR i.type IN (5, 6)) "
+            "ORDER BY i.index_id, ic.key_ordinal, ic.index_column_id",
+            [self._ident(table)],
+        ):
+            kind = "other" if int(itype) not in (1, 2) else "partial" if filtered else "btree"
+            found.setdefault(name, (bool(primary), bool(unique), kind, []))[3].append(column)
+        pk: list[str] = []
+        indexes = []
+        for name, (primary, unique, kind, keys) in found.items():
+            if primary:
+                pk = keys
+            else:
+                indexes.append(Index(name, tuple(keys), unique, kind))
+        refs: dict[str, list[tuple[str, str, str, str]]] = {}
+        for name, column, schema, ref, ref_column in self._query(
+            "SELECT fk.name, pc.name, OBJECT_SCHEMA_NAME(fkc.referenced_object_id), "
+            "OBJECT_NAME(fkc.referenced_object_id), rc.name FROM sys.foreign_keys fk "
+            "JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id "
+            "JOIN sys.columns pc "
+            "ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id "
+            "JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id "
+            "AND rc.column_id = fkc.referenced_column_id "
+            "WHERE fk.parent_object_id = OBJECT_ID(%s) AND fk.is_disabled = 0 "
+            "ORDER BY fk.name, fkc.constraint_column_id",
+            [self._ident(table)],
+        ):
+            refs.setdefault(name, []).append((column, schema, ref, ref_column))
+        fks = [
+            ForeignKey(n, tuple(p[0] for p in ps), TableRef(ps[0][1], ps[0][2]),
+                       tuple(p[3] for p in ps))
+            for n, ps in refs.items()
+        ]  # fmt: skip
+        return TableSchema(table, cols, pk, indexes, fks)
 
     def _native(self, table: TableRef) -> dict[str, str]:
         if table not in self._natives:
@@ -561,7 +575,8 @@ class SQLServerAdapter(Adapter):
             f"FROM ({self._hash_query(plan, pushable)}) a{sample} GROUP BY b"
         )
         out = {int(b): BucketAggregate(int(c), int(t)) for b, c, t in self._query(q)}
-        if pushable:
+        if pushable:  # another read of the table (spec 9.15)
+            self.pacer.again()
             self._bucket_aggregates_fallback(plan, where=f"NOT ({pushable})", into=out)
         return out
 
@@ -569,13 +584,10 @@ class SQLServerAdapter(Adapter):
         cols = ", ".join(quote(n) for n, _ in plan.columns)
         where = all_of(where, _excluding(plan.filter))
         q = f"SELECT {cols} FROM {self._ident(plan.table)}" + (f" WHERE {where}" if where else "")
-        interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         types = [t for _, t in plan.columns]
         with self.conn.cursor() as cur:
-            cur.execute(q)
-            for row in cur:
-                if interval:
-                    time.sleep(interval)
+            cur.execute(q + self._hint)
+            for row in self.pacer.each(cur):
                 yield [prepare(v, t) for v, t in zip(row, types, strict=True)]
 
     def _bucket_aggregates_fallback(
@@ -587,14 +599,16 @@ class SQLServerAdapter(Adapter):
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = into if into is not None else {}
         sample = None if plan.sample is None else set(plan.sample)
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            b = _value64(kh) % plan.buckets
-            if sample is not None and b not in sample:
-                continue
-            agg = out.setdefault(b, BucketAggregate(0, 0))
-            agg.count += 1
-            agg.total += _value64(rh)
+        # closed at once when a value cannot be hashed, so the connection reads on
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, sample)
+                if placed is None:
+                    continue
+                b, rh = placed
+                agg = out.setdefault(b, BucketAggregate(0, 0))
+                agg.count += 1
+                agg.total += _value64(rh)
         return out
 
     def _fallback_row_hashes(
@@ -602,11 +616,11 @@ class SQLServerAdapter(Adapter):
     ) -> list[tuple[tuple[Any, ...], str]]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = []
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            if _value64(kh) % plan.buckets in wanted:
-                rendered = hasher.rendered(row)
-                out.append((tuple(rendered[i] for i in plan.key_positions), rh))
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, wanted)
+                if placed is not None:
+                    out.append((hasher.key_values(row), placed[1]))
         return out
 
     def row_hashes(
@@ -624,7 +638,8 @@ class SQLServerAdapter(Adapter):
         marks = ", ".join(str(int(b)) for b in sorted(wanted))
         q = f"SELECT rh{keys} FROM ({self._hash_query(plan, pushable)}) a WHERE b IN ({marks})"
         rows = [(tuple(r[1:]), r[0]) for r in self._query(q)]
-        if pushable:
+        if pushable:  # another read of the table (spec 9.15)
+            self.pacer.again()
             rows += self._fallback_row_hashes(plan, wanted, where=f"NOT ({pushable})")
         yield from rows
 

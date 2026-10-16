@@ -46,9 +46,11 @@ def _render(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, dt.date):
         return value.isoformat()
-    if isinstance(value, decimal.Decimal) and value == value.to_integral_value():
+    if isinstance(value, decimal.Decimal) and value.is_finite() and value == int(value):
         return int(value)  # Oracle NUMBER keys read the same as integer keys elsewhere
-    return str(value)  # exact numbers, and text keys when values are shown
+    # exact numbers (PostgreSQL's Infinity too), PostgreSQL infinity dates, and text keys
+    # when values are shown
+    return str(value)
 
 
 def read(

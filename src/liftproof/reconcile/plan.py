@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from liftproof.adapters.base import HashPlan, TableSchema
 from liftproof.canonical import CanonicalType
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, TypeMap
 
 
 @dataclass
 class IgnoreRule:
     """Excludes a table, a column, or the rows a predicate matches (spec 9.11). A row
     predicate is SQL in each side's own dialect: `where` for both sides, or
-    `source_where` and `target_where` where the engines differ."""
+    `source_where` and `target_where` where the engines differ. A structure rule accepts
+    a known structural difference instead (spec 9.13): one check of the table, or of what
+    holds its column, is not compared; its data still is."""
 
     table: str  # schema.table or table
     reason: str
@@ -21,6 +24,7 @@ class IgnoreRule:
     where: str | None = None
     source_where: str | None = None
     target_where: str | None = None
+    structure: str | None = None  # nullability | keys | foreign_keys | indexes
 
     def matches_table(self, qualified: str) -> bool:
         t = self.table.lower()
@@ -33,7 +37,11 @@ class IgnoreRule:
 
     @property
     def whole_table(self) -> bool:
-        return self.column is None and not self.rows
+        return self.column is None and not self.rows and not self.structure
+
+    @property
+    def excludes_column(self) -> bool:
+        return bool(self.column) and not self.structure
 
     def predicate(self, side: str) -> str | None:
         return (self.source_where if side == "source" else self.target_where) or self.where
@@ -47,10 +55,19 @@ def row_filter(ignore: list[IgnoreRule], qualified: str, side: str) -> str | Non
     return " OR ".join(f"({p})" for p in preds) or None
 
 
+# A column that is not compared, with the reason, rather than guessed at (spec 9.6): its
+# values cannot be canonicalised, or the baseline it is compared with did not hash it.
+NOT_CANONICALISABLE = "not_canonicalisable"
+NOT_IN_BASELINE = "not_in_baseline"
+NOT_CHECKED_ISSUES = ("unsupported", NOT_CANONICALISABLE, NOT_IN_BASELINE)
+
+
 @dataclass
 class ColumnIssue:
     column: str
-    issue: str  # missing_in_target | added_in_target | type_changed | unsupported | ignored
+    # missing_in_target | added_in_target | type_changed | unsupported | not_canonicalisable
+    # | not_in_baseline
+    issue: str
     detail: str
     source_type: str | None = None
     target_type: str | None = None
@@ -75,6 +92,33 @@ class TablePlan:
         return bool(self.excluded_columns)
 
 
+@dataclass
+class TypeOverride:
+    """A column the project's type map compares otherwise than the default (spec 9.13)."""
+
+    column: str
+    side: str
+    native: str
+    canonical: str
+    default: str
+
+
+def map_types(
+    schema: TableSchema, engine: str, type_map: TypeMap, side: str
+) -> tuple[TableSchema, list[TypeOverride]]:
+    """The schema with each column typed by the project's type map, and the columns typed
+    otherwise than by the default. A baseline's stored schema is typed again too, so a
+    changed map changes the plan and the baseline's aggregates are not reused under it."""
+    columns, overridden = [], []
+    for c in schema.columns:
+        ctype = type_map.canonical(engine, c.native_type)
+        default = type_map.default(engine, c.native_type)
+        if ctype != default:
+            overridden.append(TypeOverride(c.name, side, c.native_type, str(ctype), str(default)))
+        columns.append(replace(c, canonical=ctype))
+    return replace(schema, columns=columns), overridden
+
+
 def canonical_order(names: list[str]) -> list[str]:
     return sorted(names, key=lambda n: n.lower().encode("utf-8"))
 
@@ -93,16 +137,21 @@ def plan_table(
     ignore: list[IgnoreRule],
     business_key: list[str] | None = None,
     side: str = "source",
+    unhashed: dict[str, tuple[str, str]] | None = None,
+    type_map: TypeMap = DEFAULT_TYPE_MAP,
 ) -> TablePlan:
     """Plan the comparison of one table over the intersection of mapped columns.
 
     target may be None when planning a baseline before the target exists; the plan is
-    then over every source column.
+    then over every source column. unhashed: columns left out though both sides have them
+    alike, lower cased name -> (issue, why): a baseline that did not hash them, or values
+    that cannot be canonicalised.
     """
+    unhashed = unhashed or {}
     ignored = {
         r.column.lower(): r.reason
         for r in ignore
-        if r.column and r.matches_table(source.table.qualified)
+        if r.excludes_column and r.matches_table(source.table.qualified)
     }
     rows_filter = row_filter(ignore, source.table.qualified, side)  # the reference's rows
     issues: list[ColumnIssue] = []
@@ -126,12 +175,8 @@ def plan_table(
                 )
                 continue
             if tcol.canonical != ctype:
-                if {ctype, tcol.canonical} <= {CanonicalType.CHAR, CanonicalType.TEXT}:
-                    ctype = CanonicalType.TEXT  # strip rule only fires when both are fixed width
-                elif {ctype, tcol.canonical} == {CanonicalType.INTEGER, CanonicalType.DECIMAL}:
-                    # a whole number renders the same either way (Oracle NUMBER to bigint);
-                    # a fraction lost in the move shows up as a changed value
-                    ctype = CanonicalType.DECIMAL
+                if common := type_map.common(ctype, tcol.canonical):
+                    ctype = common  # a compatible pair: char and text, integer and decimal
                 else:
                     issues.append(
                         ColumnIssue(
@@ -144,6 +189,18 @@ def plan_table(
                         )
                     )
                     continue
+        if key in unhashed:
+            issue, why = unhashed[key]
+            issues.append(
+                ColumnIssue(
+                    col.name,
+                    issue,
+                    why,
+                    col.native_type,
+                    tcol.native_type if target is not None else None,
+                )
+            )
+            continue
         if ctype is CanonicalType.UNSUPPORTED:
             issues.append(
                 ColumnIssue(
@@ -185,6 +242,10 @@ def plan_table(
         )
     if not key_ok:
         key, key_source = [], "none (bucketed on the whole row)"
+    elif any(types[k] is CanonicalType.XML for k in key):
+        # keys are matched on their rendering in SQL, which XML has none of; no engine
+        # allows one in a primary key, so only a declared business key gets here
+        key, key_source = [], "none (an xml column cannot be a key; bucketed on the whole row)"
 
     return TablePlan(
         plan=HashPlan(
