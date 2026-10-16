@@ -653,7 +653,9 @@ class Reconciler:
                 if self.against_target
                 else "schema changed since the baseline; the live source is needed to re-hash"
             )
-            typed = retyped | {o.column.lower() for o in overridden}
+            # the baseline's own overrides are in its plan already: only a column the map
+            # types otherwise than it did, or one of the target's, is the map's doing
+            typed = retyped | {o.column.lower() for o in t_over}
             mapped = sorted(typed & _replanned(base_entry.plan, plan)) if base_entry else []
             if mapped:
                 res.reason = f"the type map compares {', '.join(mapped)} otherwise than the " + (

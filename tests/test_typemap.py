@@ -141,6 +141,11 @@ def test_type_keys():
     assert type_keys("mysql", "int") == ("int",)
     assert type_keys("oracle", "NUMBER(10)") == ("number(10)", "number(p)", "number")
     assert type_keys("oracle", "NUMBER(10,0)") == ("number(10)", "number(p)", "number")
+    # as a project file may write it
+    assert type_keys("oracle", "NUMBER(1, 0)") == ("number(1)", "number(p)", "number")
+    assert type_keys("mysql", "decimal( 10, 2 ) unsigned") == (
+        "decimal(10,2) unsigned", "decimal(10,2)", "decimal",
+    )  # fmt: skip
     assert type_keys("oracle", "NUMBER(*,0)") == ("integer", "number(p)", "number")
     assert type_keys("oracle", "NUMBER(12,4)") == ("number(12,4)", "number(p,s)", "number")
     assert type_keys("oracle", "TIMESTAMP(6) WITH TIME ZONE") == (
@@ -185,6 +190,8 @@ def test_overrides():
     o = M.with_overrides({"oracle": {"NUMBER(1,0)": "boolean"}}, {"oracle"})
     assert o.canonical("oracle", "NUMBER(1)") is T.BOOLEAN
     assert o.canonical("oracle", "NUMBER(10)") is T.INTEGER
+    o = M.with_overrides({"oracle": {"NUMBER(1, 0)": "boolean"}}, {"oracle"})
+    assert o.canonical("oracle", "NUMBER(1)") is T.BOOLEAN
     o = M.with_overrides({"oracle": {"number(p)": "boolean", "NUMBER(10)": "integer"}},
                          {"oracle"})  # fmt: skip
     assert o.canonical("oracle", "NUMBER(1)") is T.BOOLEAN

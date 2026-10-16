@@ -5,10 +5,13 @@ reported with the table named, the count difference shown and the differing rows
 """
 
 import json
+from dataclasses import replace
 
 import pytest
 
 from liftproof.canonical import CANONICAL_REVISION
+from liftproof.canonical import CanonicalType as T
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, TypeRule
 from liftproof.findings import FindingWriter, Kind, Severity, read_findings
 from liftproof.reconcile.baseline import Baseline, take_baseline
 from liftproof.reconcile.engine import REASON_INFINITY, ReconcileOptions, Reconciler
@@ -558,3 +561,40 @@ def test_baselines_and_xml(tmp_path, documents):
         "the rest of the table"
     )
     assert tables["public.notes"].status == "matched"
+
+
+def test_a_schema_change_is_not_put_down_to_the_type_map(tmp_path, make_db, adapter_for):
+    """A baseline taken under the project's override, and a column the target then changed:
+    the schema changed, not the map. PostgreSQL has no alternatives in the shipped map, so
+    this one is given one."""
+    s, sc = make_db("src")
+    t, tc = make_db("tgt")
+    for c in (sc, tc):
+        c.execute("CREATE TABLE t (id int PRIMARY KEY, n smallint, m smallint);"
+                  "INSERT INTO t SELECT g, g % 7, g % 5 FROM generate_series(1, 100) g")
+    engines = dict(DEFAULT_TYPE_MAP.engines)
+    smallint = TypeRule(T.INTEGER, (T.DECIMAL,))
+    engines["postgresql"] = dict(engines["postgresql"], smallint=smallint)
+    shipped = replace(DEFAULT_TYPE_MAP, engines=engines)
+    mapped = shipped.with_overrides({"postgresql": {"smallint": "decimal"}}, {"postgresql"})
+    manifest = tmp_path / "b1.json"
+    take_baseline(adapter_for(s), manifest, baseline_id="b1", schemas=["public"], tables=None,
+                  ignore=[], business_keys={}, rows_per_bucket=1000, precision=6,
+                  type_map=mapped)  # fmt: skip
+    b = Baseline.load(manifest)
+    tc.execute("ALTER TABLE t ALTER n TYPE text")
+
+    def reason(name, type_map):
+        writer = FindingWriter(tmp_path / name, "r")
+        options = ReconcileOptions(rows_per_bucket=1000, type_map=type_map)
+        result = Reconciler(adapter_for(t), writer, options, baseline=b).run()
+        writer.close()
+        return result.tables[0].reason
+
+    assert reason("same-map", mapped) == (
+        "schema changed since the baseline; the live source is needed to re-hash"
+    )
+    assert reason("other-map", shipped) == (
+        "the type map compares m, n otherwise than the baseline did; the live source is "
+        "needed to re-hash"
+    )

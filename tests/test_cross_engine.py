@@ -234,13 +234,13 @@ def test_the_projects_type_map_compares_what_the_shipped_one_cannot(tmp_path, fl
     ]  # fmt: skip
     assert not [f for f in findings if f.kind == Kind.DIFFERENCE]
 
-    pc.execute("UPDATE flags SET flag = 2 WHERE id = 10")  # 1 on MySQL: alike as booleans
+    pc.execute("UPDATE flags SET flag = 2 WHERE id = 11")  # 1 on MySQL: alike as booleans
     result, findings = _run(tmp_path / "changed", my, pg, *where, tables=["flags"],
                             type_map=MAPPED)  # fmt: skip
     [flags] = result.tables
     assert (flags.status, flags.changed_rows) == ("different", 1)
     [changed] = [f for f in findings if f.kind == Kind.DIFFERENCE and f.column == "flag"]
-    assert changed.locator == "id = 10"
+    assert changed.locator == "id = 11"
 
 
 def test_a_baseline_is_compared_under_the_map_it_was_taken_under(tmp_path, flags):

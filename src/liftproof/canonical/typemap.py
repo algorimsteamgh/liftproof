@@ -30,9 +30,11 @@ ARGUMENTS = re.compile(r"\([^)]*\)")
 
 def type_keys(engine: str, native: str) -> tuple[str, ...]:
     """The keys a native type is looked up by, most specific first, each lower case with
-    single spaces: the whole type, then (MySQL) the type with its arguments but without
-    modifiers, or (Oracle) the class of a NUMBER, then the type without arguments."""
+    single spaces, none in its arguments: the whole type, then (MySQL) the type with its
+    arguments but without modifiers, or (Oracle) the class of a NUMBER, then the type
+    without arguments."""
     full = " ".join(str(native).lower().split())
+    full = ARGUMENTS.sub(lambda m: "".join(m[0].split()), full)  # 'number(1, 0)': 'number(1,0)'
     if engine == "mysql":
         head = MYSQL_HEAD.match(full)  # 'tinyint(1) unsigned': 'tinyint(1)', 'tinyint'
         keys = [full, head[0], head[1]] if head else [full]

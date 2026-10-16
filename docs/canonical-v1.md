@@ -70,7 +70,8 @@ to integer, `tinyint(1)` to boolean). The mapping lives in
 tables below are its defaults, which reproduce the mapping of the builds before it.
 
 - **Lookup.** A native type, as each adapter reads it and the report shows it, is looked up
-  by its keys, most specific first, each lower case with single spaces: the whole type
+  by its keys, most specific first, each lower case with single spaces and none between
+  its arguments (`NUMBER(1, 0)` is `number(1)`): the whole type
   (`tinyint(1) unsigned`, `timestamp(6) with time zone`); on MySQL the type with its
   arguments but without modifiers (`tinyint(1)`); on Oracle the class of a NUMBER
   (`number(p)` for NUMBER(p), NUMBER(p,0) and NUMBER(p,-s), `number(p,s)` for a positive
@@ -113,8 +114,8 @@ tables below are its defaults, which reproduce the mapping of the builds before 
   project's map, and a table whose plan then differs is hashed again from the live source,
   or reported not checked naming the columns the map compares otherwise. A baseline or a
   reconciliation is resumed only under a map with the same fingerprints. The alternatives'
-  renderings are reached through the map alone, so a build without them never plans, and
-  never reuses, a table hashed under one.
+  renderings are reached through the map alone: a build from before them types every column
+  it reads by its default, so it never hashes one under an alternative.
 
 ### XML
 
