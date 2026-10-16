@@ -19,7 +19,7 @@ dependencies = [
   # caching_sha2_password exchange (AttributeError in _request_authentication).
   "pymysql[rsa]>=1.1.1,<1.2",
   # thin mode: no Oracle client libraries on the image
-  "oracledb>=2.5,<4",
+  "oracledb>=2.5,<27",
   # pure Python TDS: no ODBC driver on the image; pyOpenSSL is its TLS layer
   "python-tds>=1.16,<1.18",
   "pyopenssl>=24",
