@@ -289,6 +289,25 @@ class Adapter(abc.ABC):
             return str(value)
         raise ValueError(f"no literal for {type(value).__name__}")
 
+    def excluding(self, predicate: str) -> str:
+        """The rows a row ignore rule leaves in, as a condition in this engine's SQL; a
+        NULL (unknown) result keeps the row."""
+        return f"({predicate}) IS NOT TRUE"
+
+    def value_ranges(
+        self, table: TableRef, columns: Sequence[str], predicate: str | None = None
+    ) -> dict[str, tuple[Any, Any]]:
+        """Lowest and highest value of each column, over the rows a row ignore rule
+        leaves in (the report's data ranges)."""
+        cols = [self.quote_name(c) for c in columns]
+        if not cols:
+            return {}
+        aggregates = ", ".join(f"MIN({c}), MAX({c})" for c in cols)
+        where = f" WHERE {self.excluding(predicate)}" if predicate else ""
+        q = f"SELECT {aggregates} FROM {self.qualified_name(table)}{where}"  # noqa: S608
+        [row] = self._rows(q.replace("{", "{{").replace("}", "}}"), [])  # no placeholders
+        return {c: (row[2 * i], row[2 * i + 1]) for i, c in enumerate(columns)}
+
     def column_max(self, table: TableRef, column: str) -> Any:
         q = f"SELECT MAX({self.quote_name(column)}) FROM {self.qualified_name(table)}"  # noqa: S608
         return self._rows(q, [])[0][0]

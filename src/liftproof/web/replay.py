@@ -13,6 +13,7 @@ per journey, and captures the same evidence again. The rules that keep replay ho
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -36,6 +37,8 @@ from liftproof.web.browser import (
     region_snapshot,
 )
 from liftproof.web.journey import Journey, Locator, Step
+
+log = logging.getLogger(__name__)
 
 TRANSPORT_MARKERS = (
     "Timeout",
@@ -316,12 +319,17 @@ class Replayer:
         net.drain()  # anything left from a failed attempt is not this step's
         timeout = self.step_timeout_ms
         if step.action == "goto":
+            # the recorded path, before tokens and correlated values are put in
+            log.debug("journey %s step %s: goto %s", journey.journey_id, step.n, step.url)
             url = urljoin(self.target_url, self._substitute(step.url, run, secrets).lstrip("/"))
             acted = time.time() * 1000
             page.goto(url, wait_until="load", timeout=timeout)
         else:
             target, index = resolve(page, step.locator, timeout)
             sr.used_locator = step.locator.candidates[index]
+            log.debug("journey %s step %s: %s on %s (candidate %d of %d)", journey.journey_id,
+                      step.n, step.action, sr.used_locator, index + 1,
+                      len(step.locator.candidates))  # fmt: skip
             if index > 0:
                 sr.degraded_from = step.locator.candidates[0]
             mark_region(target)

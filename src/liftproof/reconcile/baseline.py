@@ -36,6 +36,7 @@ from liftproof.adapters.base import (
 )
 from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM, CanonicalType, reduce_total
 from liftproof.errors import ConfigError
+from liftproof.reconcile import ranges
 from liftproof.reconcile.plan import IgnoreRule, plan_table
 
 SIDES = ("source", "target")
@@ -48,6 +49,8 @@ class BaselineTable:
     row_count: int
     buckets: dict[int, BucketAggregate]
     completed_at: str
+    # the report's data ranges of this side when the baseline was taken (ranges.py)
+    ranges: dict[str, list[Any]] = field(default_factory=dict)
 
     @property
     def aggregate(self) -> str:
@@ -75,6 +78,7 @@ class BaselineTable:
                 str(b): [a.count, str(a.total)] for b, a in sorted(self.buckets.items())
             },
             "completed_at": self.completed_at,
+            "ranges": self.ranges,
         }
 
     @classmethod
@@ -98,7 +102,9 @@ class BaselineTable:
         buckets = {
             int(b): BucketAggregate(int(c), int(t)) for b, (c, t) in d["bucket_aggregates"].items()
         }
-        return cls(schema, plan, int(d["row_count"]), buckets, d["completed_at"])
+        return cls(
+            schema, plan, int(d["row_count"]), buckets, d["completed_at"], d.get("ranges", {})
+        )
 
 
 @dataclass
@@ -185,6 +191,7 @@ def take_baseline(
     progress: Callable[[str], None] = lambda _m: None,
     workers: int = 1,
     checkpoint: Callable[[], object] = lambda: None,
+    with_ranges: bool = True,
 ) -> Baseline:
     """`checkpoint` runs after each table's entry is saved to the manifest; the CLI
     copies the manifest to the store there."""
@@ -252,12 +259,18 @@ def take_baseline(
             buckets = a.bucket_aggregates(tp.plan) if tp.plan.columns else {}
             if tp.plan.filter:  # the rows the baseline holds, not the table's
                 rows = sum(b.count for b in buckets.values())
+            spans = (
+                ranges.read(a, ref, schema, list(ranges.columns_for(tp.plan)), tp.plan.filter)
+                if with_ranges and tp.plan.columns
+                else {}
+            )
             return BaselineTable(
                 schema,
                 tp.plan,
                 rows,
                 buckets,
                 dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
+                spans,
             )
 
         n = min(workers, len(todo))

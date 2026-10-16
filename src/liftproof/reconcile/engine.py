@@ -28,6 +28,7 @@ from typing import Any
 from liftproof.adapters.base import Adapter, BucketAggregate, HashPlan, TableRef, TableSchema
 from liftproof.canonical import RowHasher, column_digest, reduce_total
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity
+from liftproof.reconcile import ranges
 from liftproof.reconcile.baseline import Baseline
 from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table, row_filter
 from liftproof.reconcile.replication import REASON_BEHIND, ReplicationConfig, check
@@ -66,6 +67,8 @@ class ReconcileOptions:
     # table -> a column that only grows (identity key, creation time), to tell rows a
     # replay created apart; default: a single column primary key
     replay_watermarks: dict[str, str] = field(default_factory=dict)
+    # the range block's data ranges (one MIN/MAX statement per table and side)
+    ranges: bool = True
 
 
 @dataclass
@@ -87,6 +90,8 @@ class TableResult:
     reason: str | None = None
     # set when only a sample was compared: the share of the table's rows that was
     sampled_percent: float | None = None
+    # column -> {"role": key|date, "source": [lowest, highest], "target": [...]}
+    ranges: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -299,6 +304,26 @@ class Reconciler:
                 "findings for the columns involved.",
                 detail={"tables_checked": done, "tables_different": mismatched},
             )
+
+    def _ranges(self, table, ttable, plan, tplan, sschema, tschema, base_entry, *,
+                reference_live: bool) -> dict[str, dict[str, Any]]:  # fmt: skip
+        """Lowest and highest key and dates of the rows compared, per side; the reference
+        side's from the baseline when the baseline was the reference."""
+        if not self.o.ranges:
+            return {}
+        roles = ranges.columns_for(plan, self.o.show_values)
+        if not roles:
+            return {}
+        names = list(roles)
+        if reference_live:
+            ref = ranges.read(self.source, table, sschema, names, plan.filter)
+        else:
+            ref = base_entry.ranges if base_entry is not None else {}
+        tgt = ranges.read(self.target, ttable, tschema, names, tplan.filter)
+        side = "target baseline" if self.against_target else "source"
+        return {
+            c: {"role": role, side: ref.get(c), "target": tgt.get(c)} for c, role in roles.items()
+        }
 
     def _one(self, table: TableRef, ttable: TableRef) -> tuple[TableResult, list[Finding]]:
         self._local.pending = found = []
@@ -519,6 +544,7 @@ class Reconciler:
             return res
 
         tplan = replace(_target_plan(plan, tschema), filter=tfilter)
+        s_live = s_aggs is None
         if s_aggs is None:
             # Two databases, two connections: hashing both at once halves the wall time,
             # and each database's own load is unchanged (spec 17: the source is the
@@ -530,6 +556,8 @@ class Reconciler:
         else:
             t_aggs = self.target.bucket_aggregates(tplan)
         res.target_rows = sum(a.count for a in t_aggs.values())
+        res.ranges = self._ranges(table, ttable, plan, tplan, sschema, tschema, base_entry,
+                                  reference_live=s_live)  # fmt: skip
         if plan.filter or plan.sample is not None:
             # the table's row count includes rows the rules leave out or the sample skips
             source_rows = res.source_rows = sum(a.count for a in s_aggs.values())

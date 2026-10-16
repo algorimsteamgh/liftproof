@@ -403,3 +403,56 @@ def test_mysql_replica_gtid_and_binlog(make_mysql_db, mysql_adapter_for):
     assert k("binlog", "mysql-bin.000010:4") < k("binlog", "mysql-bin.000010:120")
     # not a replica: nothing to read for a binlog position
     assert a.replication_reached("replica", "", "binlog", "mysql-bin.000001:4") is None
+
+
+# ---------------------------------------------------------------- report data ranges
+def test_data_ranges_follow_the_rule(tmp_path, pair):
+    """Spec 12: the range block names the key and date ranges of the rows compared."""
+    e, src, tgt, _, _ = pair
+    _, tables, _ = _run(tmp_path, e, src, tgt)
+    [(column, span)] = tables["orders"].ranges.items()
+    assert column.lower() == "id" and span["role"] == "key"
+    assert span["source"] == span["target"] == [1, N]
+    _, tables, _ = _run(tmp_path, e, src, tgt, ignore=[ARCHIVED], name="g")
+    [span] = tables["orders"].ranges.values()
+    assert span["source"] == span["target"] == [1, N - 1]  # row N is archived
+
+    _exec(e, pair[4], e.status_ddl)
+    marks = ", ".join(e.mark(i) for i in range(7))
+    early, late = dt.datetime(2026, 10, 1, 8, 30), dt.datetime(2026, 10, 9, 17, 5, 1)
+    for when in (late, early):
+        pair[4].execute(f"INSERT INTO awsdms_status VALUES ({marks})",
+                        ("h", "T", "RUNNING", when, 0, when, when))  # fmt: skip
+    if e.name == "oracle":
+        pair[4].connection.commit()
+    table = TableRef(e.schema_of(tgt), "AWSDMS_STATUS" if e.name == "oracle" else "awsdms_status")
+    column = "STATUS_TIME" if e.name == "oracle" else "status_time"
+    assert e.adapter(tgt).value_ranges(table, [column]) == {column: (early, late)}
+
+
+def test_statements_are_logged_at_debug_without_their_values(pair):
+    """Spec 16: --log-level debug shows the SQL each engine is sent, never parameters."""
+    import logging
+
+    e, src, tgt, _, tc = pair
+    _exec(e, tc, e.status_ddl)
+    sql_log = logging.getLogger("liftproof.sql")
+    seen: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: seen.append(record.getMessage())
+    old = sql_log.level
+    sql_log.setLevel(logging.DEBUG)
+    sql_log.addHandler(handler)
+    try:
+        a = e.adapter(tgt)
+        t = TableRef(e.schema_of(tgt), "ORDERS" if e.name == "oracle" else "orders")
+        a.value_ranges(t, ["ID" if e.name == "oracle" else "id"], "status = 'ARCHIVED'")
+        schema = e.schema_of(tgt) if e.name != "sqlserver" else None
+        assert a.dms_status(schema, "task-named-in-a-parameter") is None
+    finally:
+        sql_log.removeHandler(handler)
+        sql_log.setLevel(old)
+    assert any("MIN(" in s and "ARCHIVED" in s for s in seen), seen
+    assert any("awsdms_status" in s.lower() for s in seen)
+    assert all(s.startswith(f"{a.engine}: ") for s in seen)
+    assert not any("task-named-in-a-parameter" in s for s in seen)

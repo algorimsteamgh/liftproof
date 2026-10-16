@@ -23,6 +23,7 @@ from typing import Any
 import pymysql
 import pymysql.cursors
 
+from liftproof.adapters import sqllog
 from liftproof.adapters.base import (
     Adapter,
     BucketAggregate,
@@ -276,6 +277,7 @@ class MySQLAdapter(Adapter):
             raise ConfigError(
                 f"cannot connect to MySQL at {host}:{port}/{database}: {exc}"
             ) from exc
+        self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
         self.rows_per_second = rows_per_second
         with self.conn.cursor() as cur:
