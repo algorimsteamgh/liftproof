@@ -45,7 +45,11 @@ liftproof validate --project acme.yaml                  # reconcile, then replay
 ```
 
 `record` opens a Chromium window on `web.source_url`; carry out the journey and close the
-window. Passwords become random tokens before anything is written; `bind` points each
+window. Typing an address, Back, Forward and Reload in that window are steps too; a
+navigation the page makes itself (a link, a form, a redirect) is part of the step that
+caused it. `record` warns about a step to check: an address on another site, which replay
+opens from the instance, a Reload or Back that sent a form again (Chromium does not ask),
+and a Back whose count it could not be sure of. Passwords become random tokens before anything is written; `bind` points each
 token at a Secrets Manager secret for replay. Values the server generates (order ids,
 CSRF tokens, ASP.NET view state) are detected as correlations, substituted forward at
 replay, and never reported as differences. A correlation the replay could not carry

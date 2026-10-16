@@ -253,6 +253,18 @@ def mark_region(locator: Any) -> None:
         pass
 
 
+def clear_region(page: Any) -> None:
+    """Forget the region an earlier step touched: after a navigation the page is what is
+    compared, also where a single page application kept the element."""
+    try:
+        page.evaluate(
+            "() => document.querySelectorAll('[data-liftproof-region]').forEach("
+            "(n) => n.removeAttribute('data-liftproof-region'))"
+        )
+    except Exception:  # noqa: BLE001, S110 - the page navigated: the marker went with it
+        pass
+
+
 QUIET_JS = """
 (quietMs) => new Promise((resolve) => {
   let timer = setTimeout(done, quietMs);

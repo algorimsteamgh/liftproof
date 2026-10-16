@@ -7,7 +7,9 @@ per journey, and captures the same evidence again. The rules that keep replay ho
   fixed sleeps;
 - a locator must resolve to exactly one element; a weaker fallback is reported;
 - retry only transport and timing failures, never an HTTP status or a comparison;
-- a journey containing a state changing step is retried as a whole, never per step;
+- a journey containing a state changing step is retried as a whole, never per step, and
+  so is one whose Back or Forward failed: run again, a traversal that went through would
+  move twice;
 - once an attempt has sent a write, only a transport or timing failure or a crash runs it
   again, and not after the target answered a write with an error (spec 6 and 19);
 - every retry is counted as a flake, and a step that flakes repeatedly is reported;
@@ -25,7 +27,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from liftproof.web import correlate
 from liftproof.web.browser import (
@@ -36,6 +38,7 @@ from liftproof.web.browser import (
     Write,
     applied_regions,
     check_selectors,
+    clear_region,
     dom_settled,
     endpoints,
     in_force,
@@ -62,6 +65,8 @@ TRANSPORT_MARKERS = (
 )
 STEP_ATTEMPTS = 3
 JOURNEY_ATTEMPTS = 2
+NAVIGATIONS = ("goto", "reload", "back", "forward")
+TRAVERSALS = ("back", "forward")
 
 
 class AmbiguousLocator(Exception):
@@ -70,6 +75,14 @@ class AmbiguousLocator(Exception):
 
 class ElementNotFound(Exception):
     pass
+
+
+class WrongPage(Exception):
+    """Back or Forward led somewhere other than where it led on the source."""
+
+    def __init__(self, action: str, expected: str, actual: str, why: str = "") -> None:
+        super().__init__(f"{action} led to {actual} on the target, {expected} on the source{why}")
+        self.expected, self.actual = expected, actual
 
 
 class BrowserCrashed(Exception):
@@ -128,13 +141,14 @@ class JourneyRun:
     attempts: int = 0
     flakes: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
-    # ambiguous | not_found | transport | secret | crash | browser_crash
+    # ambiguous | not_found | wrong_page | transport | secret | crash | browser_crash
     failure_kind: str | None = None
     wall_ms: float | None = None  # this attempt, first step to last settled step
     browser_crashes: int = 0  # attempts the browser process exited during
     browser_restarted: bool = False  # it had exited before this journey, charged to none
     writes: list[Write] = field(default_factory=list)  # this attempt's, as the page sent them
     not_repeated: str | None = None  # why a failed attempt was not run again
+    wrong_page: tuple[str, str] | None = None  # where Back or Forward led: source, target
 
     @property
     def total_ms(self) -> float:
@@ -415,6 +429,11 @@ class Replayer:
                         sr.status, sr.error = "failed", str(exc)
                         run.status, run.failure_kind, run.error = "failed", "ambiguous", str(exc)
                         return False
+                    except WrongPage as exc:
+                        sr.status, sr.error = "failed", str(exc)
+                        run.status, run.failure_kind, run.error = "failed", "wrong_page", str(exc)
+                        run.wrong_page = (exc.expected, exc.actual)
+                        return False
                     except Exception as exc:
                         sr.status, sr.error = "failed", str(exc).splitlines()[0][:300]
                         if not context.browser.is_connected():
@@ -422,11 +441,13 @@ class Replayer:
                         if not transport_failure(exc) and not isinstance(exc, ElementNotFound):
                             raise
                         kind = "not_found" if isinstance(exc, ElementNotFound) else "transport"
-                        if whole or attempt == STEP_ATTEMPTS:
-                            # a journey that changes state is never repeated one step at a
-                            # time; the journey is the retry unit (spec 6)
+                        # a journey that changes state is never repeated one step at a time,
+                        # nor a traversal that may have gone through; the journey is the
+                        # retry unit (spec 6)
+                        own = not whole and step.action not in TRAVERSALS
+                        if not own or attempt == STEP_ATTEMPTS:
                             run.status, run.failure_kind, run.error = "failed", kind, sr.error
-                            return whole
+                            return not own
                         if not may_repeat(kind, net.writes[sent:]):
                             # the target wrote where the recording did not
                             run.status, run.failure_kind, run.error = "failed", kind, sr.error
@@ -454,12 +475,8 @@ class Replayer:
         net.drain()  # anything left from a failed attempt is not this step's
         timeout = self.step_timeout_ms
         hide = self._hidden(journey)
-        if step.action == "goto":
-            # the recorded path, before tokens and correlated values are put in
-            log.debug("journey %s step %s: goto %s", journey.journey_id, step.n, step.url)
-            url = urljoin(self.target_url, self._substitute(step.url, run, secrets).lstrip("/"))
-            acted = time.time() * 1000
-            page.goto(url, wait_until="load", timeout=timeout)
+        if step.action in NAVIGATIONS:
+            acted = self._navigate(page, step, journey, run, secrets, timeout)
         else:
             if hide:
                 unhide(page)  # an element left aria-hidden is not found by its role
@@ -491,6 +508,8 @@ class Replayer:
         sr.exchanges += net.drain()
         sr.duration_ms = step_duration(acted, sr.exchanges)
         dom_settled(page)
+        if step.action in NAVIGATIONS:
+            clear_region(page)  # the page is compared, not what an earlier step touched
         snap = region_snapshot(page, hide)
         sr.region = snap.text
         for token, value in secrets.items():  # a textbox shows its value in the tree
@@ -499,6 +518,57 @@ class Replayer:
         sr.region_ignored = snap.whole
         sr.page_url = path_of(page.url)
         self._correlate(journey, sr, run)
+        if step.action in TRAVERSALS and step.page_url:
+            # replaced, not pushed, or redirected another way: the target's history differs
+            expected = normalise_path(self._substitute(step.page_url, run, secrets))
+            if normalise_path(sr.page_url) != expected:
+                raise WrongPage(step.action, expected, normalise_path(sr.page_url))
+
+    def _navigate(
+        self,
+        page: Any,
+        step: Step,
+        journey: Journey,
+        run: JourneyRun,
+        secrets: dict[str, str],
+        timeout: int,
+    ) -> float:
+        """A step the browser itself made: an address, Reload, Back or Forward. Returns
+        when it acted, epoch ms."""
+        # the recorded path, before tokens and correlated values are put in
+        log.debug("journey %s step %s: %s %s", journey.journey_id, step.n, step.action,
+                  step.url or step.value or "")  # fmt: skip
+        acted = time.time() * 1000
+        if step.action == "goto":
+            url = urljoin(self.target_url, self._substitute(step.url, run, secrets).lstrip("/"))
+            source = urlsplit(journey.base_url)[:2]
+            if urlsplit(url)[:2] == source != urlsplit(self.target_url)[:2]:
+                raise RuntimeError(
+                    f"step {step.n} opens the source ({journey.base_url}); replay drives the "
+                    "target only: record the journey again without it"
+                )
+            page.goto(url, wait_until="load", timeout=timeout)
+        elif step.action == "reload":
+            page.reload(wait_until="load", timeout=timeout)
+        else:
+            # moved through the browser's history, frames' entries counted, as recorded
+            n = int(step.value or 1) * (-1 if step.action == "back" else 1)
+            cdp = page.context.new_cdp_session(page)
+            try:
+                history = cdp.send("Page.getNavigationHistory")
+                to = history["currentIndex"] + n
+                if not 0 <= to < len(history["entries"]):
+                    here = normalise_path(path_of(page.url))
+                    expected = normalise_path(self._substitute(step.page_url, run, secrets))
+                    raise WrongPage(step.action, expected, here,
+                                    ": the target has no page there in its history")  # fmt: skip
+                entry = history["entries"][to]["id"]
+                acted = time.time() * 1000
+                with page.expect_navigation(wait_until="commit", timeout=timeout):
+                    cdp.send("Page.navigateToHistoryEntry", {"entryId": entry})
+            finally:
+                cdp.detach()
+        return acted
 
     def _hidden(self, journey: Journey) -> list[str]:
         """The target's side of the ignore regions this journey is replayed with."""

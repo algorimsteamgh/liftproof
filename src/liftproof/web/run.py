@@ -25,6 +25,7 @@ from liftproof.web.journey import IgnoreRegion, Journey
 from liftproof.web.replay import JourneyRun, Replayer
 
 REPEATED_FLAKE = 2
+DIFFERENT = ("not_found", "wrong_page")  # failures that are the target's differences
 # deliberately not the run's own "stopped" reason, which a regenerated report carries
 # over from the run's report: a journey is named once, from the journey results
 REASON_STOPPED = "the run stopped before this journey was compared"
@@ -94,6 +95,21 @@ def _failure_finding(j: Journey, run: JourneyRun) -> Finding:
                 obj,
                 "element the journey uses was not found on the target",
                 locator=where,
+                journey=obj,
+                story=j.story,
+                detail=detail,
+            )
+        case "wrong_page":
+            expected, actual = run.wrong_page or (None, None)
+            return Finding(
+                Comparator.UI,
+                Kind.DIFFERENCE,
+                Severity.HIGH,
+                obj,
+                "Back or Forward led to a different page on the target",
+                locator=where,
+                expected=expected,
+                actual=actual,
                 journey=obj,
                 story=j.story,
                 detail=detail,
@@ -321,7 +337,7 @@ def _journey_done(
             # a correlation left unresolved sent its recorded value before the step failed
             failure.detail["unresolved_correlations"] = comparison.stale_at_failure
         emit(failure)
-        differences += run.failure_kind == "not_found"
+        differences += run.failure_kind in DIFFERENT
     for step, sr in zip(j.steps, run.steps, strict=False):
         for e in step.exchanges:
             _time(timing, f"{e.method} {normalise_path(e.url)}", "source", e.duration_ms)
@@ -331,7 +347,7 @@ def _journey_done(
     if run.status == "not_run" or (run.status == "failed" and run.failure_kind == "secret"):
         status = "not_run"
     elif run.status != "completed":
-        status = "failed" if run.failure_kind != "not_found" else "different"
+        status = "different" if run.failure_kind in DIFFERENT else "failed"
     else:
         status = "different" if differences else "passed"
     return _result(j, run, status, differences, run.error, comparison.ui_compared)

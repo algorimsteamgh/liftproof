@@ -274,6 +274,20 @@ def test_a_journey_shows_from_this_instance_when_the_bucket_is_out_of_reach(site
     r, page = client.request("GET", "/p/acme/journeys/other")
     assert r.status == 404
 
+def test_a_journey_shows_where_each_browser_navigation_went(site):
+    client, ui, _ = site
+    client.login()
+    steps = [Step(1, "goto", url="/login"), Step(2, "back", value="2", page_url="/orders"),
+             Step(3, "reload", page_url="/orders"),
+             Step(4, "goto", url="https://docs.example.com/help", page_url="/help")]  # fmt: skip
+    Journey("browsing", "http://src.invalid", steps=steps, format="2.0").save(
+        ui.workdir / "acme" / "journeys" / "browsing.json")
+    r, page = client.request("GET", "/p/acme/journeys/browsing")
+    assert r.status == 200
+    assert "<td>2 entries, to /orders</td>" in page and "<td>to /orders</td>" in page
+    assert page.count("opened from the instance at replay") == 1
+
+
 def test_binds_to_loopback_only(tmp_path):
     ui = UI(tmp_path, tmp_path)
     with pytest.raises(ConfigError, match="127.0.0.1"):

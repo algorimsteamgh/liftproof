@@ -64,7 +64,7 @@ DEFAULT_VOLATILE = [
 
 
 # a failure the page's content can cause, so one a stale value sent before it may explain
-STALE_FAILURES = ("not_found", "ambiguous", "transport")
+STALE_FAILURES = ("not_found", "ambiguous", "wrong_page", "transport")
 
 
 @dataclass

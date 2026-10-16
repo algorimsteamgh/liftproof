@@ -48,7 +48,7 @@ from liftproof.report.builder import build_report, who_ran_it, write_reports
 from liftproof.runlock import RunInProgress
 from liftproof.store import LocalStore, S3Store, Store
 from liftproof.web import correlate
-from liftproof.web.journey import Journey
+from liftproof.web.journey import Journey, check_steps
 from liftproof.web.run import WebResult
 
 log = logging.getLogger("liftproof.cli")
@@ -884,11 +884,16 @@ def _load_journey(store: Store, workdir: Path, journey_id: str) -> Journey:
     elif not path.exists():
         raise ConfigError(f"journey {journey_id} not found; record it with liftproof record")
     journey = Journey.load(path)
+    # what this build cannot replay as recorded refuses to load, not to replay
     for c in journey.correlations:
         try:
             correlate.check_chain(c.transforms, c.encodings)
         except ValueError as exc:
             raise ConfigError(f"journey {journey_id}, correlation {c.name}: {exc}") from None
+    try:
+        check_steps(journey)
+    except ValueError as exc:
+        raise ConfigError(f"journey {journey_id}, {exc}") from None
     return journey
 
 
@@ -1053,6 +1058,7 @@ def cmd_record(args: argparse.Namespace) -> int:
             "snapshots_kept": kept,
             "snapshots_structure_only": len(journey.steps) - kept,
             "ignore_regions_hid": hid,
+            "warnings": recorder.warnings,
         },
         f"recorded {journey.journey_id}: {len(journey.steps)} steps, "
         f"{len(journey.correlations)} correlations ({len(unconfirmed)} to confirm)\n"
@@ -1062,6 +1068,7 @@ def cmd_record(args: argparse.Namespace) -> int:
             f"ignore region {s} hid content in {n} of {len(journey.steps)} steps\n"
             for s, n in hid.items()
         )
+        + "".join(f"warning: {w}\n" for w in recorder.warnings)
         + "".join(
             f"bind {t} ({journey.secrets[t].field}): liftproof bind --project {args.project} "
             f"--journey {journey.journey_id} --token {t} --secret-arn ARN --key KEY\n"
@@ -1625,9 +1632,22 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
     if project.web is not None and store is not None:
         workdir = Path(args.workdir) / project.name
         for jid in _journey_ids(args, project, workdir, store):
+            loaded: list[Journey] = []
 
-            def _tokens(j=jid):
-                journey = _load_journey(store, workdir, j)
+            def _loads(j=jid, into=loaded):
+                into.append(_load_journey(store, workdir, j))
+                return f"{len(into[0].steps)} steps"
+
+            check(
+                f"journey {jid} loads",
+                _loads,
+                "record the journey with liftproof record; one recorded by a newer version of "
+                "liftproof needs that version here",
+            )
+            if not loaded:
+                continue
+
+            def _tokens(journey=loaded[0]):
                 values = _journey_secrets(journey)
                 return f"{len(values)} secret(s) resolve" if values else "no secrets needed"
 

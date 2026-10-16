@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable, Sequence
 from importlib import resources
 from typing import Any
-from urllib.parse import quote, quote_plus, urljoin
+from urllib.parse import quote, quote_plus, urljoin, urlsplit, urlunsplit
 
 from liftproof.web import correlate
 from liftproof.web.browser import (
@@ -26,6 +26,7 @@ from liftproof.web.browser import (
     Captured,
     NetworkLog,
     check_selectors,
+    clear_region,
     in_force,
     launch,
     normalise_path,
@@ -34,6 +35,8 @@ from liftproof.web.browser import (
     step_settled,
 )
 from liftproof.web.journey import (
+    BROWSER_NAVIGATIONS,
+    NAVIGATION_FORMAT,
     REGION_SHAPE_VERSION,
     TOKEN_PREFIX,
     IgnoreRegion,
@@ -46,6 +49,97 @@ from liftproof.web.journey import (
 )
 
 CAPTURE_JS = resources.files("liftproof.web").joinpath("capture.js").read_text("utf-8")
+# CDP's navigationType for a navigation the browser started; a traversal is capture.js's
+NAVIGATION_TYPES = {"differentDocument": "goto", "sameDocument": "goto", "reload": "reload",
+                    "reloadBypassingCache": "reload"}  # fmt: skip
+
+
+def typed_url(url: str, base_url: str) -> str:
+    """An address typed in the recording window, as its step's url: on the source's origin
+    its path, query and fragment, which replay puts on the target; elsewhere the whole URL."""
+    parts, base = urlsplit(url), urlsplit(base_url)
+    if (parts.scheme, parts.netloc) != (base.scheme, base.netloc):
+        return url
+    return urlunsplit(("", "", parts.path or "/", parts.query, parts.fragment))
+
+
+class NavigationWatch:
+    """The navigations the browser itself makes in the recording window: an address typed
+    or a bookmark opened (goto) and Reload. Those the page makes (a link, a form, a script,
+    a redirect) follow from a step already recorded and happen again by themselves at
+    replay. The page asks for its own first (CDP frameRequestedNavigation), so one started
+    without asking is the browser's. It is taken once it commits an http(s) page, so a
+    download, an empty answer, an address that does not resolve or one left with Esc is not.
+    """
+
+    def __init__(self, cdp: Any, main_frame: str) -> None:
+        self.cdp, self.main = cdp, main_frame
+        self.navs: list[dict[str, Any]] = []  # committed, not yet taken as steps
+        self.abandoned: list[dict[str, Any]] = []  # never committed
+        self.asked: set[str] = set()  # where the page asked to go
+        self._started: dict[str, Any] | None = None  # the browser's, until it commits
+
+    @classmethod
+    def attach(cls, page: Any) -> NavigationWatch:
+        cdp = page.context.new_cdp_session(page)
+        cdp.send("Page.enable")
+        watch = cls(cdp, cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"])
+        cdp.on("Page.frameRequestedNavigation", watch._requested)
+        cdp.on("Page.frameStartedNavigating", watch._start)
+        cdp.on("Page.frameNavigated", watch._navigated)
+        cdp.on("Page.navigatedWithinDocument", watch._within)
+        return watch
+
+    def _requested(self, e: dict[str, Any]) -> None:
+        if e["frameId"] == self.main and e.get("disposition", "currentTab") == "currentTab":
+            self.asked.add(e["url"])
+
+    def _start(self, e: dict[str, Any]) -> None:
+        if e["frameId"] != self.main:
+            return
+        by_page = e["url"] in self.asked
+        self.asked.clear()
+        action = NAVIGATION_TYPES.get(e.get("navigationType", ""))
+        self.abandon()  # one started before it no longer commits
+        if by_page or action is None or urlsplit(e["url"]).scheme not in ("http", "https"):
+            return
+        self._started = {"action": action, "url": e["url"], "t": time.time() * 1000,
+                         "loader": e.get("loaderId"),
+                         "same": e.get("navigationType") == "sameDocument"}  # fmt: skip
+
+    def _navigated(self, e: dict[str, Any]) -> None:
+        frame = e["frame"]
+        if frame["id"] != self.main:
+            return
+        started = self._started
+        if (
+            started is not None
+            and not started["same"]
+            and started["loader"] == frame.get("loaderId")
+            and urlsplit(frame["url"]).scheme in ("http", "https")  # not chrome-error://
+        ):
+            self.navs.append(started)
+            self._started = None
+        self.abandon()
+
+    def _within(self, e: dict[str, Any]) -> None:
+        if e["frameId"] == self.main and self._started is not None and self._started["same"]:
+            self.navs.append(self._started)
+            self._started = None
+
+    def abandon(self) -> None:
+        """The navigation started has not committed, and now will not."""
+        if self._started is not None:
+            self.abandoned.append(self._started)
+            self._started = None
+
+    def history_index(self) -> int | None:
+        """Where the window is in its history, which counts the entries frames added; None
+        once the window has closed, which must not cost the recording."""
+        try:
+            return self.cdp.send("Page.getNavigationHistory")["currentIndex"]
+        except Exception:  # noqa: BLE001 - closed: the caller does without it
+            return None
 
 
 class RecordingSession:
@@ -71,6 +165,10 @@ class RecordingSession:
         self._sensitive: dict[str, str] = {}  # token -> real value; memory only
         self._token_for_field: dict[str, str] = {}
         self.net = NetworkLog(page)
+        self.watch: NavigationWatch | None = None
+        self._history: int | None = None  # the window's history index at the last step
+        self._taken = 0  # requests captured before the last steps were taken
+        self.warnings: list[str] = []  # for the engineer, as recording ends
 
     # events arrive from capture.js through the exposed binding --------------------
     def on_event(self, payload: str) -> None:
@@ -88,14 +186,19 @@ class RecordingSession:
         self._settle()
         self.journey.steps.append(Step(n=1, action="goto", url=path_of(url)))
         self._times.append(t)
+        self.watch = NavigationWatch.attach(self.page)  # after the recorder's own goto
         self._snapshot()
 
     def _snapshot(self) -> None:
         step = self.journey.steps[-1]
+        if step.action in ("goto", *BROWSER_NAVIGATIONS):
+            clear_region(self.page)  # as replay does
         snap = region_snapshot(self.page, self.hide)
         step.region = None if snap.whole else snap.text
         step.region_hidden, step.region_ignored = snap.hidden, snap.whole
         step.page_url = path_of(self.page.url)
+        if self.watch is not None:
+            self._history = self.watch.history_index()
 
     def _token(self, field: str, value: str) -> str:
         token = self._token_for_field.get(field)
@@ -107,10 +210,66 @@ class RecordingSession:
         self._sensitive[token] = value
         return token
 
+    def _browser_navigations(self) -> list[dict[str, Any]]:
+        """The navigations the browser made since the last steps, as capture events. Each is
+        timed no later than its own page's request, so that request is its step's."""
+        if self.watch is None:
+            return []
+        navs, self.watch.navs[:] = list(self.watch.navs), []
+        self.watch.asked.clear()  # a page's request that never started hides nothing later
+        events = []
+        for nav in navs:
+            path, t = path_of(nav["url"]), nav["t"]
+            own = (
+                c.started
+                for c in self._captured[self._taken :]
+                if c.exchange.resource_type == "document"
+                and c.exchange.url == path
+                and c.started >= self._times[-1]
+            )
+            t = min(t, next(own, t))
+            url = typed_url(nav["url"], self.journey.base_url) if nav["action"] == "goto" else None
+            events.append({"action": nav["action"], "url": url, "t": t})
+        return events
+
+    def _traversal(self, ev: dict[str, Any], alone: bool) -> dict[str, Any] | None:
+        """Back or Forward in the window, as a step event. How far it went is the move in the
+        window's history since the last step, which counts the entries frames added, as
+        replay does; the page's own count, which does not, is used when other navigations
+        came with it or the window has closed, and the engineer is told."""
+        n = len(self.journey.steps) + 1
+        now = self.watch.history_index() if self.watch is not None else None
+        moved = now - self._history if now is not None and self._history is not None else None
+        delta = moved if alone and moved is not None else ev.get("delta")
+        if not delta:
+            return None  # it went nowhere, or how far is not known
+        if not alone:
+            self.warnings.append(
+                f"step {n}: {'Back' if delta < 0 else 'Forward'} came with other actions before "
+                "the page settled, so how far it went is the page's count; record the journey "
+                "again, waiting for each page, if it does not replay"
+            )
+        elif ev.get("delta") not in (None, delta):
+            self.warnings.append(
+                f"step {n}: the page moved {ev['delta']} entries and the window {delta}; "
+                "replay moves as the window did. Check the step, or record the journey again"
+            )
+        value = str(abs(delta)) if abs(delta) > 1 else None
+        return {"action": "back" if delta < 0 else "forward", "value": value, "t": ev["t"]}
+
     def _take(self) -> None:
-        """Turn pending capture events into steps, then snapshot the result."""
+        """Turn pending capture events, and the browser's own navigations, into steps, then
+        snapshot the result."""
         events, self._events[:] = list(self._events), []
+        events = sorted(events + self._browser_navigations(), key=lambda ev: float(ev["t"]))
+        others = [ev for ev in events if ev["action"] not in ("fill", "select", "check", "uncheck")]
+        took = False
         for ev in events:
+            if ev["action"] == "traverse":
+                ev = self._traversal(ev, alone=len(others) == 1)
+                if ev is None:
+                    continue
+            took = True
             loc = Locator(**ev["locator"]) if ev.get("locator") else None
             value = ev.get("value")
             if ev["action"] == "fill" and ev.get("sensitive") and value:
@@ -125,11 +284,13 @@ class RecordingSession:
             ):
                 last.value = value  # one field, several change events: keep the last
                 continue
+            n = len(self.journey.steps) + 1
             self.journey.steps.append(
-                Step(n=len(self.journey.steps) + 1, action=ev["action"], locator=loc, value=value)
+                Step(n=n, action=ev["action"], url=ev.get("url"), locator=loc, value=value)
             )
             self._times.append(float(ev["t"]))
-        if events:
+        self._taken = len(self._captured)
+        if took:
             self._snapshot()
 
     def act(self, fn: Callable[[Any], Any]) -> None:
@@ -149,7 +310,7 @@ class RecordingSession:
                 self.page.wait_for_timeout(poll_ms)
             except Exception:  # noqa: BLE001 - the window was closed mid wait
                 break
-            if self._events:
+            if self._events or (self.watch is not None and self.watch.navs):
                 self._settle()
                 self._take()
 
@@ -162,9 +323,27 @@ class RecordingSession:
                 text = text.replace(form, token)
         return text
 
+    def _drop_abandoned(self) -> None:
+        """A navigation the browser started that never became a page (a download, an empty
+        answer, an address that does not resolve, Esc) is no step, and its request is no
+        step's: replay never makes it. A request that failed has no start time."""
+        self.watch.abandon()
+        for nav in self.watch.abandoned:
+            path, t = path_of(nav["url"]), nav["t"]
+            near = sorted(
+                (abs((c.started or t) - t), i)
+                for i, c in enumerate(self._captured)
+                if c.exchange.resource_type == "document" and c.exchange.url == path
+            )
+            if near and near[0][0] < 1000:
+                del self._captured[near[0][1]]
+        self.watch.abandoned.clear()
+
     def finish(self) -> tuple[Journey, dict[str, bytes]]:
         if not self.page.is_closed():
             self._captured += self.net.drain()
+        if self.watch is not None:
+            self._drop_abandoned()
         if hasattr(self, "_began"):
             self.journey.wall_ms = round((self._settled - self._began) * 1000, 1)
         steps = self.journey.steps
@@ -195,15 +374,36 @@ class RecordingSession:
             end = c.started + (ex.duration_ms or 0.0)
             steps[idx].duration_ms = max(steps[idx].duration_ms or 0.0, end - self._times[idx])
         for s in steps:
+            s.url = self._scrub(s.url)  # a typed address can hold a redacted value
             self._reduce_region(s, assets)
             s.non_idempotent = any(e.method in WRITE_METHODS for e in s.exchanges)
             if s.duration_ms is not None:
                 s.duration_ms = round(max(s.duration_ms, 0.0), 1)
+            self._warn(s)
+        if any(s.action in BROWSER_NAVIGATIONS for s in steps):
+            self.journey.format = NAVIGATION_FORMAT  # an older build refuses it as it loads
         self.journey.region_shape_version = REGION_SHAPE_VERSION
         later = [[s.url or "", s.value or ""] for s in steps]
         self.journey.correlations = correlate.detect(traffic, later)
         self._sensitive.clear()
         return self.journey, assets
+
+    def _warn(self, step: Step) -> None:
+        """What the engineer should know about a navigation the browser made."""
+        if step.action in BROWSER_NAVIGATIONS and step.non_idempotent:
+            # Playwright's Chromium sends a form again without asking
+            writes = sorted({e.endpoint for e in step.exchanges if e.method in WRITE_METHODS})
+            self.warnings.append(
+                f"step {step.n} ({step.action}) sent {', '.join(writes)} again on the source, "
+                "and replay will send it to the target; record the journey again without it "
+                "if that was not meant"
+            )
+        if step.action == "goto" and step.n > 1 and step.url and not step.url.startswith("/"):
+            origin = urlunsplit(urlsplit(step.url)[:2] + ("", "", ""))
+            self.warnings.append(
+                f"step {step.n} opens {origin} from the instance at replay, not the target; "
+                "record the journey again without it if it was a detour"
+            )
 
     def _reduce_region(self, step: Step, assets: dict[str, bytes]) -> None:
         """Default deny, as for bodies (spec 5): the snapshot's text is kept, as an asset
@@ -238,6 +438,7 @@ class Recorder:
         self.executable_path = executable_path
         self.settle_ms = settle_ms
         self.regions = list(regions)  # the project's ignore regions (web.ignore_regions)
+        self.warnings: list[str] = []  # the last recording's, for the engineer
 
     def record(
         self,
@@ -270,6 +471,7 @@ class Recorder:
             else:
                 session.wait_until_closed()
             result = session.finish()
+            self.warnings = session.warnings
             session.net.close()  # a write still being fetched would reach the source twice
             context.close()
             browser.close()

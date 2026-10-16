@@ -5,6 +5,7 @@ the shop: unchanged, and deliberately changed. Ids, CSRF tokens and timestamps d
 between the two on every run, as they would between a source and its migrated target.
 """
 
+import contextlib
 import copy
 import json
 import os
@@ -161,6 +162,159 @@ def test_a_page_not_kept_is_compared_by_structure(recorded, tmp_path):
     [notice] = [f for f in findings if f.kind == Kind.NOTICE and f.object != "page region"]
     assert notice.detail == {"snapshots_expired": 1, "bodies_expired": 2}
     assert not [f for f in findings if f.summary.startswith("page ")]
+
+
+# ------------------------------------------------ navigations made in the browser itself
+def jump(s, by):
+    """Back or Forward by several entries at once, as the browser's history menu does."""
+    history = s.watch.cdp.send("Page.getNavigationHistory")
+    entry = history["entries"][history["currentIndex"] + by]["id"]
+    with s.page.expect_navigation():
+        s.watch.cdp.send("Page.navigateToHistoryEntry", {"entryId": entry})
+
+
+def drive_navigations(s):
+    drive(s)
+    base, oid = s.journey.base_url, s.page.url.rsplit("/", 1)[1]
+    s.act(lambda p: p.go_back())
+    s.act(lambda p: p.go_forward())
+    s.act(lambda p: p.reload())
+    s.act(lambda p: p.get_by_role("button", name="Refresh").click())  # the page's own reload
+    s.act(lambda p: p.goto(f"{base}/orders"))  # typed
+    s.act(lambda p: p.goto(f"{base}/orders/{oid}"))
+    s.act(lambda p: p.get_by_role("button", name="Previous page").click())  # history.back()
+    s.act(lambda p: jump(s, -2))
+    s.act(lambda p: jump(s, 2))
+    s.act(lambda p: p.get_by_label("Item").fill("Gadget"))
+
+
+@pytest.fixture(scope="module")
+def recorded_nav(browser_available):
+    with ShopApp() as app:
+        recorder = Recorder(app.url, policy=BodyPolicy(["/api/*"]), headless=True)
+        journey, _ = recorder.record("browsing", start="/login", drive=drive_navigations)
+    return journey, recorder.warnings
+
+
+def test_browser_navigations_are_recorded(recorded_nav, recorded):
+    journey, warnings = recorded_nav
+    steps = journey.steps[6:]
+    assert [(s.action, s.url, s.value) for s in steps] == [
+        ("back", None, None), ("forward", None, None), ("reload", None, None),
+        ("click", None, None), ("goto", "/orders", None), ("goto", steps[5].url, None),
+        ("click", None, None), ("back", None, "2"), ("forward", None, "2"),
+        ("fill", None, "Gadget")]  # fmt: skip
+    oid = journey.steps[5].page_url.rsplit("/", 1)[1]
+    assert steps[5].url == f"/orders/{oid}"
+    # each navigation's own requests are its step's, not the step before
+    endpoints = [[e.endpoint for e in s.exchanges] for s in steps[:3]]
+    assert endpoints == [["GET /orders"], [f"GET /orders/{oid}", f"GET /api/orders/{oid}"],
+                         [f"GET /orders/{oid}", f"GET /api/orders/{oid}"]]  # fmt: skip
+    [order_id] = [c for c in journey.correlations if c.name == "orders.id"]
+    assert "step 12" in order_id.used_in  # the typed address carries the order id
+    assert (journey.format, warnings) == ("2.0", [])
+    assert recorded[0].format == "1.1"  # a journey without them stays readable by older builds
+
+
+def test_browser_navigations_replay_clean(recorded_nav):
+    journey, _ = recorded_nav
+    result, findings = replay(journey, None, "same")
+    [r] = result.journeys
+    assert r.status == "passed", [f.summary for f in findings]
+    assert (r.steps_run, r.attempts, r.flakes) == (16, 1, 0)
+    assert not [f for f in findings if f.kind in (Kind.DIFFERENCE, Kind.ERROR)]
+
+
+def test_a_navigation_that_never_shows_a_page_is_not_a_step(browser_available):
+    """A download, an empty answer and an address that does not resolve: none can be
+    replayed, and neither can their requests. A link to an anchor and a page's own
+    pushState are the click that made them."""
+
+    def go(url):
+        def act(p):
+            with contextlib.suppress(Exception):  # Download is starting, net::ERR_...
+                p.goto(url)
+
+        return act
+
+    def browse(s):
+        drive(s)
+        s.act(lambda p: p.get_by_role("link", name="Details").click())
+        s.act(lambda p: p.get_by_role("button", name="More").click())
+        for path in ("/export", "/empty"):
+            s.act(go(s.journey.base_url + path))
+        s.act(go("http://liftproof-test.invalid/orders"))
+
+    with ShopApp() as app:
+        journey, _ = Recorder(app.url, headless=True).record("detours", start="/login",
+                                                            drive=browse)  # fmt: skip
+    assert [s.action for s in journey.steps[6:]] == ["click", "click"]
+    assert journey.steps[-1].page_url.endswith("?tab=more") and journey.format == "1.1"
+    requested = Counter(e.url for s in journey.steps for e in s.exchanges)
+    assert (requested["/export"], requested["/empty"], requested["/orders"]) == (0, 0, 1)
+    result, findings = replay(journey, None, "same")
+    assert result.journeys[0].status == "passed", [f.summary for f in findings]
+
+
+def test_a_window_closed_right_after_a_reload_keeps_the_journey(browser_available):
+    def close(s):
+        drive(s)
+        s.act(lambda p: (p.reload(), p.close()))
+
+    with ShopApp() as app:
+        journey, _ = Recorder(app.url, headless=True).record("closed", start="/login",
+                                                            drive=close)  # fmt: skip
+    assert [s.action for s in journey.steps[5:]] == ["click", "reload"]
+
+
+def test_back_counts_the_entries_a_frame_added(browser_available):
+    """A frame that moves on adds an entry of its own: Back across it is two entries in
+    the browser's history and one in the page's, and replay moves as the browser did."""
+
+    def framed(s):
+        drive(s)
+        s.act(lambda p: p.goto(s.journey.base_url + "/framed"))
+        s.act(lambda p: jump(s, -2))
+
+    with ShopApp() as app:
+        recorder = Recorder(app.url, policy=BodyPolicy(["/api/*"]), headless=True)
+        journey, _ = recorder.record("framed", start="/login", drive=framed)
+    back = journey.steps[-1]
+    assert (back.action, back.value, back.page_url) == ("back", "2", journey.steps[5].page_url)
+    assert recorder.warnings == [
+        "step 8: the page moved -1 entries and the window -2; replay moves as the window "
+        "did. Check the step, or record the journey again"]  # fmt: skip
+    result, findings = replay(journey, None, "same")
+    assert result.journeys[0].status == "passed", [f.summary for f in findings]
+
+
+@pytest.mark.parametrize(("value", "page_url", "expected", "actual"), [
+    ("9", "/orders", "/orders", "/orders/{id}"),  # no entry that far back on the target
+    (None, "/help", "/help", "/orders"),  # an entry, but another page
+])  # fmt: skip
+def test_back_that_leads_elsewhere_on_the_target_is_a_difference(
+    recorded, value, page_url, expected, actual
+):
+    journey, assets = recorded
+    j = with_step(journey, "back", value=value, page_url=page_url)
+    result, findings = replay(j, assets, "same")
+    [r] = result.journeys
+    assert (r.status, r.attempts, r.flakes, r.differences) == ("different", 1, 0, 1)
+    [wrong] = [f for f in findings if f.kind == Kind.DIFFERENCE]
+    assert (wrong.severity, wrong.summary, wrong.locator) == (
+        Severity.HIGH, "Back or Forward led to a different page on the target", "step 7")
+    assert (wrong.expected, wrong.actual) == (expected, actual)
+
+
+def test_replay_never_opens_the_source(recorded):
+    journey, assets = recorded
+    j = with_step(journey, "goto", url=journey.base_url + "/orders")
+    result, findings = replay(j, assets, "same")
+    [r] = result.journeys
+    assert (r.status, r.attempts) == ("failed", 1)
+    [error] = [f for f in findings if f.kind == Kind.ERROR]
+    assert error.locator == "step 7"
+    assert error.detail["error"].startswith(f"step 7 opens the source ({journey.base_url})")
 
 
 # ------------------------------------------------------------- ignore regions (spec 7)

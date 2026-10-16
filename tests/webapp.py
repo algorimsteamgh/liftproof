@@ -48,6 +48,10 @@ document.getElementById('new').addEventListener('submit', async (e) => {{
 ORDER = """<!doctype html><html><head><title>Shop</title></head><body><main>
 <h1>Order <span id="oid"></span></h1>{greeting}<dl id="d"></dl>
 <a href="/orders">Back to orders</a>
+<button type="button" onclick="history.back()">Previous page</button>
+<button type="button" onclick="location.reload()">Refresh</button>
+<a href="#d">Details</a>
+<button type="button" onclick="history.pushState(null, '', '?tab=more')">More</button>
 <p data-liftproof-volatile>Served by node {node}</p>
 <script>
 fetch('/api/orders/{oid}').then(r => r.json()).then(o => {{
@@ -63,6 +67,14 @@ HELP = """<!doctype html><html><head><title>Shop</title></head><body><main>
 <aside data-liftproof-volatile>Served by node {node}. <a href="/login">Sign in</a></aside>
 </main></body></html>"""
 
+# a page whose frame moves on by itself once loaded: a history entry for the frame alone
+FRAMED = """<!doctype html><html><head><title>Shop</title></head><body><main>
+<h1>Framed</h1><iframe title="news" src="/frame/a"></iframe></main></body></html>"""
+
+FRAME = """<!doctype html><html><body><p>Frame {name}</p>
+<script>{script}</script></body></html>"""
+NEXT_FRAME = "addEventListener('load', () => setTimeout(() => location.assign('/frame/b'), 50));"
+
 INBOX = """<!doctype html><html><head><title>Shop</title></head><body><main>
 <h1>Inbox</h1>
 <script>fetch('/api/updates');</script></main></body></html>"""
@@ -76,8 +88,10 @@ class ShopApp:
 
     posts counts the POSTs that reach it, by path. post_status and post_delay_ms (by path)
     change the answer to a write it has already stored: its status, and how long it takes.
-    GET /dropped closes the connection without an answer. GET /inbox long polls
-    /api/updates, which is held open until the app closes; polls counts those requests.
+    GET /dropped closes the connection without an answer, GET /export answers with a
+    download and GET /empty with 204. GET /framed holds a frame that moves on by itself.
+    GET /inbox long polls /api/updates, which is held open until the app closes; polls
+    counts those requests.
 
     Every page after sign in names the node that served it, marked volatile, and so does
     GET /help, around its link to sign in. greeting (plain, or marked volatile) welcomes
@@ -157,6 +171,17 @@ class ShopApp:
                     return  # the connection closes with nothing sent
                 if path == "/inbox":
                     return self._send(200, INBOX)
+                if path == "/export":
+                    return self._send(200, "a,b\n", "text/csv",
+                                      {"Content-Disposition": 'attachment; filename="o.csv"'})
+                if path == "/empty":
+                    return self._send(204, "")
+                if path == "/framed":
+                    return self._send(200, FRAMED)
+                if path.startswith("/frame/"):
+                    name = path.rsplit("/", 1)[1]
+                    return self._send(200, FRAME.format(
+                        name=name, script=NEXT_FRAME if name == "a" else ""))
                 if path == "/help":
                     return self._send(200, HELP.format(node=secrets.token_hex(4)))
                 if path == "/api/updates":

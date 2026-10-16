@@ -35,12 +35,13 @@ from liftproof.web.journey import (
     Exchange,
     IgnoreRegion,
     Journey,
+    Locator,
     Step,
     region_shape,
     sha256,
     shape,
 )
-from liftproof.web.recorder import RecordingSession
+from liftproof.web.recorder import NavigationWatch, RecordingSession, typed_url
 from liftproof.web.replay import JourneyRun, Replayer, StepRun
 from liftproof.web.run import REASON_STOPPED, WebResult, run_journeys
 from tests import fakereplay
@@ -1147,3 +1148,236 @@ def test_record_says_what_each_ignore_region_hid_on_the_source(tmp_path, monkeyp
     assert out["ignore_regions_hid"] == {VOLATILE.selector: 1, ".greeting": 2, "#legacy-ad": 0}
     saved = Journey.load(tmp_path / "work" / "t" / "journeys" / "j1.json")
     assert saved.ignore_regions == in_force(load_project(p).web.ignore_regions)
+
+
+# -------------------------------------------------- navigations made in the browser itself
+class _Cdp:
+    """A CDP session: navigation history, or gone with its window."""
+
+    def __init__(self, index=0, closed=False) -> None:
+        self.index, self.closed = index, closed
+
+    def send(self, method, params=None):
+        if self.closed:
+            raise RuntimeError("Target page, context or browser has been closed")
+        return {"currentIndex": self.index, "entries": []}
+
+
+def _started(url, kind="differentDocument", frame="main", loader="L1"):
+    return {"frameId": frame, "url": url, "loaderId": loader, "navigationType": kind}
+
+
+def _committed(url, frame="main", loader="L1"):
+    return {"frame": {"id": frame, "loaderId": loader, "url": url}}
+
+
+def test_navigation_watch_tells_browser_from_page():
+    w = NavigationWatch(_Cdp(), "main")
+    page = "http://a/orders"
+    # the page asked for it first (a link, a form, a script, location.reload())
+    w._requested({"frameId": "main", "url": page, "disposition": "currentTab"})
+    w._start(_started(page, "reload"))
+    w._navigated(_committed(page))
+    assert w.navs == []
+    # the browser's own: an address, Reload, an address with only a new fragment
+    w._start(_started(page))
+    w._navigated(_committed(page))
+    w._start(_started(page, "reload", loader="L2"))
+    w._navigated(_committed(page, loader="L2"))
+    w._start(_started(page + "#x", "sameDocument", loader="L3"))
+    w._within({"frameId": "main", "url": page + "#x"})
+    assert [(n["action"], n["url"]) for n in w.navs] == [
+        ("goto", page), ("reload", page), ("goto", page + "#x")]  # fmt: skip
+    w.navs.clear()
+    # a traversal is capture.js's; a frame's navigation and a browser page are not steps
+    w._start(_started(page, "historyDifferentDocument"))
+    w._start(_started(page, frame="frame"))
+    w._start(_started("chrome://settings/"))
+    w._navigated(_committed(page))
+    # a page asking for a new tab does not hide the browser's next navigation
+    w._requested({"frameId": "main", "url": page, "disposition": "newTab"})
+    w._start(_started(page, loader="L4"))
+    w._navigated(_committed(page, loader="L4"))
+    assert [n["action"] for n in w.navs] == ["goto"]
+    w.navs.clear()
+    # never shown: an address that did not resolve, a download (another navigation
+    # follows), and one started as the window closes
+    w._start(_started("http://nowhere.invalid/", loader="L5"))
+    w._navigated(_committed("chrome-error://chromewebdata/", loader="L5"))
+    w._start(_started("http://a/export", loader="L6"))
+    w._start(_started("http://a/b", loader="L7"))
+    w.abandon()
+    assert w.navs == []
+    assert [n["url"] for n in w.abandoned] == [
+        "http://nowhere.invalid/", "http://a/export", "http://a/b"]  # fmt: skip
+    assert w.history_index() == 0
+    assert NavigationWatch(_Cdp(closed=True), "main").history_index() is None
+
+
+def test_typed_url_keeps_path_query_fragment_or_full_url():
+    assert typed_url("http://src:8080/a?b=1#/c", "http://src:8080") == "/a?b=1#/c"
+    assert typed_url("http://src:8080", "http://src:8080") == "/"
+    for other in ("https://src:8080/a", "http://localhost:8080/a", "https://example.com/?q=x"):
+        assert typed_url(other, "http://src:8080") == other
+
+
+def _watched(index=0, closed=False):
+    s = _session(BodyPolicy())
+    s.journey.steps = [Step(1, "goto", url="/orders")]
+    s._times, s.watch, s._history = [0.0], NavigationWatch(_Cdp(index, closed), "main"), 3
+    s._snapshot = lambda: None
+    return s
+
+
+@pytest.mark.parametrize(("index", "closed", "events", "taken", "warned"), [
+    (1, False, [{"action": "traverse", "delta": -1, "t": 5}], ("back", "2"), True),
+    (5, False, [{"action": "traverse", "delta": 2, "t": 5}], ("forward", "2"), False),
+    (3, False, [{"action": "traverse", "delta": -1, "t": 5}], None, False),  # went nowhere
+    # the window closed straight after: the page's count, and the recording is kept
+    (0, True, [{"action": "traverse", "delta": -1, "t": 5}], ("back", None), False),
+    (0, True, [{"action": "traverse", "delta": None, "t": 5}], None, False),
+])  # fmt: skip
+def test_a_traversal_moves_as_the_window_did(index, closed, events, taken, warned):
+    s = _watched(index, closed)
+    s._events = list(events)
+    s._take()
+    got = [(st.action, st.value) for st in s.journey.steps[1:]]
+    assert got == ([taken] if taken else [])
+    assert bool(s.warnings) is warned
+
+
+def test_a_traversal_with_other_navigations_uses_the_pages_count():
+    s = _watched(index=5)
+    s.watch.navs.append({"action": "goto", "url": "http://source.invalid/help", "t": 1})
+    s._events = [{"action": "traverse", "delta": -1, "t": 5}]
+    s._take()
+    assert [(st.action, st.url, st.value) for st in s.journey.steps] == [
+        ("goto", "/orders", None), ("goto", "/help", None), ("back", None, None)]  # fmt: skip
+    assert s.warnings == [
+        "step 3: Back came with other actions before the page settled, so how far it went is "
+        "the page's count; record the journey again, waiting for each page, if it does not "
+        "replay"]  # fmt: skip
+
+
+def test_the_engineer_is_told_what_a_browser_navigation_repeats_or_leaves():
+    s = _watched()
+    s.journey.steps += [
+        Step(2, "reload", exchanges=[Exchange("POST", "/api/orders", 201)]),
+        Step(3, "goto", url="https://docs.example.com/help?q=s3cret-pass"),
+    ]
+    s._token("Password", "s3cret-pass")
+    s._times += [1.0, 2.0]
+    journey, _ = s.finish()
+    assert journey.format == "2.0" and journey.steps[2].url.endswith("?q=" + next(iter(
+        journey.secrets)))  # fmt: skip
+    assert s.warnings == [
+        "step 2 (reload) sent POST /api/orders again on the source, and replay will send it "
+        "to the target; record the journey again without it if that was not meant",
+        "step 3 opens https://docs.example.com from the instance at replay, not the target; "
+        "record the journey again without it if it was a detour"]  # fmt: skip
+
+
+def test_the_request_of_a_navigation_never_shown_is_no_steps():
+    s = _watched()
+    s.watch.abandoned = [{"url": "http://source.invalid/export", "t": 5000.0}]
+
+    def doc(url, started):
+        return Captured(Exchange("GET", url, 0, resource_type="document"), started, None, None,
+                        None)  # fmt: skip
+
+    kept = [doc("/export", 100.0), doc("/orders", 0.0)]
+    s._captured = [kept[0], doc("/export", 5003.0), kept[1]]
+    s._drop_abandoned()
+    assert s._captured == kept
+    s.watch.abandoned = [{"url": "http://source.invalid/orders", "t": 9000.0}]
+    s._drop_abandoned()  # a failed request has no start time
+    assert s._captured == kept[:1]
+
+
+def _journey_file(tmp_path, steps, fmt="2.0"):
+    from liftproof.cli import _journey_dir
+
+    j = Journey("j", "http://source.invalid", steps=steps, format=fmt)
+    j.save(_journey_dir(tmp_path) / "j.json")
+    return j
+
+
+@pytest.mark.parametrize(("step", "fmt", "says"), [
+    (Step(2, "hover", locator=Locator([{"kind": "text", "value": "Help"}])), "2.0",
+     "step 2: unknown action 'hover'"),
+    (Step(2, "back", value="0"), "2.0", "step 2: back by '0' entries"),
+    (Step(2, "forward", value="two"), "2.0", "step 2: forward by 'two' entries"),
+    (Step(2, "goto"), "1.1", "step 2: goto without a url"),
+    (Step(2, "reload"), "1.1", "step 2: reload needs journey format 2.0"),
+])  # fmt: skip
+def test_a_step_this_build_cannot_replay_refuses_to_load(tmp_path, step, fmt, says):
+    from liftproof.cli import _load_journey
+    from liftproof.store import LocalStore
+
+    _journey_file(tmp_path, [Step(1, "goto", url="/"), step], fmt)
+    with pytest.raises(ConfigError, match=f"^journey j, {says}$"):
+        _load_journey(LocalStore(tmp_path), tmp_path, "j")
+
+
+def test_journeys_load_in_both_formats(tmp_path, monkeypatch):
+    from liftproof.cli import _load_journey
+    from liftproof.store import LocalStore
+    from liftproof.web import journey as journey_mod
+
+    old = {"journey_id": "j", "base_url": "http://s", "format": "1.0",
+           "steps": [{"n": 1, "action": "goto", "url": "/"}]}  # fmt: skip
+    assert Journey.from_dict(old).to_dict()["steps"] == Journey.from_dict(
+        Journey.from_dict(old).to_dict()).to_dict()["steps"]  # fmt: skip
+    j = _journey_file(tmp_path, [Step(1, "goto", url="/"), Step(2, "back", value="2")])
+    assert _load_journey(LocalStore(tmp_path), tmp_path, "j").to_dict() == j.to_dict()
+    # a build that reads 1.x only refuses it as it loads, not as it replays
+    monkeypatch.setattr(journey_mod, "READ_FORMATS", ("1",))
+    with pytest.raises(ConfigError, match="journey j has format 2.0; this build reads"):
+        Journey.from_dict(j.to_dict())
+
+
+def test_doctor_says_what_to_do_with_a_journey_that_does_not_load(tmp_path, monkeypatch, capsys):
+    from liftproof import cli
+
+    monkeypatch.setattr(cli, "INSTANCE_CONFIG", tmp_path / "instance.yaml")
+    p = tmp_path / "p.yaml"
+    web = {"source_url": "http://s.invalid", "target_url": "http://t.invalid"}
+    p.write_text(yaml.safe_dump({"project": "t", "web": web}))
+    _journey_file(tmp_path / "w" / "t", [Step(1, "goto", url="/"), Step(2, "hover")])
+    cli.main(["doctor", "--project", str(p), "--workdir", str(tmp_path / "w"), "--format", "json"])
+    checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+    loads = checks["journey j loads"]
+    assert (loads["result"], loads["detail"]) == (
+        "fail", "journey j, step 2: unknown action 'hover'")  # fmt: skip
+    assert loads["remedy"].startswith("record the journey with liftproof record")
+    assert "journey j secrets resolve" not in checks
+
+
+class _Context:
+    """A browser context whose page Back times out."""
+
+    browser = SimpleNamespace(is_connected=lambda: True)
+
+    def new_page(self):
+        return _Page()
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_traversal_is_never_retried_on_its_own(monkeypatch):
+    """Run again after a timeout, a Back that did go through would move twice."""
+    tries = []
+
+    def step(self, page, net, s, sr, j, run, secrets):
+        tries.append(s.n)
+        if s.action == "back":
+            raise RuntimeError("Timeout 3000ms exceeded.")
+
+    monkeypatch.setattr(Replayer, "_step", step)
+    browser = SimpleNamespace(new_context=lambda: (_Context(), False), gone=False)
+    j = Journey("j", "http://x", steps=[Step(1, "goto", url="/a"), Step(2, "back")])
+    run = Replayer("http://t", secret_values=lambda j: {})._journey(browser, j)
+    assert tries == [1, 2, 1, 2]  # once in each attempt of the journey
+    assert (run.status, run.failure_kind, run.attempts) == ("failed", "transport", 2)
+    assert [(f["step"], f["unit"]) for f in run.flakes] == [(2, "journey")]

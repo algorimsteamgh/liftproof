@@ -13,6 +13,11 @@ Each release's numbers are kept in `perf-results.json` with the release evidence
 | Runs failing for tool reasons, not real differences | under 2 % of runs | In the field: run history (`liftproof runs`), counting runs that end with exit code 2 or carry flakes. Release test: 60 replays against an unchanged target, where any run that does not pass first time, cleanly, is the tool's failure | `test_kpi_tool_failures_under_two_percent` |
 | Time from AMI launch to first recorded journey | under 30 minutes for a new engineer | Timed by hand on a fresh instance for each release, from launching the stack to the first `liftproof record` finishing, following only the deployment guide. Recorded in the release evidence | manual |
 
+The same manual pass records one journey using the window's own address bar, toolbar Back
+and Reload, and replays it clean (decision 140): the tests drive those through Playwright,
+which reaches the browser by the same commands but does not skip the history entries a page
+added without a click, as the toolbar's Back does.
+
 The suite also holds the streaming design in place (spec 17): drilling into differences
 spread over 13 buckets of a 1,000,000 row table must not grow the process by 200 MB or
 more (`test_large_table_drill_down_streams`), and a replay worker must not hold a journey's

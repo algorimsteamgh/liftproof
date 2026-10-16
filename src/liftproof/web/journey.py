@@ -20,6 +20,13 @@ from typing import Any
 from liftproof.errors import ConfigError
 
 JOURNEY_FORMAT = "1.1"
+# A journey with a navigation the browser itself made is format 2.0, so a build that cannot
+# replay one refuses it as it loads; every other journey stays 1.x, which older builds read
+NAVIGATION_FORMAT = "2.0"
+READ_FORMATS = ("1", "2")  # the majors this build reads
+STEP_ACTIONS = ("goto", "click", "fill", "select", "check", "uncheck", "press", "reload",
+                "back", "forward")  # fmt: skip
+BROWSER_NAVIGATIONS = ("reload", "back", "forward")
 REGION_SHAPE_VERSION = 1  # of region_shape(): shapes made by another are not compared
 TOKEN_PREFIX = "@@REDACTED_"  # noqa: S105 - the marker, not a secret
 
@@ -55,10 +62,10 @@ class Exchange:
 @dataclass
 class Step:
     n: int
-    action: str  # goto | click | fill | select | check | uncheck | press
+    action: str  # STEP_ACTIONS
     url: str | None = None
     locator: Locator | None = None
-    value: str | None = None
+    value: str | None = None  # for back and forward, the entries moved when more than one
     non_idempotent: bool = False  # the step's requests changed state (POST, PUT, PATCH, DELETE)
     exchanges: list[Exchange] = field(default_factory=list)
     # the accessible tree of the region the step touched, after it ran, inline: journeys
@@ -171,10 +178,10 @@ class Journey:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Journey:
-        if d.get("format", JOURNEY_FORMAT).split(".")[0] != JOURNEY_FORMAT.split(".")[0]:
+        if d.get("format", JOURNEY_FORMAT).split(".")[0] not in READ_FORMATS:
             raise ConfigError(
                 f"journey {d.get('journey_id')} has format {d.get('format')}; "
-                f"this build reads {JOURNEY_FORMAT}"
+                f"this build reads {JOURNEY_FORMAT} and {NAVIGATION_FORMAT}"
             )
         steps = []
         for s in d.get("steps", []):
@@ -211,6 +218,20 @@ class Journey:
             raise ConfigError(f"journey file not found: {path}") from None
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise ConfigError(f"journey file {path} is not valid: {exc}") from None
+
+
+def check_steps(journey: Journey) -> None:
+    """Refuse a step this build cannot replay as recorded, before anything runs."""
+    for s in journey.steps:
+        if s.action not in STEP_ACTIONS:
+            raise ValueError(f"step {s.n}: unknown action {s.action!r}")
+        if s.action == "goto" and not s.url:
+            raise ValueError(f"step {s.n}: goto without a url")
+        if s.action in BROWSER_NAVIGATIONS and not journey.format.startswith("2."):
+            raise ValueError(f"step {s.n}: {s.action} needs journey format {NAVIGATION_FORMAT}")
+        if s.action in ("back", "forward") and s.value is not None:
+            if not re.fullmatch(r"[1-9][0-9]*", s.value):
+                raise ValueError(f"step {s.n}: {s.action} by {s.value!r} entries")
 
 
 def sha256(data: bytes) -> str:
