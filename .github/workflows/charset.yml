@@ -110,7 +110,12 @@ jobs:
           docker exec oracle bash -c \
             'printf "ALTER PLUGGABLE DATABASE FREEPDB1 SAVE STATE;\nEXIT\n" \
                | "$ORACLE_HOME/bin/sqlplus" -s / as sysdba'
-          until docker exec oracle /opt/oracle/checkDBStatus.sh; do
+          # the image's health script never reports a database it did not create as ready,
+          # so wait for FREEPDB1 itself to take a connection
+          docker exec oracle /opt/oracle/checkDBStatus.sh || true
+          until python -c 'import os, oracledb; oracledb.connect(user="system",
+                password=os.environ["LIFTPROOF_TEST_ORACLE_PASSWORD"], host="127.0.0.1",
+                port=1521, service_name="FREEPDB1").close()'; do
             if [ $((SECONDS - start)) -gt 2400 ]; then
               echo "Oracle not recreated after $((SECONDS - start)) s"
               exit 1
