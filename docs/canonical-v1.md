@@ -178,6 +178,12 @@ reports each such row as a changed value; ignore the column if that mapping is i
 The pushdown is `coalesce(<finite rendering>, c::text)`: `to_char` gives NULL for both
 words, and their text form does not depend on `DateStyle`.
 
+A database whose server encoding is not UTF8 (LATIN1, WIN1252) has no `normalize()`, and
+`md5` there would hash its own bytes. Its text and char columns are read through the UTF8
+client encoding and hashed application side; a table without them is still hashed in the
+database. `tests/test_charset_pg.py` holds LATIN1 and WIN1252 databases to the hashes of
+UTF8 ones.
+
 ### MySQL type mapping and engine specific rules
 
 | MySQL | Canonical | Note |
@@ -207,7 +213,9 @@ accident:
 
 MySQL has no Unicode normalisation function, so a row whose text and char values are all
 ASCII is hashed in the database and every other row is hashed application side; the two
-are summed. The cost is proportional to the non-ASCII rows only.
+are summed. The cost is proportional to the non-ASCII rows only. The test for ASCII and
+the rendering both go through `CONVERT(c USING utf8mb4)`, so a `latin1` (Windows-1252)
+column, one byte per character, is held to the same rule (`tests/test_mysql_parity.py`).
 
 Oracle sessions pin `TIME_ZONE='+00:00'` and `NLS_NUMERIC_CHARACTERS='.,'`; every
 rendering uses an explicit format, so no other NLS setting matters.
@@ -243,6 +251,17 @@ strings stop at 4000 bytes, so a row is hashed in the database only when its tex
 are plain ASCII of at most 3990 characters, its RAW values are at most 1995 bytes, and its
 decimals print without an exponent. Every other row is hashed application side; the two
 are summed.
+
+Single-byte sources (WE8MSWIN1252, WE8ISO8859P1) need nothing more, and this is how the
+Technical Specification's `CONVERT(col, 'AL32UTF8')` is met. The test for ASCII is
+`ASCIISTR(c) = c`, which escapes every other character in any character set, so the only
+rows hashed in Oracle are those whose bytes are the same in UTF-8. python-oracledb always
+asks for AL32UTF8, so Oracle transcodes every other row before the reference
+implementation hashes it. A test counting bytes against characters (`LENGTHB(c) =
+LENGTH(c)`) would pass on AL32UTF8 and hash the Windows-1252 bytes of `é`;
+`tests/test_charset_oracle.py` runs against a WE8MSWIN1252 database to catch that. A key
+in `NVARCHAR2` or `NCHAR` is fetched for drill-down as itself, bound as `NVARCHAR`, since
+`TO_CHAR` would turn a character outside the database character set into `¿`.
 
 ### SQL Server type mapping and engine specific rules
 

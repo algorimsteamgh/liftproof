@@ -53,14 +53,16 @@ def pg_available():
 
 @pytest.fixture
 def make_db(pg_available):
-    """Factory creating throwaway databases; returns (dbname, raw connection)."""
+    """Factory creating throwaway databases; returns (dbname, raw connection). A database in
+    another encoding (LATIN1, WIN1252) gets the C locale, which every encoding accepts."""
     created: list[str] = []
     conns: list[psycopg.Connection] = []
 
-    def factory(prefix: str = "t"):
+    def factory(prefix: str = "t", encoding: str = "UTF8"):
         name = f"liftproof_{prefix}_{uuid.uuid4().hex[:8]}"
+        locale = "" if encoding == "UTF8" else " LC_COLLATE 'C' LC_CTYPE 'C'"
         with _admin() as c:
-            c.execute(f'CREATE DATABASE "{name}" ENCODING UTF8 TEMPLATE template0')
+            c.execute(f'CREATE DATABASE "{name}" ENCODING {encoding}{locale} TEMPLATE template0')
         created.append(name)
         conn = psycopg.connect(
             host=PG["host"], port=PG["port"], user=PG["user"], password=PG["password"],
@@ -192,6 +194,9 @@ ORA = {
     "service": os.environ.get("LIFTPROOF_TEST_ORACLE_SERVICE", "FREEPDB1"),
     "user": os.environ.get("LIFTPROOF_TEST_ORACLE_USER", "system"),
     "password": os.environ.get("LIFTPROOF_TEST_ORACLE_PASSWORD", "ci-only-local-service"),
+    # set when the run exists to test a server in this character set (charset.yml): a
+    # server that is missing or in another one then fails the run rather than skipping
+    "charset": os.environ.get("LIFTPROOF_TEST_ORACLE_CHARSET"),
 }
 
 
@@ -210,12 +215,22 @@ def _ora_connect(user: str | None = None, password: str | None = None):
 
 @pytest.fixture(scope="session")
 def oracle_available():
+    """The server's database character set (NLS_CHARACTERSET)."""
     import oracledb
 
     try:
-        _ora_connect().close()
-    except oracledb.Error:
+        with _ora_connect() as c, c.cursor() as cur:
+            cur.execute(
+                "SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER = 'NLS_CHARACTERSET'"
+            )
+            (charset,) = cur.fetchone()
+    except oracledb.Error as exc:
+        if ORA["charset"]:
+            pytest.fail(f"no {ORA['charset']} Oracle server for tests: {exc}")
         pytest.skip("no Oracle server for tests")
+    if ORA["charset"] and charset != ORA["charset"]:
+        pytest.fail(f"the Oracle test server is {charset}, expected {ORA['charset']}")
+    return charset
 
 
 @pytest.fixture

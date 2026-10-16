@@ -9,7 +9,7 @@ import datetime as dt
 import pytest
 
 from liftproof.adapters.base import ForeignKey, HashPlan, Index, TableRef
-from liftproof.adapters.mysql import MySQLAdapter, prepare
+from liftproof.adapters.mysql import MySQLAdapter, _ascii_sql, prepare
 from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import Verbatim, render
 from tests.conftest import type_map_alternatives
@@ -121,6 +121,29 @@ def test_non_ascii_rows_take_the_reference_path(loaded):
         r[0]: r[1] for r in a._query(f"SELECT id, label FROM `{db}`.everything WHERE id IN (2, 5)")
     }
     assert render(rendered[2], T.TEXT) == render(rendered[5], T.TEXT) == "café"
+
+
+def test_latin1_text_hashes_as_its_utf8mb4_copy(make_mysql_db, mysql_adapter_for):
+    """MySQL's latin1 is Windows-1252, one byte per character. Only ASCII rows are hashed
+    in MySQL, so a gate counting the stored bytes would admit é and hash its latin1 byte."""
+    db, cur = make_mysql_db()
+    cur.execute("CREATE TABLE legacy (id int PRIMARY KEY, "
+                "l1 varchar(100) CHARACTER SET latin1, u8 varchar(100))")  # fmt: skip
+    values = ["Café crème – € Š", "plain", None, "back\\slash", "Ÿ"]
+    cur.executemany("INSERT INTO legacy VALUES (%s, %s, %s)",
+                    [(i, v, v) for i, v in enumerate(values, 1)])  # fmt: skip
+    cur.execute("SELECT MAX(LENGTH(l1) - CHAR_LENGTH(l1)), MAX(LENGTH(u8) - CHAR_LENGTH(u8)) "
+                "FROM legacy")  # fmt: skip
+    assert cur.fetchone() == (0, 7)
+    a = mysql_adapter_for(db)
+    table = TableRef(db, "legacy")
+    assert {c.name: c.canonical for c in a.describe(table).columns}["l1"] is T.TEXT
+    l1 = HashPlan(table, [("id", T.INTEGER), ("l1", T.TEXT)], ["id"], 3)
+    u8 = HashPlan(table, [("id", T.INTEGER), ("u8", T.TEXT)], ["id"], 3)
+    found = a._query(f"SELECT id FROM `{db}`.legacy WHERE {_ascii_sql(l1.columns)}")
+    assert sorted(r[0] for r in found) == [2, 3, 4]
+    assert a.bucket_aggregates(l1) == a._bucket_aggregates_fallback(l1) == a.bucket_aggregates(u8)
+    assert sorted(a.row_hashes(l1, {0, 1, 2})) == sorted(a.row_hashes(u8, {0, 1, 2}))
 
 
 def test_describe_maps_types(loaded):

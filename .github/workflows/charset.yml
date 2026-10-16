@@ -1,0 +1,118 @@
+name: charset
+
+# Character set fixtures (spec 19): the Oracle parity and character set tests against a
+# WE8MSWIN1252 database, created from Oracle's own Free image (the gvenzl images are
+# AL32UTF8 only). Gates every release (release.yml calls it), runs on pull requests that
+# touch the code the rule lives in, weekly against upstream image drift, and by hand.
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+  pull_request:
+    paths:
+      - "src/liftproof/adapters/oracle.py"
+      - "src/liftproof/canonical/**"
+      - "src/liftproof/reconcile/**"
+      - "tests/conftest.py"
+      - "tests/test_charset_oracle.py"
+      - "tests/test_oracle_parity.py"
+      - ".github/workflows/charset.yml"
+
+permissions:
+  contents: read
+
+# Every run step is bash with pipefail, so a piped command (pip-audit | tee) fails the
+# step when the first command fails, not only when the last one does.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  oracle-single-byte:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-local-service
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      ORACLE_IMAGE: container-registry.oracle.com/database/free:23.26.0.0
+      LIFTPROOF_TEST_PG_HOST: localhost
+      LIFTPROOF_TEST_PG_PORT: "5432"
+      LIFTPROOF_TEST_PG_USER: postgres
+      LIFTPROOF_TEST_PG_PASSWORD: ci-only-local-service
+      LIFTPROOF_TEST_ORACLE_HOST: 127.0.0.1
+      LIFTPROOF_TEST_ORACLE_PORT: "1521"
+      LIFTPROOF_TEST_ORACLE_SERVICE: FREEPDB1
+      LIFTPROOF_TEST_ORACLE_USER: system
+      LIFTPROOF_TEST_ORACLE_PASSWORD: ci-only-local-service
+      LIFTPROOF_TEST_ORACLE_CHARSET: WE8MSWIN1252
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # Started from a step, not as a service: services start before any step, so there
+      # would be no room to free disk first and no log when the database fails to create
+      - name: Free disk for the Oracle image
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Start Oracle Free in WE8MSWIN1252
+        run: |
+          docker run -d --name oracle -p 1521:1521 -e ORACLE_PWD=ci-only-local-service \
+            -e ORACLE_CHARACTERSET=WE8MSWIN1252 "$ORACLE_IMAGE"
+      - run: python -m pip install -e ".[dev]"
+      - name: Wait for the database (created on first start)
+        run: |
+          start=$SECONDS
+          until docker exec oracle /opt/oracle/checkDBStatus.sh; do
+            if [ "$(docker inspect -f '{{.State.Running}}' oracle)" != true ]; then
+              echo "Oracle container stopped after $((SECONDS - start)) s"
+              exit 1
+            fi
+            if [ $((SECONDS - start)) -gt 2400 ]; then
+              echo "Oracle not ready after $((SECONDS - start)) s"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Oracle ready after $((SECONDS - start)) s"
+          df -h /
+      - name: Character set as seen from FREEPDB1
+        run: |
+          python - <<'EOF'
+          import os
+
+          import oracledb
+
+          with oracledb.connect(
+              user="system", password=os.environ["LIFTPROOF_TEST_ORACLE_PASSWORD"],
+              host="127.0.0.1", port=1521, service_name="FREEPDB1",
+          ) as conn, conn.cursor() as cur:
+              cur.execute(
+                  "SELECT PARAMETER, VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER IN "
+                  "('NLS_CHARACTERSET', 'NLS_NCHAR_CHARACTERSET', 'NLS_RDBMS_VERSION')"
+              )
+              for name, value in cur:
+                  print(f"{name}={value}")
+              cur.execute("SELECT LENGTHB('é') FROM DUAL")
+              print("LENGTHB('é') =", cur.fetchone()[0])
+          EOF
+      - name: Character set fixtures (spec 19). A skip of the character set test is a failure
+        run: |
+          python -m pytest -p no:cacheprovider -rs -m "not mysql" \
+            tests/test_charset_oracle.py tests/test_oracle_parity.py | tee pytest.log
+          if grep -q "^SKIPPED .*test_charset_oracle.py" pytest.log; then
+            grep "^SKIPPED .*test_charset_oracle.py" pytest.log
+            exit 1
+          fi
+      - name: Oracle log
+        if: failure()
+        run: docker logs oracle 2>&1 | tail -n 300

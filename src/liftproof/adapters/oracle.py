@@ -60,6 +60,7 @@ from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
 
 LOB_TYPES = {"CLOB", "NCLOB", "BLOB"}
+NATIONAL_TYPES = {"NVARCHAR2", "NCHAR"}
 TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
 PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {
     CanonicalType.JSON,
@@ -708,12 +709,30 @@ class OracleAdapter(Adapter):
             rows += self._fallback_row_hashes(plan, wanted, where=f"NOT ({pushable})")
         yield from rows
 
+    def _match_sql(self, plan: HashPlan) -> list[tuple[str, bool]]:
+        """Each key's expression for fetch_rows, and whether it is national (bound as
+        NVARCHAR). A national text key is matched as itself: TO_CHAR, like a VARCHAR2 bind,
+        converts it to the database character set, where a character outside that set
+        (Ω in WE8MSWIN1252) becomes a replacement character and the row is never found."""
+        natives = self._native(plan.table)
+        types = dict(plan.columns)
+        out = []
+        for k in plan.key_columns:
+            if natives.get(k) in NATIONAL_TYPES and types[k] in TEXT_TYPES:
+                expr = quote(k) if types[k] is CanonicalType.TEXT else f"RTRIM({quote(k)}, ' ')"
+                out.append((expr, True))
+            else:
+                out.append((self._render(plan, k, types[k]), False))
+        return out
+
     def fetch_rows(
         self, plan: HashPlan, keys: Sequence[tuple[Any, ...]]
     ) -> dict[tuple[Any, ...], list[Any]]:
         if not keys or not plan.key_columns:
             return {}
-        key_exprs = self._key_sql(plan)
+        match = self._match_sql(plan)
+        key_exprs = ", ".join(e for e, _ in match)
+        sizes = [oracledb.DB_TYPE_NVARCHAR if national else None for _, national in match]
         nk = len(plan.key_columns)
         types = [t for _, t in plan.columns]
         out: dict[tuple[Any, ...], list[Any]] = {}
@@ -724,11 +743,16 @@ class OracleAdapter(Adapter):
                 for i in range(len(chunk))
             )
             q = (
-                f"SELECT {', '.join(key_exprs)}, {self._select_sql(plan)} "
-                f"FROM {self._ident(plan.table)} WHERE ({', '.join(key_exprs)}) IN ({tuples})"
+                f"SELECT {key_exprs}, {self._select_sql(plan)} "
+                f"FROM {self._ident(plan.table)} WHERE ({key_exprs}) IN ({tuples})"
             )
             args = [v for k in chunk for v in k]
-            for r in self._query(q, args):
+            with self.conn.cursor() as cur:
+                if any(national for _, national in match):
+                    cur.setinputsizes(*(sizes * len(chunk)))
+                cur.execute(q, args)
+                rows = cur.fetchall()
+            for r in rows:
                 out[tuple(r[:nk])] = [prepare(v, t) for v, t in zip(r[nk:], types, strict=True)]
         return out
 

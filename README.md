@@ -310,6 +310,12 @@ Database tests need PostgreSQL, MySQL, Oracle and SQL Server: set
 `_USER`, `_PASSWORD`, and `LIFTPROOF_TEST_MSSQL_HOST`, `_PORT`, `_USER`, `_PASSWORD` (CI uses
 service containers; for Oracle, `gvenzl/oracle-free:23-slim-faststart`, for SQL Server,
 `mcr.microsoft.com/mssql/server:2022-latest`); they are skipped when no server is reachable.
+The character set tests (spec 19) also need a WE8MSWIN1252 Oracle, which only Oracle's own
+Free image can create; `.github/workflows/charset.yml` starts one, and
+`tests/test_charset_oracle.py` says how to run it locally. With
+`LIFTPROOF_TEST_ORACLE_CHARSET` set, a missing Oracle or one in another character set fails
+the tests instead of skipping them. LATIN1 and WIN1252 PostgreSQL databases are created on
+the PostgreSQL test server.
 Cross engine tests load the same data into each engine and require identical hashes. The suite includes the golden vectors that pin the
 canonical wire format, pushdown against fallback parity for every type rule, and the
 PRD F6 acceptance test (a ten row injected difference, reported exactly).

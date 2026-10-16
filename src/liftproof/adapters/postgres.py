@@ -6,6 +6,10 @@ network. Tables containing a column that PostgreSQL cannot canonicalise identica
 streaming rows through the reference implementation. Both paths are held to byte
 identical output by the parity tests.
 
+A database whose server encoding is not UTF8 (LATIN1, WIN1252) has no normalize() and
+md5 would hash its own bytes, so its text and char columns are hashed application side,
+read through the UTF8 client encoding.
+
 Dates and timestamps can be infinity or -infinity, which no Python date holds and to_char
 renders as NULL. Both paths render them as PostgreSQL prints them (canonical revision 1).
 """
@@ -51,6 +55,7 @@ from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
 
 PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON, CanonicalType.XML}
+TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
 INFINITE_TYPES = {CanonicalType.DATE, CanonicalType.TIMESTAMP, CanonicalType.TIMESTAMPTZ}
 INFINITE = {b"infinity": Verbatim("infinity"), b"-infinity": Verbatim("-infinity")}
 
@@ -66,9 +71,12 @@ SESSION = {
 }
 
 
-def render_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sql.Composable:
-    """PostgreSQL expression producing the canonical rendering of one column, or NULL."""
-    expr = _finite_sql(col, ctype, precision)
+def render_sql(
+    col: sql.Composable, ctype: CanonicalType, precision: int, nfc: bool = True
+) -> sql.Composable:
+    """PostgreSQL expression producing the canonical rendering of one column, or NULL.
+    Without nfc, text is left as stored: normalize() needs a UTF8 server."""
+    expr = _finite_sql(col, ctype, precision, nfc)
     if ctype in INFINITE_TYPES:
         # to_char is NULL only for NULL and for infinity and -infinity, which render as
         # PostgreSQL prints them in any DateStyle; the cast runs for those rows alone
@@ -76,7 +84,9 @@ def render_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sql
     return expr
 
 
-def _finite_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sql.Composable:
+def _finite_sql(
+    col: sql.Composable, ctype: CanonicalType, precision: int, nfc: bool = True
+) -> sql.Composable:
     match ctype:
         case CanonicalType.INTEGER | CanonicalType.UUID:
             return sql.SQL("({})::text").format(col)
@@ -86,10 +96,14 @@ def _finite_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sq
             return sql.SQL("CASE WHEN {c} IS NULL THEN NULL WHEN {c} THEN '1' ELSE '0' END").format(
                 c=col
             )
-        case CanonicalType.TEXT:
+        case CanonicalType.TEXT if nfc:
             return sql.SQL("normalize(({})::text, NFC)").format(col)
-        case CanonicalType.CHAR:
+        case CanonicalType.TEXT:
+            return sql.SQL("({})::text").format(col)
+        case CanonicalType.CHAR if nfc:
             return sql.SQL("normalize(rtrim(({})::text, ' '), NFC)").format(col)
+        case CanonicalType.CHAR:
+            return sql.SQL("rtrim(({})::text, ' ')").format(col)
         case CanonicalType.DATE:
             return sql.SQL("to_char({}, 'YYYY-MM-DD')").format(col)
         case CanonicalType.BINARY:
@@ -260,6 +274,7 @@ class PostgresAdapter(Adapter):
             settings, rows_per_second=str(rows_per_second), pause_ms=str(pause_ms)
         )
         self._in_snapshot = False
+        self._utf8 = self.conn.info.parameter_status("server_encoding") == "UTF8"
         self.require_version(_shown_version(self.conn.info.server_version))
 
     def close(self) -> None:
@@ -447,7 +462,10 @@ class PostgresAdapter(Adapter):
 
     # hashing ------------------------------------------------------------------
     def _pushdown(self, plan: HashPlan) -> bool:
-        return all(ctype in PUSHDOWN_TYPES for _, ctype in plan.columns)
+        return all(
+            ctype in PUSHDOWN_TYPES and (self._utf8 or ctype not in TEXT_TYPES)
+            for _, ctype in plan.columns
+        )
 
     def _digests_sql(self, plan: HashPlan) -> list[sql.Composable]:
         return [
@@ -457,7 +475,10 @@ class PostgresAdapter(Adapter):
 
     def _key_sql(self, plan: HashPlan) -> list[sql.Composable]:
         types = dict(plan.columns)
-        return [render_sql(sql.Identifier(k), types[k], plan.precision) for k in plan.key_columns]
+        return [
+            render_sql(sql.Identifier(k), types[k], plan.precision, self._utf8)
+            for k in plan.key_columns
+        ]
 
     def _hash_query(self, plan: HashPlan) -> sql.Composable:
         digests = self._digests_sql(plan)
