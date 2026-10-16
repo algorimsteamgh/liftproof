@@ -86,19 +86,30 @@ jobs:
           echo "Oracle ready after $((SECONDS - start)) s"
           df -h /
       # The registry image ships a database already created in AL32UTF8, so it ignores
-      # ORACLE_CHARACTERSET. Delete it and configure a new one through the image's own
-      # init script, the way docker-images' createDB.sh does when it creates the database.
+      # ORACLE_CHARACTERSET. Delete it and create a new one with DBCA as the oracle user
+      # (DBCA refuses root, so the image's init script cannot do it from here), from the
+      # template the init script configures with.
       - name: Recreate the database in WE8MSWIN1252
         run: |
-          docker exec -u root oracle bash -c 'ls /etc/init.d/ /etc/sysconfig/'
-          script=$(docker exec oracle bash -c 'ls /etc/init.d/oracle-free-* | head -n 1')
-          conf=$(docker exec oracle bash -c 'ls /etc/sysconfig/oracle-free-*.conf | head -n 1')
+          docker exec oracle bash -c \
+            'grep -n "dbca\|DBCA\|CHARSET\|TEMPLATE" /etc/init.d/oracle-free-*ai | head -n 40;
+             ls "$ORACLE_HOME/assistants/dbca/templates/"'
           start=$SECONDS
-          { yes || true; } | docker exec -i -u root oracle "$script" delete
-          docker exec -u root oracle sed -i 's/^CHARSET=.*/CHARSET=WE8MSWIN1252/' "$conf"
-          docker exec -u root oracle grep '^CHARSET=' "$conf"
-          printf '%s\n%s\n' "$LIFTPROOF_TEST_ORACLE_PASSWORD" "$LIFTPROOF_TEST_ORACLE_PASSWORD" \
-            | docker exec -i -u root oracle "$script" configure
+          docker exec -e PW="$LIFTPROOF_TEST_ORACLE_PASSWORD" oracle bash -c \
+            '"$ORACLE_HOME/bin/dbca" -silent -deleteDatabase -sourceDB FREE \
+               -sysDBAUserName sys -sysDBAPassword "$PW"'
+          docker exec -e PW="$LIFTPROOF_TEST_ORACLE_PASSWORD" oracle bash -c \
+            'template=$(ls "$ORACLE_HOME/assistants/dbca/templates/" | grep -m 1 "^FREE.*\.dbc$");
+             "$ORACLE_HOME/bin/dbca" -silent -createDatabase -templateName "$template" \
+               -gdbName FREE -sid FREE -characterSet WE8MSWIN1252 \
+               -nationalCharacterSet AL16UTF16 -createAsContainerDatabase true \
+               -numberOfPDBs 1 -pdbName FREEPDB1 -pdbAdminPassword "$PW" \
+               -sysPassword "$PW" -systemPassword "$PW" -emConfiguration NONE \
+               -storageType FS -datafileDestination "$ORACLE_BASE/oradata" \
+               -initParams sga_target=1536M,pga_aggregate_target=512M'
+          docker exec oracle bash -c \
+            'printf "ALTER PLUGGABLE DATABASE FREEPDB1 SAVE STATE;\nEXIT\n" \
+               | "$ORACLE_HOME/bin/sqlplus" -s / as sysdba'
           until docker exec oracle /opt/oracle/checkDBStatus.sh; do
             if [ $((SECONDS - start)) -gt 2400 ]; then
               echo "Oracle not recreated after $((SECONDS - start)) s"
