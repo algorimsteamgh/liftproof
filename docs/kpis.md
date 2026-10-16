@@ -14,7 +14,7 @@ Each release's numbers are kept in `perf-results.json` with the release evidence
 | Time from AMI launch to first recorded journey | under 30 minutes for a new engineer | Timed by hand on a fresh instance for each release, from launching the stack to the first `liftproof record` finishing, following only the deployment guide. Recorded in the release evidence | manual |
 
 The same manual pass records one journey using the window's own address bar, toolbar Back
-and Reload, and replays it clean (decision 140): the tests drive those through Playwright,
+and Reload, and replays it clean (decision 132): the tests drive those through Playwright,
 which reaches the browser by the same commands but does not skip the history entries a page
 added without a click, as the toolbar's Back does.
 

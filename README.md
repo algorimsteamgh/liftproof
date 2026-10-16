@@ -49,8 +49,8 @@ window. Typing an address, Back, Forward and Reload in that window are steps too
 navigation the page makes itself (a link, a form, a redirect) is part of the step that
 caused it. `record` warns about a step to check: an address on another site, which replay
 opens from the instance, a Reload or Back that sent a form again (Chromium does not ask),
-and a Back whose count it could not be sure of. Passwords become random tokens before anything is written; `bind` points each
-token at a Secrets Manager secret for replay. Values the server generates (order ids,
+and a Back whose count it could not be sure of. Passwords become random tokens before
+anything is written; `bind` points each token at a Secrets Manager secret for replay. Values the server generates (order ids,
 CSRF tokens, ASP.NET view state) are detected as correlations, substituted forward at
 replay, and never reported as differences. A correlation the replay could not carry
 forward (its rule found nothing in the target's response, the value would not decode, the

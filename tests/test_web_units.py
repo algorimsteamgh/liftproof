@@ -41,8 +41,8 @@ from liftproof.web.journey import (
     sha256,
     shape,
 )
-from liftproof.web.recorder import NavigationWatch, RecordingSession, typed_url
-from liftproof.web.replay import JourneyRun, Replayer, StepRun
+from liftproof.web.recorder import NavigationWatch, RecordingSession, old_chromium, typed_url
+from liftproof.web.replay import JourneyRun, Replayer, StepRun, WrongPage
 from liftproof.web.run import REASON_STOPPED, WebResult, run_journeys
 from tests import fakereplay
 
@@ -1214,11 +1214,39 @@ def test_navigation_watch_tells_browser_from_page():
     assert NavigationWatch(_Cdp(closed=True), "main").history_index() is None
 
 
+def test_a_page_request_hides_its_navigation_across_one_taking_of_steps():
+    w = NavigationWatch(_Cdp(), "main")
+    page = "http://a/orders"
+    # steps were taken between the page asking and the navigation starting
+    w._requested({"frameId": "main", "url": page, "disposition": "currentTab"})
+    w.forget()
+    w._start(_started(page))
+    w._navigated(_committed(page))
+    assert w.navs == []
+    # a request that never started does not hide the same address typed later
+    w._requested({"frameId": "main", "url": page, "disposition": "currentTab"})
+    w.forget()
+    w.forget()
+    w._start(_started(page, loader="L2"))
+    w._navigated(_committed(page, loader="L2"))
+    assert [n["action"] for n in w.navs] == ["goto"]
+
+
 def test_typed_url_keeps_path_query_fragment_or_full_url():
     assert typed_url("http://src:8080/a?b=1#/c", "http://src:8080") == "/a?b=1#/c"
     assert typed_url("http://src:8080", "http://src:8080") == "/"
     for other in ("https://src:8080/a", "http://localhost:8080/a", "https://example.com/?q=x"):
         assert typed_url(other, "http://src:8080") == other
+    # the origin as the browser compares it; a user and password are never kept
+    assert typed_url("http://bob:hunter2@src:8080/a", "http://src:8080") == "/a"
+    assert typed_url("http://src/a", "http://SRC:80/app") == "/a"
+    assert typed_url("https://bob:hunter2@docs.example.com/x?y=1", "http://src:8080") == (
+        "https://docs.example.com/x?y=1")  # fmt: skip
+
+
+def test_record_warns_of_a_chromium_older_than_the_navigation_signals():
+    assert old_chromium("141.0.7390.37") is None and old_chromium("unknown") is None
+    assert old_chromium("120.0.6099.28").startswith("Chromium 120.0.6099.28 is older than 141")
 
 
 def _watched(index=0, closed=False):
@@ -1232,10 +1260,14 @@ def _watched(index=0, closed=False):
 @pytest.mark.parametrize(("index", "closed", "events", "taken", "warned"), [
     (1, False, [{"action": "traverse", "delta": -1, "t": 5}], ("back", "2"), True),
     (5, False, [{"action": "traverse", "delta": 2, "t": 5}], ("forward", "2"), False),
-    (3, False, [{"action": "traverse", "delta": -1, "t": 5}], None, False),  # went nowhere
+    (3, False, [{"action": "traverse", "delta": 0, "t": 5}], None, False),  # went nowhere
+    # the page moved on by itself after the step before (a timer, a redirect): the window
+    # moved less, or the other way, so the page's count, and the engineer is told
+    (3, False, [{"action": "traverse", "delta": -1, "t": 5}], ("back", None), True),
+    (5, False, [{"action": "traverse", "delta": -1, "t": 5}], ("back", None), True),
     # the window closed straight after: the page's count, and the recording is kept
-    (0, True, [{"action": "traverse", "delta": -1, "t": 5}], ("back", None), False),
-    (0, True, [{"action": "traverse", "delta": None, "t": 5}], None, False),
+    (0, True, [{"action": "traverse", "delta": -1, "t": 5}], ("back", None), True),
+    (0, True, [{"action": "traverse", "delta": None, "t": 5}], None, True),
 ])  # fmt: skip
 def test_a_traversal_moves_as_the_window_did(index, closed, events, taken, warned):
     s = _watched(index, closed)
@@ -1264,12 +1296,14 @@ def test_the_engineer_is_told_what_a_browser_navigation_repeats_or_leaves():
     s.journey.steps += [
         Step(2, "reload", exchanges=[Exchange("POST", "/api/orders", 201)]),
         Step(3, "goto", url="https://docs.example.com/help?q=s3cret-pass"),
+        Step(4, "goto", url="/search?q=s3cret-pass", page_url="/search?q=s3cret-pass"),
     ]
     s._token("Password", "s3cret-pass")
-    s._times += [1.0, 2.0]
+    s._times += [1.0, 2.0, 3.0]
     journey, _ = s.finish()
-    assert journey.format == "2.0" and journey.steps[2].url.endswith("?q=" + next(iter(
-        journey.secrets)))  # fmt: skip
+    token = next(iter(journey.secrets))
+    assert journey.format == "2.0" and journey.steps[2].url.endswith("?q=" + token)
+    assert (journey.steps[3].url, journey.steps[3].page_url) == (f"/search?q={token}",) * 2
     assert s.warnings == [
         "step 2 (reload) sent POST /api/orders again on the source, and replay will send it "
         "to the target; record the journey again without it if that was not meant",
@@ -1381,3 +1415,69 @@ def test_a_traversal_is_never_retried_on_its_own(monkeypatch):
     assert tries == [1, 2, 1, 2]  # once in each attempt of the journey
     assert (run.status, run.failure_kind, run.attempts) == ("failed", "transport", 2)
     assert [(f["step"], f["unit"]) for f in run.flakes] == [(2, "journey")]
+
+
+def test_the_engineer_is_told_when_a_traversal_is_counted_by_the_page():
+    s = _watched(index=3)  # the page moved on by itself, then Back took it where it was
+    s._events = [{"action": "traverse", "delta": -1, "t": 5}]
+    s._take()
+    assert s.warnings == [
+        "step 2: Back came after the page navigated by itself, so how far it went is the "
+        "page's count; record the journey again, waiting for each page, if it does not "
+        "replay"]  # fmt: skip
+    s = _watched(closed=True)
+    s._events = [{"action": "traverse", "delta": None, "t": 5}]
+    s._take()
+    assert len(s.journey.steps) == 1 and s.warnings == [
+        "after step 1: a Back or Forward to another site came as the window closed, so how "
+        "far it went is not known and it is no step; record the journey again, waiting for "
+        "each page"]  # fmt: skip
+
+
+class _History:
+    """A CDP session on the target: one entry in its history."""
+
+    def send(self, method, params=None):
+        return {"currentIndex": 0, "entries": [{"id": 1}]}
+
+    def detach(self) -> None:
+        pass
+
+
+def _navigate(step, base_url, target_url, secrets=None):
+    opened = []
+    context = SimpleNamespace(new_cdp_session=lambda p: _History())
+    page = SimpleNamespace(goto=lambda url, **kw: opened.append(url), url="http://t/orders/55",
+                           context=context)  # fmt: skip
+    journey = Journey("j", base_url, steps=[step])
+    Replayer(target_url, secret_values=lambda j: {})._navigate(
+        page, step, journey, JourneyRun("j"), secrets or {}, 1000)
+    return opened
+
+
+@pytest.mark.parametrize(("base_url", "target_url", "url", "opened"), [
+    # source and target on one origin (another path, or the same): nothing is refused
+    ("http://h:8000/old", "http://h:8000/new", "http://h:8000/x", "http://h:8000/x"),
+    ("http://h:8000", "http://h:8000", "http://h:8000/x", "http://h:8000/x"),
+    # a path, step 1's included, goes to the target, whatever the source's path
+    ("http://src/app", "http://tgt/app", "/app/login", "http://tgt/app/app/login"),
+    ("http://src", "http://tgt", "/login", "http://tgt/login"),
+    ("http://src", "http://tgt", "https://docs.example.com/a", "https://docs.example.com/a"),
+])  # fmt: skip
+def test_a_goto_opens_the_target_or_where_it_was_typed(base_url, target_url, url, opened):
+    assert _navigate(Step(2, "goto", url=url), base_url, target_url) == [opened]
+
+
+@pytest.mark.parametrize("url", [
+    "http://src.example/x", "http://SRC.example:80/x", "http://bob:pw@src.example/x"])  # fmt: skip
+def test_a_goto_to_the_source_is_refused(url):
+    with pytest.raises(RuntimeError, match=r"^step 2 opens the source \(http://src.example/app\)"):
+        _navigate(Step(2, "goto", url=url), "http://src.example/app", "http://tgt.example")
+
+
+def test_where_back_led_is_reported_without_secret_values():
+    step = Step(2, "back", page_url="/notes/@@REDACTED_1")
+    with pytest.raises(WrongPage) as caught:
+        _navigate(step, "http://src", "http://t", {"@@REDACTED_1": "s3cret-pass"})
+    assert (caught.value.expected, caught.value.actual) == ("/notes/@@REDACTED_1", "/orders/{id}")
+    assert "s3cret-pass" not in str(caught.value)

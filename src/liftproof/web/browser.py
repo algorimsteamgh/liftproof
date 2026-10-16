@@ -70,6 +70,17 @@ def path_of(url: str) -> str:
     return parts.path + (f"?{parts.query}" if parts.query else "")
 
 
+def origin_of(url: str) -> tuple[str, str, int | None]:
+    """Scheme, host and port as the browser compares them: no user or password, the host
+    in lower case, the default port written out."""
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    return parts.scheme, parts.hostname or "", port or {"http": 80, "https": 443}.get(parts.scheme)
+
+
 def normalise_path(path: str, values: dict[str, str] | None = None) -> str:
     """Endpoint identity across environments: generated ids become {id}, and values a
     correlation names become {name}. The query string is not part of the identity."""

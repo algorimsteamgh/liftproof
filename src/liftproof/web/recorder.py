@@ -30,6 +30,7 @@ from liftproof.web.browser import (
     in_force,
     launch,
     normalise_path,
+    origin_of,
     path_of,
     region_snapshot,
     step_settled,
@@ -52,15 +53,34 @@ CAPTURE_JS = resources.files("liftproof.web").joinpath("capture.js").read_text("
 # CDP's navigationType for a navigation the browser started; a traversal is capture.js's
 NAVIGATION_TYPES = {"differentDocument": "goto", "sameDocument": "goto", "reload": "reload",
                     "reloadBypassingCache": "reload"}  # fmt: skip
+# the Chromium the navigation signals were verified on (decision 136); an older one set by
+# web.chromium_path or LIFTPROOF_CHROMIUM may not send them
+NAVIGATION_CHROMIUM = 141
 
 
 def typed_url(url: str, base_url: str) -> str:
     """An address typed in the recording window, as its step's url: on the source's origin
-    its path, query and fragment, which replay puts on the target; elsewhere the whole URL."""
-    parts, base = urlsplit(url), urlsplit(base_url)
-    if (parts.scheme, parts.netloc) != (base.scheme, base.netloc):
-        return url
+    its path, query and fragment, which replay puts on the target; elsewhere the whole URL,
+    with no user or password."""
+    parts = urlsplit(url)
+    if origin_of(url) != origin_of(base_url):
+        return urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
     return urlunsplit(("", "", parts.path or "/", parts.query, parts.fragment))
+
+
+def old_chromium(version: str) -> str | None:
+    """A warning when the browser predates the navigation signals the recorder relies on."""
+    try:
+        major = int(version.split(".", 1)[0])
+    except ValueError:
+        return None
+    if major >= NAVIGATION_CHROMIUM:
+        return None
+    return (
+        f"Chromium {version} is older than {NAVIGATION_CHROMIUM}: an address typed in the "
+        "window or a Reload may not have been recorded; record with the Chromium Playwright "
+        "installs"
+    )
 
 
 class NavigationWatch:
@@ -77,6 +97,7 @@ class NavigationWatch:
         self.navs: list[dict[str, Any]] = []  # committed, not yet taken as steps
         self.abandoned: list[dict[str, Any]] = []  # never committed
         self.asked: set[str] = set()  # where the page asked to go
+        self._asked_before: set[str] = set()  # and before the last steps were taken
         self._started: dict[str, Any] | None = None  # the browser's, until it commits
 
     @classmethod
@@ -97,8 +118,8 @@ class NavigationWatch:
     def _start(self, e: dict[str, Any]) -> None:
         if e["frameId"] != self.main:
             return
-        by_page = e["url"] in self.asked
-        self.asked.clear()
+        by_page = e["url"] in self.asked or e["url"] in self._asked_before
+        self.asked, self._asked_before = set(), set()
         action = NAVIGATION_TYPES.get(e.get("navigationType", ""))
         self.abandon()  # one started before it no longer commits
         if by_page or action is None or urlsplit(e["url"]).scheme not in ("http", "https"):
@@ -126,6 +147,11 @@ class NavigationWatch:
         if e["frameId"] == self.main and self._started is not None and self._started["same"]:
             self.navs.append(self._started)
             self._started = None
+
+    def forget(self) -> None:
+        """Steps were taken: a page's request that never started hides nothing for long. It
+        is kept one round more, since the navigation it asked for may start just after."""
+        self._asked_before, self.asked = self.asked, set()
 
     def abandon(self) -> None:
         """The navigation started has not committed, and now will not."""
@@ -216,7 +242,7 @@ class RecordingSession:
         if self.watch is None:
             return []
         navs, self.watch.navs[:] = list(self.watch.navs), []
-        self.watch.asked.clear()  # a page's request that never started hides nothing later
+        self.watch.forget()
         events = []
         for nav in navs:
             path, t = path_of(nav["url"]), nav["t"]
@@ -236,24 +262,44 @@ class RecordingSession:
         """Back or Forward in the window, as a step event. How far it went is the move in the
         window's history since the last step, which counts the entries frames added, as
         replay does; the page's own count, which does not, is used when other navigations
-        came with it or the window has closed, and the engineer is told."""
+        came with it, the page navigated by itself since, or the window has closed, and the
+        engineer is told."""
         n = len(self.journey.steps) + 1
         now = self.watch.history_index() if self.watch is not None else None
         moved = now - self._history if now is not None and self._history is not None else None
-        delta = moved if alone and moved is not None else ev.get("delta")
+        counted = ev.get("delta")  # the page's: None when it went to another origin
+        if alone and moved and (counted is None or (moved < 0) == (counted < 0)):
+            delta = moved
+            if counted not in (None, moved):
+                self.warnings.append(
+                    f"step {n}: the page moved {counted} entries and the window {moved}; "
+                    "replay moves as the window did. Check the step, or record the journey again"
+                )
+        else:
+            # the window's move is not known, or holds more than this traversal: the page
+            # navigated by itself since the step before (a timer, a redirect), or the window
+            # has closed
+            delta = counted
+            if not alone:
+                why = "came with other actions before the page settled"
+            elif moved is None:
+                why = "came as the window closed"
+            else:
+                why = "came after the page navigated by itself"
+            if delta:
+                self.warnings.append(
+                    f"step {n}: {'Back' if delta < 0 else 'Forward'} {why}, so how far it went "
+                    "is the page's count; record the journey again, waiting for each page, if "
+                    "it does not replay"
+                )
+            elif counted is None:
+                self.warnings.append(
+                    f"after step {n - 1}: a Back or Forward to another site {why}, so how far "
+                    "it went is not known and it is no step; record the journey again, waiting "
+                    "for each page"
+                )
         if not delta:
             return None  # it went nowhere, or how far is not known
-        if not alone:
-            self.warnings.append(
-                f"step {n}: {'Back' if delta < 0 else 'Forward'} came with other actions before "
-                "the page settled, so how far it went is the page's count; record the journey "
-                "again, waiting for each page, if it does not replay"
-            )
-        elif ev.get("delta") not in (None, delta):
-            self.warnings.append(
-                f"step {n}: the page moved {ev['delta']} entries and the window {delta}; "
-                "replay moves as the window did. Check the step, or record the journey again"
-            )
         value = str(abs(delta)) if abs(delta) > 1 else None
         return {"action": "back" if delta < 0 else "forward", "value": value, "t": ev["t"]}
 
@@ -374,7 +420,8 @@ class RecordingSession:
             end = c.started + (ex.duration_ms or 0.0)
             steps[idx].duration_ms = max(steps[idx].duration_ms or 0.0, end - self._times[idx])
         for s in steps:
-            s.url = self._scrub(s.url)  # a typed address can hold a redacted value
+            # a typed address, and so the page it showed, can hold a redacted value
+            s.url, s.page_url = self._scrub(s.url), self._scrub(s.page_url)
             self._reduce_region(s, assets)
             s.non_idempotent = any(e.method in WRITE_METHODS for e in s.exchanges)
             if s.duration_ms is not None:
@@ -463,6 +510,8 @@ class Recorder:
             context = browser.new_context()
             page = context.new_page()
             session = RecordingSession(page, journey, self.policy, self.settle_ms, hide)
+            if old := old_chromium(browser.version):
+                session.warnings.append(old)
             context.expose_function("__liftproofRecord", session.on_event)
             context.add_init_script(CAPTURE_JS)
             session.start(urljoin(self.base_url, start.lstrip("/")))

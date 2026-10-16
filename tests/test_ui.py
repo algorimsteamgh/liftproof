@@ -274,6 +274,7 @@ def test_a_journey_shows_from_this_instance_when_the_bucket_is_out_of_reach(site
     r, page = client.request("GET", "/p/acme/journeys/other")
     assert r.status == 404
 
+
 def test_a_journey_shows_where_each_browser_navigation_went(site):
     client, ui, _ = site
     client.login()

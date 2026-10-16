@@ -27,7 +27,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 
 from liftproof.web import correlate
 from liftproof.web.browser import (
@@ -45,6 +45,7 @@ from liftproof.web.browser import (
     launch,
     mark_region,
     normalise_path,
+    origin_of,
     path_of,
     region_snapshot,
     unhide,
@@ -164,6 +165,14 @@ def step_duration(acted_ms: float, exchanges: list[Captured]) -> float | None:
 
 
 OnDone = Callable[[int, Journey, JourneyRun], None]
+
+
+def _masked(text: str, secrets: dict[str, str]) -> str:
+    """A path for the report: each secret's value as its token again."""
+    for token, value in secrets.items():
+        if value:
+            text = text.replace(value, token)
+    return text
 
 
 class _Worker(threading.Thread):
@@ -522,7 +531,8 @@ class Replayer:
             # replaced, not pushed, or redirected another way: the target's history differs
             expected = normalise_path(self._substitute(step.page_url, run, secrets))
             if normalise_path(sr.page_url) != expected:
-                raise WrongPage(step.action, expected, normalise_path(sr.page_url))
+                raise WrongPage(step.action, _masked(expected, secrets),
+                                _masked(normalise_path(sr.page_url), secrets))  # fmt: skip
 
     def _navigate(
         self,
@@ -541,8 +551,7 @@ class Replayer:
         acted = time.time() * 1000
         if step.action == "goto":
             url = urljoin(self.target_url, self._substitute(step.url, run, secrets).lstrip("/"))
-            source = urlsplit(journey.base_url)[:2]
-            if urlsplit(url)[:2] == source != urlsplit(self.target_url)[:2]:
+            if origin_of(url) == origin_of(journey.base_url) != origin_of(self.target_url):
                 raise RuntimeError(
                     f"step {step.n} opens the source ({journey.base_url}); replay drives the "
                     "target only: record the journey again without it"
@@ -560,7 +569,7 @@ class Replayer:
                 if not 0 <= to < len(history["entries"]):
                     here = normalise_path(path_of(page.url))
                     expected = normalise_path(self._substitute(step.page_url, run, secrets))
-                    raise WrongPage(step.action, expected, here,
+                    raise WrongPage(step.action, _masked(expected, secrets), _masked(here, secrets),
                                     ": the target has no page there in its history")  # fmt: skip
                 entry = history["entries"][to]["id"]
                 acted = time.time() * 1000

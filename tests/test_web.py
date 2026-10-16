@@ -267,6 +267,26 @@ def test_a_window_closed_right_after_a_reload_keeps_the_journey(browser_availabl
     assert [s.action for s in journey.steps[5:]] == ["click", "reload"]
 
 
+def test_a_back_after_the_page_moved_on_by_itself_is_recorded(browser_available):
+    """The page adds an entry after its step settled (a timer, a late redirect): the window
+    has not moved since that step, but Back did go back."""
+
+    def later(s):
+        drive(s)
+        s.act(lambda p: p.evaluate("history.pushState(null, '', '?later=1')"))  # not a step
+        s.act(lambda p: p.go_back())
+
+    with ShopApp() as app:
+        recorder = Recorder(app.url, headless=True)
+        journey, _ = recorder.record("later", start="/login", drive=later)
+    back = journey.steps[-1]
+    assert (back.action, back.value, back.page_url) == ("back", None, journey.steps[5].page_url)
+    assert recorder.warnings == [
+        "step 7: Back came after the page navigated by itself, so how far it went is the "
+        "page's count; record the journey again, waiting for each page, if it does not "
+        "replay"]  # fmt: skip
+
+
 def test_back_counts_the_entries_a_frame_added(browser_available):
     """A frame that moves on adds an entry of its own: Back across it is two entries in
     the browser's history and one in the page's, and replay moves as the browser did."""
