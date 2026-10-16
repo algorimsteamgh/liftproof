@@ -354,9 +354,15 @@ HIDE_JS = """
   (UNHIDE)();
   if (roots.length !== 1) return null;
   const root = roots[0];
-  const whole = selectors.find((s) => root.closest(s));
+  // a root in an open shadow root is also inside its host and the host's ancestors
+  const inside = (s) => {
+    for (let n = root; n; n = n.getRootNode().host) if (n.closest(s)) return true;
+    return false;
+  };
+  const whole = selectors.find(inside);
   if (whole) return {hidden: [], unhideable: [], whole};
-  const scopes = [root];  // the tree reads into open shadow roots, so they are searched too
+  // the tree reads into open shadow roots, the root's own too, so they are searched
+  const scopes = root.shadowRoot ? [root, root.shadowRoot] : [root];
   for (let i = 0; i < scopes.length; i++) {
     for (const el of scopes[i].querySelectorAll('*')) {
       if (el.shadowRoot) scopes.push(el.shadowRoot);

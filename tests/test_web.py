@@ -282,6 +282,32 @@ def test_a_part_of_the_page_is_left_out_only_while_it_is_read(browser_available)
         browser.close()
 
 
+def test_an_ignore_region_reaches_across_shadow_roots(browser_available):
+    """A touched region in a component's shadow root is inside what marks the component
+    volatile, and a region that is itself a shadow host is searched in its shadow root."""
+    from playwright.sync_api import sync_playwright
+
+    widget = """<main><h1>Shop</h1><chat-box data-liftproof-volatile></chat-box></main>
+      <script>customElements.define('chat-box', class extends HTMLElement {
+        constructor() { super(); this.attachShadow({mode: 'open'}).innerHTML =
+          '<form data-liftproof-region="1"><p>agent Bob</p><button>Send</button></form>'; }
+      });</script>"""
+    host = """<main><section id="s" data-liftproof-region="1"></section></main><script>
+      document.getElementById('s').attachShadow({mode: 'open'}).innerHTML =
+        '<p class="v">Served by node ab12</p><p>kept</p>';</script>"""
+    with sync_playwright() as p:
+        browser = launch(p)
+        page = browser.new_page()
+        page.set_content(widget)
+        snap = region_snapshot(page, [VOLATILE.selector])
+        assert "agent Bob" not in snap.text and 'heading "Shop"' in snap.text, snap.text
+        assert (snap.hidden, snap.whole) == ([VOLATILE.selector], None)
+        page.set_content(host)
+        snap = region_snapshot(page, [".v"])
+        assert (snap.text, snap.hidden) == ("- paragraph: kept", [".v"])
+        browser.close()
+
+
 def test_a_step_finds_its_element_after_a_snapshot_left_it_hidden(browser_available, monkeypatch):
     """An element left aria-hidden is not found by its role, so each step puts back what
     the snapshot before it hid, should that snapshot not have."""
