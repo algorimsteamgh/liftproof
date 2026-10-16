@@ -53,7 +53,7 @@ CAPTURE_JS = resources.files("liftproof.web").joinpath("capture.js").read_text("
 # CDP's navigationType for a navigation the browser started; a traversal is capture.js's
 NAVIGATION_TYPES = {"differentDocument": "goto", "sameDocument": "goto", "reload": "reload",
                     "reloadBypassingCache": "reload"}  # fmt: skip
-# the Chromium the navigation signals were verified on (decision 136); an older one set by
+# the Chromium the navigation signals were verified on (decision 106); an older one set by
 # web.chromium_path or LIFTPROOF_CHROMIUM may not send them
 NAVIGATION_CHROMIUM = 141
 
