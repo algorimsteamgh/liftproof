@@ -2,8 +2,9 @@
 
 A journey is data, never a script. It holds the steps the engineer took, the network
 exchanges behind each step, what the touched page region looked like, timings, the
-correlation rules, and the binding of each redaction token to a secret. Bodies are kept
-out of the journey file: an opted in body is an asset referenced by hash, and everything
+correlation rules, the ignore regions it was recorded with, and the binding of each
+redaction token to a secret. Bodies and page snapshots are kept out of the journey file:
+an opted in one is an asset referenced by hash, which the bucket expires, and everything
 else is reduced to a hash and a shape (default deny, spec 5).
 """
 
@@ -11,13 +12,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from liftproof.errors import ConfigError
 
-JOURNEY_FORMAT = "1.0"
+JOURNEY_FORMAT = "1.1"
+# A journey with a navigation the browser itself made is format 2.0, so a build that cannot
+# replay one refuses it as it loads; every other journey stays 1.x, which older builds read
+NAVIGATION_FORMAT = "2.0"
+READ_FORMATS = ("1", "2")  # the majors this build reads
+STEP_ACTIONS = ("goto", "click", "fill", "select", "check", "uncheck", "press", "reload",
+                "back", "forward")  # fmt: skip
+BROWSER_NAVIGATIONS = ("reload", "back", "forward")
+REGION_SHAPE_VERSION = 1  # of region_shape(): shapes made by another are not compared
 TOKEN_PREFIX = "@@REDACTED_"  # noqa: S105 - the marker, not a secret
 
 
@@ -52,15 +62,50 @@ class Exchange:
 @dataclass
 class Step:
     n: int
-    action: str  # goto | click | fill | select | check | uncheck | press
+    action: str  # STEP_ACTIONS
     url: str | None = None
     locator: Locator | None = None
-    value: str | None = None
+    value: str | None = None  # for back and forward, the entries moved when more than one
     non_idempotent: bool = False  # the step's requests changed state (POST, PUT, PATCH, DELETE)
     exchanges: list[Exchange] = field(default_factory=list)
-    region: str | None = None  # accessible tree of the region the step touched, after it ran
+    # the accessible tree of the region the step touched, after it ran, inline: journeys
+    # recorded before 1.1 only
+    region: str | None = None
     page_url: str | None = None  # where the browser was after the step
     duration_ms: float | None = None
+    region_sha256: str | None = None
+    region_shape: str | None = None  # region_shape() of the region: structure, no content
+    region_asset: str | None = None  # assets/<sha256>, present only when the page was opted in
+    # the ignore regions (source selectors) that left elements out of the region, and the
+    # one the page itself was inside, so that none of it was read
+    region_hidden: list[str] = field(default_factory=list)
+    region_ignored: str | None = None
+
+
+@dataclass(frozen=True)
+class IgnoreRegion:
+    """Part of a page never compared (spec 7): the elements a CSS selector matches, left
+    out of the accessible tree on both sides, or source_selector and target_selector where
+    the markup differs. The reason is printed in the report (spec 9.12)."""
+
+    reason: str
+    selector: str | None = None
+    source_selector: str | None = None
+    target_selector: str | None = None
+
+    def on(self, side: str) -> str | None:
+        return (self.source_selector if side == "source" else self.target_selector) or self.selector
+
+    @property
+    def selectors(self) -> list[str]:
+        return [s for s in (self.selector, self.source_selector, self.target_selector) if s]
+
+    @property
+    def label(self) -> str:
+        source, target = self.on("source"), self.on("target")
+        if source == target:
+            return source or ""
+        return ", ".join(f"{side} {s}" for side, s in (("source", source), ("target", target)) if s)
 
 
 @dataclass
@@ -108,6 +153,8 @@ class Journey:
     # journey an engineer drove it includes their pauses
     wall_ms: float | None = None
     format: str = JOURNEY_FORMAT
+    region_shape_version: int | None = None
+    ignore_regions: list[IgnoreRegion] = field(default_factory=list)  # in force when recorded
 
     @property
     def non_idempotent(self) -> bool:
@@ -131,10 +178,10 @@ class Journey:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Journey:
-        if d.get("format", JOURNEY_FORMAT).split(".")[0] != JOURNEY_FORMAT.split(".")[0]:
+        if d.get("format", JOURNEY_FORMAT).split(".")[0] not in READ_FORMATS:
             raise ConfigError(
                 f"journey {d.get('journey_id')} has format {d.get('format')}; "
-                f"this build reads {JOURNEY_FORMAT}"
+                f"this build reads {JOURNEY_FORMAT} and {NAVIGATION_FORMAT}"
             )
         steps = []
         for s in d.get("steps", []):
@@ -154,6 +201,8 @@ class Journey:
             browser=d.get("browser"),
             wall_ms=d.get("wall_ms"),
             format=d.get("format", JOURNEY_FORMAT),
+            region_shape_version=d.get("region_shape_version"),
+            ignore_regions=[IgnoreRegion(**r) for r in d.get("ignore_regions", [])],
         )
 
     def save(self, path: Path) -> Path:
@@ -169,6 +218,20 @@ class Journey:
             raise ConfigError(f"journey file not found: {path}") from None
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise ConfigError(f"journey file {path} is not valid: {exc}") from None
+
+
+def check_steps(journey: Journey) -> None:
+    """Refuse a step this build cannot replay as recorded, before anything runs."""
+    for s in journey.steps:
+        if s.action not in STEP_ACTIONS:
+            raise ValueError(f"step {s.n}: unknown action {s.action!r}")
+        if s.action == "goto" and not s.url:
+            raise ValueError(f"step {s.n}: goto without a url")
+        if s.action in BROWSER_NAVIGATIONS and not journey.format.startswith("2."):
+            raise ValueError(f"step {s.n}: {s.action} needs journey format {NAVIGATION_FORMAT}")
+        if s.action in ("back", "forward") and s.value is not None:
+            if not re.fullmatch(r"[1-9][0-9]*", s.value):
+                raise ValueError(f"step {s.n}: {s.action} by {s.value!r} entries")
 
 
 def sha256(data: bytes) -> str:
@@ -194,3 +257,50 @@ def shape(value: Any) -> Any:
     if value is None:
         return "null"
     return "string"
+
+
+# Playwright's ARIA roles, the text node, and the properties it lists under an element
+ARIA_ROLES = frozenset(
+    """
+alert alertdialog application article banner blockquote button caption cell checkbox code
+columnheader combobox complementary contentinfo definition deletion dialog directory
+document emphasis feed figure form generic grid gridcell group heading img insertion link
+list listbox listitem log main mark marquee math meter menu menubar menuitem
+menuitemcheckbox menuitemradio navigation none note option paragraph presentation
+progressbar radio radiogroup region row rowgroup rowheader scrollbar search searchbox
+separator slider spinbutton status strong subscript superscript switch tab table tablist
+tabpanel term textbox time timer toolbar tooltip tree treegrid treeitem text /url
+/placeholder
+""".split()
+)
+ARIA_STATE = re.compile(
+    r"active|disabled|expanded|selected|(checked|pressed)(=mixed)?|invalid(=grammar|=spelling)?"
+    r"|level=\d+"
+)
+_ARIA_KEY = r'(?P<role>/?[a-z]+)(?P<name> "(?:[^"\\]|\\.)*"| /.*/)?(?P<states>(?: \[[^\]]*\])*)'
+_ARIA_LINE = re.compile(
+    rf"(?P<indent> *)- (?:'(?P<quoted>(?:[^']|'')*)'|{_ARIA_KEY})(?P<colon>:(?P<text> .+)?)?"
+)
+_ARIA_QUOTED_KEY = re.compile(_ARIA_KEY)
+
+
+def region_shape(snapshot: str) -> str:
+    """The structure of a page snapshot (Playwright's aria snapshot) without its content:
+    each element's role at its depth, its states, and whether it has a name, text or
+    children. Names and text become *, and a line with no known role becomes ?, so
+    nothing the page showed survives, whatever the snapshot holds."""
+    lines = []
+    for line in snapshot.splitlines():
+        key = m = _ARIA_LINE.fullmatch(line)
+        if m is not None and m["quoted"] is not None:  # YAML quotes a key holding ": "
+            key = _ARIA_QUOTED_KEY.fullmatch(m["quoted"].replace("''", "'"))
+        if m is None or key is None or key["role"] not in ARIA_ROLES:
+            lines.append(line[: len(line) - len(line.lstrip(" "))] + "?")
+            continue
+        name = ' "*"' if key["name"] else ""
+        states = "".join(
+            f" [{s}]" for s in re.findall(r"\[([^\]]*)\]", key["states"]) if ARIA_STATE.fullmatch(s)
+        )
+        colon = (":" if m["colon"] else "") + (" *" if m["text"] else "")
+        lines.append(f"{m['indent']}- {key['role']}{name}{states}{colon}")
+    return "\n".join(lines)

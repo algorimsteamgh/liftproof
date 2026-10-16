@@ -13,6 +13,7 @@ import psycopg
 import pytest
 
 from liftproof.adapters.postgres import PostgresAdapter
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 
 PG = {
     "host": os.environ.get("LIFTPROOF_TEST_PG_HOST", "/tmp"),
@@ -20,6 +21,19 @@ PG = {
     "user": os.environ.get("LIFTPROOF_TEST_PG_USER", "postgres"),
     "password": os.environ.get("LIFTPROOF_TEST_PG_PASSWORD") or None,
 }
+
+
+def type_map_alternatives(engine: str, columns: dict[str, str]) -> list[tuple[str, object]]:
+    """(fixture column, canonical type) for each alternative the shipped type map lets a
+    project choose on this engine, and for each type a compatible pair widens one to.
+    columns: type map key -> a fixture column of that type; one missing fails collection."""
+    out = []
+    for key, rule in DEFAULT_TYPE_MAP.engines[engine].items():
+        for ctype in rule.also:
+            out.append((columns[key], ctype))
+            out += [(columns[key], c) for types, c in DEFAULT_TYPE_MAP.compatible
+                    if ctype in types and c != ctype]  # fmt: skip
+    return out
 
 
 def _admin():
@@ -39,14 +53,16 @@ def pg_available():
 
 @pytest.fixture
 def make_db(pg_available):
-    """Factory creating throwaway databases; returns (dbname, raw connection)."""
+    """Factory creating throwaway databases; returns (dbname, raw connection). A database in
+    another encoding (LATIN1, WIN1252) gets the C locale, which every encoding accepts."""
     created: list[str] = []
     conns: list[psycopg.Connection] = []
 
-    def factory(prefix: str = "t"):
+    def factory(prefix: str = "t", encoding: str = "UTF8"):
         name = f"liftproof_{prefix}_{uuid.uuid4().hex[:8]}"
+        locale = "" if encoding == "UTF8" else " LC_COLLATE 'C' LC_CTYPE 'C'"
         with _admin() as c:
-            c.execute(f'CREATE DATABASE "{name}" ENCODING UTF8 TEMPLATE template0')
+            c.execute(f'CREATE DATABASE "{name}" ENCODING {encoding}{locale} TEMPLATE template0')
         created.append(name)
         conn = psycopg.connect(
             host=PG["host"], port=PG["port"], user=PG["user"], password=PG["password"],
@@ -67,10 +83,10 @@ def make_db(pg_available):
 def adapter_for():
     opened: list[PostgresAdapter] = []
 
-    def factory(dbname: str, read_only: bool = True) -> PostgresAdapter:
+    def factory(dbname: str, read_only: bool = True, **kw) -> PostgresAdapter:
         a = PostgresAdapter(
             host=PG["host"], port=PG["port"], database=dbname, user=PG["user"],
-            password=PG["password"], sslmode="disable", read_only=read_only,
+            password=PG["password"], sslmode="disable", read_only=read_only, **kw,
         )
         opened.append(a)
         return a
@@ -158,10 +174,10 @@ def mysql_adapter_for():
 
     opened: list[MySQLAdapter] = []
 
-    def factory(dbname: str, read_only: bool = True) -> MySQLAdapter:
+    def factory(dbname: str, read_only: bool = True, **kw) -> MySQLAdapter:
         a = MySQLAdapter(
             host=MY["host"], port=MY["port"], database=dbname, user=MY["user"],
-            password=MY["password"], sslmode="disable", read_only=read_only,
+            password=MY["password"], sslmode="disable", read_only=read_only, **kw,
         )
         opened.append(a)
         return a
@@ -178,6 +194,9 @@ ORA = {
     "service": os.environ.get("LIFTPROOF_TEST_ORACLE_SERVICE", "FREEPDB1"),
     "user": os.environ.get("LIFTPROOF_TEST_ORACLE_USER", "system"),
     "password": os.environ.get("LIFTPROOF_TEST_ORACLE_PASSWORD", "ci-only-local-service"),
+    # set when the run exists to test a server in this character set (charset.yml): a
+    # server that is missing or in another one then fails the run rather than skipping
+    "charset": os.environ.get("LIFTPROOF_TEST_ORACLE_CHARSET"),
 }
 
 
@@ -196,12 +215,22 @@ def _ora_connect(user: str | None = None, password: str | None = None):
 
 @pytest.fixture(scope="session")
 def oracle_available():
+    """The server's database character set (NLS_CHARACTERSET)."""
     import oracledb
 
     try:
-        _ora_connect().close()
-    except oracledb.Error:
+        with _ora_connect() as c, c.cursor() as cur:
+            cur.execute(
+                "SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER = 'NLS_CHARACTERSET'"
+            )
+            (charset,) = cur.fetchone()
+    except oracledb.Error as exc:
+        if ORA["charset"]:
+            pytest.fail(f"no {ORA['charset']} Oracle server for tests: {exc}")
         pytest.skip("no Oracle server for tests")
+    if ORA["charset"] and charset != ORA["charset"]:
+        pytest.fail(f"the Oracle test server is {charset}, expected {ORA['charset']}")
+    return charset
 
 
 @pytest.fixture

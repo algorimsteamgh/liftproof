@@ -22,17 +22,32 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from liftproof.adapters.base import Adapter, BucketAggregate, HashPlan, TableRef, TableSchema
-from liftproof.canonical import RowHasher, column_digest, reduce_total
+from liftproof.canonical import CanonicalType, RenderError, RowHasher, column_digest, reduce_total
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, TypeMap
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, Severity
-from liftproof.reconcile.baseline import Baseline
-from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table, row_filter
+from liftproof.reconcile import ranges
+from liftproof.reconcile.baseline import Baseline, hashed_infinity_as_null
+from liftproof.reconcile.plan import (
+    NOT_CANONICALISABLE,
+    NOT_CHECKED_ISSUES,
+    NOT_IN_BASELINE,
+    IgnoreRule,
+    TablePlan,
+    map_types,
+    plan_table,
+    row_filter,
+)
 from liftproof.reconcile.replication import REASON_BEHIND, ReplicationConfig, check
+from liftproof.reconcile.structure import StructureChecks, compare_structure
 
 DB = Comparator.DATABASE
+INFINITY = {"infinity", "-infinity"}
+REASON_STOPPED = "the run stopped before this table was compared"
+REASON_INFINITY = "the baseline may hold PostgreSQL infinity dates hashed as NULL"
 
 
 @dataclass
@@ -65,6 +80,12 @@ class ReconcileOptions:
     # table -> a column that only grows (identity key, creation time), to tell rows a
     # replay created apart; default: a single column primary key
     replay_watermarks: dict[str, str] = field(default_factory=dict)
+    # the range block's data ranges (one MIN/MAX statement per table and side)
+    ranges: bool = True
+    # nullability, keys, foreign keys and indexes compared before data (spec 9.13)
+    structure: StructureChecks = field(default_factory=StructureChecks)
+    # how native types compare: the shipped map with the project's overrides (spec 9.13)
+    type_map: TypeMap = field(default_factory=lambda: DEFAULT_TYPE_MAP)
 
 
 @dataclass
@@ -86,6 +107,10 @@ class TableResult:
     reason: str | None = None
     # set when only a sample was compared: the share of the table's rows that was
     sampled_percent: float | None = None
+    # column -> {"role": key|date, "source": [lowest, highest], "target": [...]}
+    ranges: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # structural differences found (spec 9.13); the status stays the data's
+    structure_differences: int = 0
 
 
 @dataclass
@@ -94,6 +119,11 @@ class ReconcileResult:
     systemic: bool = False
     replication: dict[str, Any] | None = None  # the position check, for the report
     sample_seed: int | None = None  # set when a table was sampled: reruns the same sample
+    # each database's cap, pause and timeouts as the run read it; no source when it was
+    # not read (spec 9.15)
+    protection: dict[str, Any] | None = None
+    # the structure checks the run made, and the tables a baseline recorded no structure of
+    structure: dict[str, Any] | None = None
 
     def status_counts(self) -> Counter:
         return Counter(t.status for t in self.tables)
@@ -101,6 +131,13 @@ class ReconcileResult:
 
 def _short(h: str) -> str:
     return f"md5:{h[:12]}"
+
+
+def _replanned(old: HashPlan, new: HashPlan) -> set[str]:
+    """Lower cased columns hashed in one plan and not the other, or as another type."""
+    a = {n.lower(): t for n, t in old.columns}
+    b = {n.lower(): t for n, t in new.columns}
+    return {n for n in a.keys() | b.keys() if a.get(n) != b.get(n)}
 
 
 def _target_plan(plan: HashPlan, target: TableSchema) -> HashPlan:
@@ -128,7 +165,14 @@ class Reconciler:
         source: Adapter | None = None,
         baseline: Baseline | None = None,
         progress: Callable[[str], None] | None = None,
+        on_table: Callable[[ReconcileResult], None] | None = None,
+        done: Sequence[TableResult] = (),
+        resumed: bool = False,
+        systemic: bool = False,
     ) -> None:
+        """`on_table` runs after each table, with the findings of every finished table
+        written (a checkpoint). `done` and `resumed` continue an interrupted run: those
+        tables are not compared again and their findings are already written."""
         if source is None and baseline is None:
             raise ValueError("a live source or a baseline is required")
         self.against_target = baseline is not None and baseline.side == "target"
@@ -141,23 +185,58 @@ class Reconciler:
         self.writer = writer
         self.o = options
         self.progress = progress or (lambda _msg: None)
-        self.result = ReconcileResult()
+        self.on_table = on_table or (lambda _result: None)
+        self.result = ReconcileResult(list(done), systemic)
+        self.resumed = resumed
+        self.planned: list[str] = []
         # shared by the workers, which are shallow copies of this object
-        self._flags = {"drill": True}
+        self._flags = {"drill": not systemic}
         self._lock = threading.Lock()
-        self._tally = [0, 0]  # tables different, tables done
+        counted = [t for t in done if t.status in ("matched", "different")]
+        self._tally = [sum(t.status == "different" for t in counted), len(counted)]
+        # per thread: the findings of the table in hand, written when the table completes,
+        # so the written findings only ever cover whole tables
+        self._local = threading.local()
         self._seed = (
             options.sample_seed if options.sample_seed is not None else secrets.randbelow(2**31)
         )
 
     # ------------------------------------------------------------------ helpers
     @property
+    def seed(self) -> int:
+        """The sampling seed: a resumed run passes it back so it samples alike."""
+        return self._seed
+
+    @property
     def _drill(self) -> bool:
         return self._flags["drill"]
 
     def emit(self, kind: Kind, severity: int, obj: str, summary: str, **kw: Any) -> None:
+        finding = Finding(DB, kind, severity, obj, summary, **kw)
+        pending = getattr(self._local, "pending", None)
+        if pending is not None:
+            pending.append(finding)
+            return
         with self._lock:
-            self.writer.write(Finding(DB, kind, severity, obj, summary, **kw))
+            self.writer.write(finding)
+
+    def _write_table(self, res: TableResult, found: list[Finding]) -> None:
+        with self._lock:
+            for f in found:
+                self.writer.write(f)
+        self.result.tables.append(res)
+        self._count(res)
+        self.on_table(self.result)
+
+    def mark_unfinished(self, why: str) -> None:
+        """After a failure: every planned table without a result is named as not
+        checked, so coverage counts what exists, not only what finished (spec 12)."""
+        seen = {t.table for t in self.result.tables}
+        for q in self.planned:
+            if q not in seen:
+                self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, f"{REASON_STOPPED}: {why}",
+                          detail={"reason": REASON_STOPPED})  # fmt: skip
+                self.result.tables.append(TableResult(q, "not_checked", reason=REASON_STOPPED))
 
     def _selected(self, tables: Sequence[TableRef]) -> list[TableRef]:
         if not self.o.tables:
@@ -183,11 +262,17 @@ class Reconciler:
         target_schemas = list(dict.fromkeys(self.o.schema_map.get(x, x) for x in self.o.schemas))
         target_tables = {t.qualified.lower(): t for t in self.target.list_tables(target_schemas)}
         source_tables = self._selected(source_tables)
-        if self._replication_behind(source_tables):
+        self.planned = [t.qualified for t in source_tables]
+        self.result.structure = self._structure_checks()
+        finished = {t.table for t in self.result.tables}
+        remaining = [t for t in source_tables if t.qualified not in finished]
+        # Resumed against a live source, the remaining tables are read as of now, so
+        # replication must have applied through the source's position now.
+        if self._replication_behind(remaining):
             return self.result
 
         for t in sorted(set(target_tables) - {self._target_key(s) for s in source_tables}):
-            if self.o.tables:
+            if self.o.tables or self.resumed:  # a resumed run already reported these
                 break
             self.emit(
                 Kind.DIFFERENCE,
@@ -198,7 +283,7 @@ class Reconciler:
 
         order = {t.qualified: i for i, t in enumerate(source_tables)}
         work: list[tuple[TableRef, TableRef]] = []
-        for table in source_tables:
+        for table in remaining:
             rule = self._table_ignored(table)
             if rule:
                 self.emit(
@@ -222,11 +307,24 @@ class Reconciler:
                 self._count(res)
                 continue
             work.append((table, ttable))
-        for res in self._each(work):
-            self.result.tables.append(res)
-            self._count(res)
+        self.on_table(self.result)  # what is known before any table is compared
+        for res, found in self._each(work):
+            self._write_table(res, found)
         self.result.tables.sort(key=lambda r: order.get(r.table, len(order)))
         return self.result
+
+    def _structure_checks(self) -> dict[str, Any]:
+        """For the range block: the checks made, and which tables were compared on their
+        primary key alone because the baseline recorded nothing more."""
+        out: dict[str, Any] = self.o.structure.as_dict()
+        entries = self.baseline.tables if self.baseline is not None else {}
+        bare = [q for q in self.planned if q in entries and entries[q].schema.indexes is None]
+        if bare:
+            out["unrecorded"] = (
+                f"baseline {self.baseline.baseline_id} was taken before nullability, keys and "
+                f"indexes were recorded; only primary keys are compared for {', '.join(bare)}"
+            )
+        return out
 
     def _count(self, res: TableResult) -> None:
         """Circuit breaker across tables: most tables differing means a systemic cause."""
@@ -252,7 +350,48 @@ class Reconciler:
                 detail={"tables_checked": done, "tables_different": mismatched},
             )
 
-    def _each(self, work: list[tuple[TableRef, TableRef]]) -> Iterator[TableResult]:
+    def _ranges(self, table, ttable, plan, tplan, sschema, tschema, base_entry, scan, *,
+                reference_live: bool) -> dict[str, dict[str, Any]]:  # fmt: skip
+        """Lowest and highest key and dates of the rows compared, per side; the reference
+        side's from the baseline when the baseline was the reference."""
+        if not self.o.ranges:
+            return {}
+        roles = ranges.columns_for(plan, self.o.show_values)
+        if not roles:
+            return {}
+        names = list(roles)
+        if reference_live:
+            with self.source.pacer.statement(scan[0]):
+                ref = ranges.read(self.source, table, sschema, names, plan.filter)
+        else:
+            ref = base_entry.ranges if base_entry is not None else {}
+        with self.target.pacer.statement(scan[1]):
+            tgt = ranges.read(self.target, ttable, tschema, names, tplan.filter)
+        side = "target baseline" if self.against_target else "source"
+        return {
+            c: {"role": role, side: ref.get(c), "target": tgt.get(c)} for c, role in roles.items()
+        }
+
+    def _one(self, table: TableRef, ttable: TableRef) -> tuple[TableResult, list[Finding]]:
+        unhashed: dict[str, tuple[str, str]] = {}
+        self._local.unhashed = unhashed  # columns found to hold a value _table cannot hash
+        while True:
+            self._local.pending = found = []
+            try:
+                return self._table(table, ttable), found
+            except RenderError as exc:
+                # A value that cannot be canonicalised: its column is not compared, with the
+                # reason, and the table is compared again without it (spec 9.6). The
+                # findings of the attempt were not written.
+                if exc.column is None or exc.column.lower() in unhashed:
+                    raise
+                unhashed[exc.column.lower()] = (NOT_CANONICALISABLE, exc.reason)
+            finally:
+                self._local.pending = None
+
+    def _each(
+        self, work: list[tuple[TableRef, TableRef]]
+    ) -> Iterator[tuple[TableResult, list[Finding]]]:
         """Reconcile the tables, in order on one worker, or on several at once when the
         project asks for it and both engines can open more connections."""
         n = min(self.o.workers, len(work))
@@ -270,7 +409,7 @@ class Reconciler:
         if n <= 1:
             for table, ttable in work:
                 self.progress(f"reconciling {table}")
-                yield self._table(table, ttable)
+                yield self._one(table, ttable)
             return
         free: queue.SimpleQueue[Reconciler] = queue.SimpleQueue()
         free.put(self)
@@ -283,11 +422,11 @@ class Reconciler:
                 clones.append(c)
                 free.put(c)
 
-            def job(table: TableRef, ttable: TableRef) -> TableResult:
+            def job(table: TableRef, ttable: TableRef) -> tuple[TableResult, list[Finding]]:
                 w = free.get()
                 try:
                     self.progress(f"reconciling {table}")
-                    return w._table(table, ttable)
+                    return w._one(table, ttable)
                 finally:
                     free.put(w)
 
@@ -303,12 +442,13 @@ class Reconciler:
 
     def _replication_behind(self, tables: Sequence[TableRef]) -> bool:
         """Spec 9.2: before any difference is reported, replication must have applied
-        through the reference position. Not compared against a target baseline: there
-        the reference is the target itself."""
+        through the reference position: a baseline's is the latest point it read a table
+        at. Not compared against a target baseline: there the reference is the target
+        itself."""
         if self.against_target:
             return False
         if self.baseline is not None:
-            position = self.baseline.position
+            position = self.baseline.reference_position
         else:
             position = self.source.current_position() if self.source else None
         r = check(self.o.replication, position, source=self.source, target=self.target)
@@ -337,15 +477,26 @@ class Reconciler:
 
     # -------------------------------------------------------------------- table
     def _table(self, table: TableRef, ttable: TableRef) -> TableResult:
+        unhashed: dict[str, tuple[str, str]] = getattr(self._local, "unhashed", {})
         q = table.qualified
-        tschema = self.target.describe(ttable)
+        tm = self.o.type_map
+        tschema, t_over = map_types(self.target.describe(ttable), self.target.engine, tm, "target")
         base_entry = self.baseline.tables.get(q) if self.baseline else None
+        retyped: set[str] = set()  # columns the map types otherwise than the baseline did
         if base_entry is not None:
-            sschema = base_entry.schema
+            sschema, s_over = map_types(base_entry.schema, self.baseline.engine, tm, self.reference)
+            retyped = {
+                c.name.lower()
+                for c, was in zip(sschema.columns, base_entry.schema.columns, strict=True)
+                if c.canonical != was.canonical
+            }
             source_rows = base_entry.row_count
         else:
-            sschema = self.source.describe(table)
-            source_rows = self.source.row_count(table)
+            described = self.source.describe(table)
+            sschema, s_over = map_types(described, self.source.engine, tm, "source")
+            with self.source.pacer.statement() as counted:
+                source_rows = counted.rows = self.source.row_count(table)
+        overridden = s_over + t_over
 
         tp: TablePlan = plan_table(
             sschema,
@@ -356,6 +507,8 @@ class Reconciler:
             ignore=self.o.ignore,
             business_key=self.o.business_keys.get(q) or self.o.business_keys.get(table.name),
             side="target" if self.against_target else "source",
+            unhashed={**(base_entry.unhashed if base_entry else {}), **unhashed},
+            type_map=tm,
         )
         plan = tp.plan
         if base_entry is not None:
@@ -374,10 +527,10 @@ class Reconciler:
         for issue in tp.issues:
             sev = (
                 Severity.LOW
-                if issue.issue in ("added_in_target", "unsupported")
+                if issue.issue in ("added_in_target", "unsupported", NOT_IN_BASELINE)
                 else (Severity.MEDIUM)
             )
-            kind = Kind.NOT_CHECKED if issue.issue == "unsupported" else Kind.DIFFERENCE
+            kind = Kind.NOT_CHECKED if issue.issue in NOT_CHECKED_ISSUES else Kind.DIFFERENCE
             self.emit(
                 kind,
                 sev,
@@ -397,6 +550,19 @@ class Reconciler:
                 column=col,
                 detail={"reason": reason},
             )
+        if overridden:
+            self.emit(
+                Kind.NOTICE,
+                Severity.INFO,
+                q,
+                "columns compared under the project's type map: "
+                + ", ".join(
+                    f"{o.column} ({o.side} {o.native} as {o.canonical}, default {o.default})"
+                    for o in overridden
+                ),
+                detail={"type_map": [asdict(o) for o in overridden]},
+            )
+        res.structure_differences = self._structure(q, sschema, tschema)
         if tp.partial:
             res.partial = True
             self.emit(
@@ -411,6 +577,16 @@ class Reconciler:
             res.status, res.reason = "not_checked", "no comparable columns"
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, "no comparable columns")
             return res
+        xml = [n for n, t in plan.columns if t is CanonicalType.XML]
+        if xml:  # why the table takes longer than its size suggests
+            self.emit(
+                Kind.NOTICE,
+                Severity.INFO,
+                q,
+                f"XML columns are canonicalised here, so every row is read and hashed here "
+                f"rather than in the database: {', '.join(xml)}",
+                detail={"xml_columns": xml},
+            )
 
         # Row ignore rules: each side leaves out its own rows, in its own dialect.
         tfilter = row_filter(self.o.ignore, q, "target")
@@ -446,6 +622,25 @@ class Reconciler:
             and base_entry.plan.key_columns == plan.key_columns
             and base_entry.plan.filter == plan.filter
         ):
+            if hashed_infinity_as_null(self.baseline.engine, base_entry):
+                # taken before canonical revision 1, with nothing to show it held no infinity
+                res.status = "not_checked"
+                res.reason = f"{REASON_INFINITY}; " + (
+                    "take a new target baseline (liftproof rebaseline)"
+                    if self.against_target
+                    else "take a new baseline, or compare with the live source without --baseline"
+                )
+                self.emit(
+                    Kind.NOT_CHECKED,
+                    Severity.MEDIUM,
+                    q,
+                    res.reason,
+                    detail={
+                        "reason": REASON_INFINITY,
+                        "baseline_canonical_revision": base_entry.canonical_revision,
+                    },
+                )
+                return res
             s_aggs = base_entry.buckets
             if plan.sample is not None:
                 s_aggs = {b: a for b, a in s_aggs.items() if b in plan.sample}
@@ -458,21 +653,43 @@ class Reconciler:
                 if self.against_target
                 else "schema changed since the baseline; the live source is needed to re-hash"
             )
+            # the baseline's own overrides are in its plan already: only a column the map
+            # types otherwise than it did, or one of the target's, is the map's doing
+            typed = retyped | {o.column.lower() for o in t_over}
+            mapped = sorted(typed & _replanned(base_entry.plan, plan)) if base_entry else []
+            if mapped:
+                res.reason = f"the type map compares {', '.join(mapped)} otherwise than the " + (
+                    "target baseline did; rebaseline to apply it"
+                    if self.against_target
+                    else "baseline did; the live source is needed to re-hash"
+                )
+            elif base_entry is not None and unhashed:
+                res.reason = (
+                    f"the baseline hashed {', '.join(sorted(unhashed))}, which cannot be "
+                    "canonicalised now; "
+                    + ("rebaseline" if self.against_target else "the live source is needed")
+                    + " to compare the rest of the table"
+                )
             self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, res.reason)
             return res
 
         tplan = replace(_target_plan(plan, tschema), filter=tfilter)
+        s_live = s_aggs is None
         if s_aggs is None:
             # Two databases, two connections: hashing both at once halves the wall time,
             # and each database's own load is unchanged (spec 17: the source is the
             # resource to protect, not the clock).
             with ThreadPoolExecutor(max_workers=2) as pool:
-                s_job = pool.submit(self.source.bucket_aggregates, plan)
-                t_aggs = self.target.bucket_aggregates(tplan)
+                s_job = pool.submit(_aggregates, self.source, plan, full_rows)
+                t_aggs = _aggregates(self.target, tplan, full_rows)
                 s_aggs = s_job.result()
         else:
-            t_aggs = self.target.bucket_aggregates(tplan)
+            t_aggs = _aggregates(self.target, tplan, full_rows)
         res.target_rows = sum(a.count for a in t_aggs.values())
+        # the rows each later read of the table is charged on each side (spec 9.15)
+        scan = (full_rows, max(full_rows, res.target_rows))
+        res.ranges = self._ranges(table, ttable, plan, tplan, sschema, tschema, base_entry,
+                                  scan, reference_live=s_live)  # fmt: skip
         if plan.filter or plan.sample is not None:
             # the table's row count includes rows the rules leave out or the sample skips
             source_rows = res.source_rows = sum(a.count for a in s_aggs.values())
@@ -511,7 +728,7 @@ class Reconciler:
         # 2. table aggregate
         s_total = reduce_total(sum(a.total for a in s_aggs.values()))
         t_total = reduce_total(sum(a.total for a in t_aggs.values()))
-        self._floats(table, ttable, tp, res, tschema, plan.filter, tfilter)
+        self._floats(table, ttable, tp, res, tschema, scan, plan.filter, tfilter)
         if s_total == t_total and res.target_rows == source_rows:
             return res
         res.status = "different"
@@ -552,11 +769,50 @@ class Reconciler:
             and len(bad) / compared > self.o.breaker_bucket_ratio
         )
         drill = bad[:1] if systemic else bad
-        if plan.key_columns:
-            self._keyed(q, plan, tplan, set(drill), res, systemic)
-        else:
-            self._keyless(q, plan, tplan, set(drill), res)
+        try:
+            if plan.key_columns:
+                self._keyed(q, plan, tplan, set(drill), res, systemic, scan)
+            else:
+                self._keyless(q, plan, tplan, set(drill), res, scan)
+        except RenderError as exc:
+            # the source's values are first rendered here when the baseline was the
+            # reference: the differences above stand, the rows cannot be named
+            self.emit(
+                Kind.NOT_CHECKED,
+                Severity.MEDIUM,
+                q,
+                f"row level drill-down stopped: {exc}",
+                column=exc.column,
+                detail={"issue": NOT_CANONICALISABLE},
+            )
         return res
+
+    def _structure(self, q: str, sschema: TableSchema, tschema: TableSchema) -> int:
+        """Nullability, keys, foreign keys and indexes (spec 9.13), each structure rule
+        named with its reason; the number of differences found."""
+        rules = [r for r in self.o.ignore if r.matches_table(q)]
+        for r in rules:
+            if r.structure:
+                self.emit(
+                    Kind.NOTICE,
+                    Severity.INFO,
+                    q,
+                    f"{r.structure.replace('_', ' ')} not compared: {r.reason}",
+                    column=r.column,
+                    detail={"reason": r.reason, "structure": r.structure},
+                )
+        found = compare_structure(
+            sschema,
+            tschema,
+            self.o.structure,
+            rules=rules,
+            reference_name=self.reference,
+            schema_map={} if self.against_target else self.o.schema_map,
+        )
+        for i in found:
+            self.emit(i.kind, i.severity, q, i.summary, column=i.column, expected=i.expected,
+                      actual=i.actual, detail={"issue": i.issue, **i.detail})  # fmt: skip
+        return sum(i.kind == Kind.DIFFERENCE for i in found)
 
     def _sample(self, q: str, plan: HashPlan, rows: int) -> HashPlan:
         """The random buckets a large table is compared on, the same for a given seed."""
@@ -583,7 +839,7 @@ class Reconciler:
         return replace(plan, sample=tuple(sorted(rng.sample(range(plan.buckets), k))))
 
     # ------------------------------------------------------------------ details
-    def _keyed(self, q, plan, tplan, buckets, res, systemic) -> None:
+    def _keyed(self, q, plan, tplan, buckets, res, systemic, scan) -> None:
         """Bucket by bucket, both sides in step: one bucket's keys are held at a time, and
         of each kind of difference only the rows that can be shown are kept."""
         limit = self.o.diff_row_limit
@@ -593,8 +849,8 @@ class Reconciler:
         changed: list[tuple] = []
         counts = [0, 0, 0]
         pairs = zip(
-            self.source.bucket_rows(plan, buckets),
-            self.target.bucket_rows(tplan, buckets),
+            self.source.paced_bucket_rows(plan, buckets, scan[0]),
+            self.target.paced_bucket_rows(tplan, buckets, scan[1]),
             strict=True,
         )
         for (sb, s), (tb, t) in pairs:
@@ -616,7 +872,7 @@ class Reconciler:
             return f"{keyname} = {', '.join('NULL' if v is None else v for v in k)}"
 
         if systemic:
-            self._systemic(q, plan, tplan, changed[:5], n_changed, res)
+            self._systemic(q, plan, tplan, changed[:5], n_changed, res, scan)
             return
         shown = 0
         for k in missing:
@@ -645,7 +901,7 @@ class Reconciler:
             shown += 1
         remaining = max(0, limit - shown)
         if changed and remaining:
-            self._changed(q, plan, tplan, changed[:remaining], fmt)
+            self._changed(q, plan, tplan, changed[:remaining], fmt, scan)
             shown += min(len(changed), remaining)
         total = n_missing + n_extra + n_changed
         self.emit(
@@ -664,9 +920,14 @@ class Reconciler:
             },
         )
 
-    def _column_diffs(self, plan, tplan, keys) -> list[tuple[tuple, str, str | None, str | None]]:
-        s_vals = self.source.fetch_rows(plan, keys)
-        t_vals = self.target.fetch_rows(tplan, keys)
+    def _column_diffs(
+        self, plan, tplan, keys, scan
+    ) -> list[tuple[tuple, str, str | None, str | None]]:
+        # keys are matched on their rendering, which no index serves: a read of the table
+        with self.source.pacer.statement(scan[0]):
+            s_vals = self.source.fetch_rows(plan, keys)
+        with self.target.pacer.statement(scan[1]):
+            t_vals = self.target.fetch_rows(tplan, keys)
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = []
         for k in keys:
@@ -686,8 +947,8 @@ class Reconciler:
             return value
         return _short(column_digest(value))
 
-    def _changed(self, q, plan, tplan, keys, fmt) -> None:
-        for k, col, a, b in self._column_diffs(plan, tplan, keys):
+    def _changed(self, q, plan, tplan, keys, fmt, scan) -> None:
+        for k, col, a, b in self._column_diffs(plan, tplan, keys, scan):
             self.emit(
                 Kind.DIFFERENCE,
                 Severity.MEDIUM,
@@ -700,8 +961,8 @@ class Reconciler:
                 detail={"key": list(k), "values_shown": self.o.show_values},
             )
 
-    def _systemic(self, q, plan, tplan, sample_keys, changed_total, res) -> None:
-        diffs = self._column_diffs(plan, tplan, sample_keys)
+    def _systemic(self, q, plan, tplan, sample_keys, changed_total, res, scan) -> None:
+        diffs = self._column_diffs(plan, tplan, sample_keys, scan)
         cols = Counter(col for _, col, _, _ in diffs)
         types = dict(plan.columns)
         likely = {
@@ -712,8 +973,20 @@ class Reconciler:
             "time": "time precision",
             "decimal": "numeric scale or rounding",
             "json": "JSON normalisation",
+            "xml": "XML serialisation (namespace prefixes, typed XML or whitespace)",
         }
-        causes = sorted({likely.get(str(types[c]), "type mapping") for c in cols})
+        # PostgreSQL infinity on one side: an open ended date mapped to or from NULL or a
+        # sentinel date in the move, not a time zone or type mapping
+        infinite = {c for _, c, a, b in diffs if types[c] in ranges.DATES and {a, b} & INFINITY}
+        causes = sorted(
+            {
+                "PostgreSQL infinity dates mapped to NULL or a sentinel date (ignore the "
+                "column if intended)"
+                if c in infinite
+                else likely.get(str(types[c]), "type mapping")
+                for c in cols
+            }
+        )
         examples = [
             {"key": list(k), "column": c, "source": self._show(a), "target": self._show(b)}
             for k, c, a, b in diffs[:3]
@@ -735,14 +1008,17 @@ class Reconciler:
             },
         )
 
-    def _keyless(self, q, plan, tplan, buckets, res) -> None:
+    def _keyless(self, q, plan, tplan, buckets, res, scan) -> None:
         """A multiset of row hashes per bucket (identical rows share a bucket), one bucket
-        at a time; only the first hashes of each kind are kept for the report."""
+        at a time, each a read of the table; only the first hashes of each kind are kept
+        for the report."""
         missing: list[str] = []
         extra: list[str] = []
         for b in sorted(buckets):
-            s = Counter(h for _, h in self.source.row_hashes(plan, {b}))
-            t = Counter(h for _, h in self.target.row_hashes(tplan, {b}))
+            with self.source.pacer.statement(scan[0]):
+                s = Counter(h for _, h in self.source.row_hashes(plan, {b}))
+            with self.target.pacer.statement(scan[1]):
+                t = Counter(h for _, h in self.target.row_hashes(tplan, {b}))
             m, e = s - t, t - s
             res.missing_rows += sum(m.values())
             res.extra_rows += sum(e.values())
@@ -767,6 +1043,7 @@ class Reconciler:
         tp: TablePlan,
         res: TableResult,
         tschema: TableSchema,
+        scan: tuple[int, int],
         sfilter: str | None = None,
         tfilter: str | None = None,
     ) -> None:
@@ -783,11 +1060,13 @@ class Reconciler:
             return
         tol = self.o.float_rel_tolerance
         for col in tp.float_columns:
-            a = self.source.float_stats(table, col, **({"where": sfilter} if sfilter else {}))
+            with self.source.pacer.statement(scan[0]):
+                a = self.source.float_stats(table, col, **({"where": sfilter} if sfilter else {}))
             tcol = tschema.column(col)  # the target's own spelling (Oracle: upper case)
-            b = self.target.float_stats(
-                ttable, tcol.name if tcol else col, **({"where": tfilter} if tfilter else {})
-            )
+            with self.target.pacer.statement(scan[1]):
+                b = self.target.float_stats(
+                    ttable, tcol.name if tcol else col, **({"where": tfilter} if tfilter else {})
+                )
             problems = []
             for name in ("non_null", "nan_count", "inf_count"):
                 if getattr(a, name) != getattr(b, name):
@@ -817,6 +1096,15 @@ class Reconciler:
                     column=col,
                     detail={"rel_tolerance": tol},
                 )
+
+
+def _aggregates(a: Adapter, plan: HashPlan, rows: int) -> dict[int, BucketAggregate]:
+    """One side's bucket aggregates: a read of the whole table whatever the row rules and
+    the sample keep, so charged at least the table's rows (spec 9.15)."""
+    with a.pacer.statement(rows) as s:
+        aggs = a.bucket_aggregates(plan)
+        s.rows = max(rows, sum(x.count for x in aggs.values()))
+    return aggs
 
 
 def _norm(a: BucketAggregate | None) -> tuple[int, str]:

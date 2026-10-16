@@ -12,6 +12,8 @@ product never polls a control plane API.
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 import threading
 import time
 from typing import Any
@@ -46,7 +48,11 @@ class TokenBucket:
             time.sleep(wait)
 
 
-_bucket = TokenBucket(rate_per_second=20, burst=40)
+# One per process: a run, doctor, the UI and the scheduler each limit their own calls.
+_bucket = TokenBucket(rate_per_second=20, burst=40)  # until configure_rate_limit
+# The deployment's region from the instance settings. The SDK does not read it from the
+# instance metadata, so without it a client has no region, or the profile's.
+_region: str | None = None
 
 
 def configure_rate_limit(rate_per_second: float, burst: int | None = None) -> None:
@@ -54,18 +60,37 @@ def configure_rate_limit(rate_per_second: float, burst: int | None = None) -> No
     _bucket = TokenBucket(rate_per_second, burst or max(1, int(rate_per_second * 2)))
 
 
+def configure_region(region: str | None) -> None:
+    global _region
+    _region = region or None
+
+
 def sdk_versions() -> dict[str, str]:
     """Recorded in every report and in `liftproof version` (AWSAPI-004)."""
     return {"boto3": boto3.__version__, "botocore": botocore.__version__}
 
 
-def client(service: str, region: str | None = None) -> Any:
+DEFAULT_RATE = 20.0  # requests per second, all clients together
+
+
+def client(
+    service: str,
+    region: str | None = None,
+    *,
+    endpoint_url: str | None = None,
+    credentials: dict[str, str] | None = None,
+) -> Any:
+    """Every client the product makes, rate limited and retried alike. `endpoint_url` and
+    `credentials` serve an S3 compatible store outside AWS only, whose access key pair
+    comes from a Secrets Manager secret; AWS itself is reached with the default chain."""
     cfg = Config(
         retries={"mode": "adaptive", "max_attempts": 10},
         user_agent_extra=f"liftproof/{__version__}",
-        region_name=region,
+        region_name=region or _region,
     )
-    c = boto3.session.Session().client(service, config=cfg)
+    c = boto3.session.Session().client(
+        service, config=cfg, endpoint_url=endpoint_url, **(credentials or {})
+    )
 
     def _limit(**_kwargs: Any) -> None:
         _bucket.take()
@@ -90,3 +115,33 @@ def put_metric(name: str, value: float, dimensions: dict[str, str], unit: str = 
             }
         ],
     )
+
+
+# The services the instance calls (and the SSM agent beside it), each through a VPC
+# endpoint in a private subnet: infra/modules/liftproof/network.tf. S3 goes through a
+# gateway endpoint, which routes rather than resolves, so its addresses stay public ones.
+ENDPOINT_SERVICES = (
+    "ssm", "ssmmessages", "ec2messages", "secretsmanager", "kms", "logs", "monitoring", "s3",
+)  # fmt: skip
+GATEWAY_SERVICES = ("s3",)
+
+
+def reach(service: str, region: str, timeout: float = 5.0, vpc_cidrs: tuple[str, ...] = ()) -> str:
+    """Opens a TCP connection to the service's regional endpoint on 443 and closes it.
+    Returns "vpc endpoint" when the name resolves inside the VPC (an interface endpoint
+    with private DNS): an address that is not publicly routable, or one in the VPC's own
+    ranges, which a customer may have taken from public space. Returns "gateway" for S3,
+    whose addresses stay public through a gateway endpoint, so its route cannot be seen
+    from here; "public address" otherwise. Raises OSError when the name does not resolve
+    or nothing answers."""
+    host = f"{service}.{region}.amazonaws.com"
+    infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    family, kind, proto, _name, addr = infos[0]
+    with socket.socket(family, kind, proto) as sock:
+        sock.settimeout(timeout)
+        sock.connect(addr)
+    if service in GATEWAY_SERVICES:
+        return "gateway"
+    ip = ipaddress.ip_address(addr[0])
+    inside = not ip.is_global or any(ip in ipaddress.ip_network(c, strict=False) for c in vpc_cidrs)
+    return "vpc endpoint" if inside else "public address"

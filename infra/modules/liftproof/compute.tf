@@ -12,10 +12,14 @@ locals {
   instance_config = yamlencode({
     deployment       = var.name # the dimension the skipped run alarm watches
     region           = local.region
+    vpc_cidr         = data.aws_vpc.this.cidr_block # doctor: endpoint addresses inside it
     bucket           = aws_s3_bucket.this.bucket
     kms_key          = local.kms_key_arn
     log_group        = aws_cloudwatch_log_group.this.name
     report_lock_days = var.report_lock_days
+    # every AWS client in a Liftproof process shares one token bucket of this rate
+    # (AWSAPI-002); a run, the UI and the scheduler each have their own
+    aws_requests_per_second = var.aws_requests_per_second
   })
 }
 
@@ -54,7 +58,7 @@ resource "aws_instance" "this" {
     write_files:
       - path: /etc/mvt/config.yaml
         permissions: "0640"
-        owner: root:root
+        owner: root:mvt
         content: |
           ${indent(6, local.instance_config)}
   EOT

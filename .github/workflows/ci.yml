@@ -4,9 +4,16 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_call: # release.yml runs the whole suite again on the tagged commit (OPE-004)
 
 permissions:
   contents: read
+
+# Every run step is bash with pipefail, so a piped command (pip-audit | tee) fails the
+# step when the first command fails, not only when the last one does.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   test:

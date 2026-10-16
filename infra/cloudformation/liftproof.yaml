@@ -40,7 +40,7 @@ Metadata:
           - AccessLogBucket
           - LogRetentionDays
       - Label: { default: Operators and alarms }
-        Parameters: [OperatorPrincipalArns, AlarmTopicArn]
+        Parameters: [OperatorPrincipalArns, AlarmTopicArn, AwsRequestsPerSecond]
     ParameterLabels:
       ImageId: { default: Liftproof AMI }
       SecretArns: { default: Secrets the product may read }
@@ -148,7 +148,7 @@ Parameters:
     Default: ""
   KmsKeyArn:
     Type: String
-    Description: Existing customer managed KMS key. Empty creates a dedicated key with rotation.
+    Description: Existing customer managed KMS key. Empty creates a dedicated key with rotation. An existing key's policy must first allow CloudWatch Logs and the instance role (statements in the deployment guide, "Bring your own KMS key").
     Default: ""
     AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:\\d{12}:key/.+$"
   BucketName:
@@ -191,6 +191,12 @@ Parameters:
     Type: String
     Description: SNS topic for alarms. Empty creates alarms without notifications.
     Default: ""
+  AwsRequestsPerSecond:
+    Type: Number
+    Description: Ceiling on the AWS API calls each Liftproof process (a run, the UI, the scheduler) makes per second, all services together. Runs going at once each have this ceiling.
+    Default: 20
+    MinValue: 1
+    MaxValue: 1000
 
 Conditions:
   CreateKey: { "Fn::Equals": [{ Ref: KmsKeyArn }, ""] }
@@ -828,15 +834,18 @@ Resources:
               write_files:
                 - path: /etc/mvt/config.yaml
                   permissions: "0640"
-                  owner: root:root
+                  owner: root:mvt
                   content: |
                     deployment: ${DeploymentName}
                     region: ${AWS::Region}
+                    vpc_cidr: ${VpcCidr}
                     bucket: ${Bucket}
                     kms_key: ${KeyArn}
                     log_group: ${LogGroup}
                     report_lock_days: ${ReportLockDays}
+                    aws_requests_per_second: ${AwsRequestsPerSecond}
             - KeyArn: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+              VpcCidr: { "Fn::GetAtt": [VpcInfo, CidrBlock] }
       Tags:
         - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}" } }
         - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
@@ -877,6 +886,11 @@ Resources:
             description: "Reference for reconcile and validate: latest (source), latest-target (after rebaseline) or a baseline id"
             default: latest
             allowedPattern: "^(latest|b-[0-9]{8}-[0-9]{6}|[a-z0-9-]{1,40})$"
+          resume:
+            type: String
+            description: "true: continue the interrupted reconcile, baseline or rebaseline, also on a replacement instance"
+            default: "false"
+            allowedValues: ["false", "true"]
           failOn:
             type: String
             default: differences
@@ -896,6 +910,7 @@ Resources:
                 - "case '{{ mode }}' in reconcile|validate) args+=(--baseline {{ baseline }});; esac"
                 - "case '{{ mode }}' in replay|smoke|validate) [ -z '{{ journeys }}' ] || args+=(--journeys '{{ journeys }}');; esac"
                 - "case '{{ mode }}' in files|validate) [ -z '{{ sets }}' ] || args+=(--sets '{{ sets }}');; esac"
+                - "case '{{ mode }}' in reconcile|baseline|rebaseline) [ '{{ resume }}' != true ] || args+=(--resume);; esac"
                 - "case '{{ mode }}' in ui-login) args=(--workdir /var/lib/mvt/projects --format json);; esac"
                 - "systemd-run --unit=liftproof-{{ project }}-$(date +%s) --wait --pipe --collect --quiet -p User=mvt -E LIFTPROOF_INVOKED_BY=ssm-run-command /opt/mvt/bin/liftproof {{ mode }} \"${args[@]}\""
 

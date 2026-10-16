@@ -12,6 +12,7 @@ import json
 import secrets
 import threading
 import time
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
@@ -29,6 +30,7 @@ LOGIN = """<!doctype html><html><head><title>Shop</title>
 
 ORDERS = """<!doctype html><html><head><title>Shop</title></head><body><main>
 <h1>Orders</h1>
+<p data-liftproof-volatile>Served by node {node}</p>
 <form id="new">
 <label for="item">Item</label> <input id="item" name="item">
 <button type="submit" {testid}>{button}</button>
@@ -44,8 +46,13 @@ document.getElementById('new').addEventListener('submit', async (e) => {{
 </script></main></body></html>"""
 
 ORDER = """<!doctype html><html><head><title>Shop</title></head><body><main>
-<h1>Order <span id="oid"></span></h1><dl id="d"></dl>
+<h1>Order <span id="oid"></span></h1>{greeting}<dl id="d"></dl>
 <a href="/orders">Back to orders</a>
+<button type="button" onclick="history.back()">Previous page</button>
+<button type="button" onclick="location.reload()">Refresh</button>
+<a href="#d">Details</a>
+<button type="button" onclick="history.pushState(null, '', '?tab=more')">More</button>
+<p data-liftproof-volatile>Served by node {node}</p>
 <script>
 fetch('/api/orders/{oid}').then(r => r.json()).then(o => {{
   document.getElementById('oid').textContent = o.id;
@@ -55,16 +62,60 @@ fetch('/api/orders/{oid}').then(r => r.json()).then(o => {{
 }});
 </script></main></body></html>"""
 
+HELP = """<!doctype html><html><head><title>Shop</title></head><body><main>
+<h1>Help</h1>
+<aside data-liftproof-volatile>Served by node {node}. <a href="/login">Sign in</a></aside>
+</main></body></html>"""
+
+# a page whose frame moves on by itself once loaded: a history entry for the frame alone
+FRAMED = """<!doctype html><html><head><title>Shop</title></head><body><main>
+<h1>Framed</h1><iframe title="news" src="/frame/a"></iframe></main></body></html>"""
+
+FRAME = """<!doctype html><html><body><p>Frame {name}</p>
+<script>{script}</script></body></html>"""
+NEXT_FRAME = "addEventListener('load', () => setTimeout(() => location.assign('/frame/b'), 50));"
+
+INBOX = """<!doctype html><html><head><title>Shop</title></head><body><main>
+<h1>Inbox</h1>
+<script>fetch('/api/updates');</script></main></body></html>"""
+
 
 class ShopApp:
     """variant: same | changed. changed renames a status, adds an API field, drops the
     order button's test id (so replay falls back to a weaker locator) and returns 500 for
     a missing order instead of 404. latency_ms delays every response, as a real
-    application across a network does (the performance suite uses it)."""
+    application across a network does (the performance suite uses it).
 
-    def __init__(self, variant: str = "same", latency_ms: int = 0) -> None:
+    posts counts the POSTs that reach it, by path. post_status and post_delay_ms (by path)
+    change the answer to a write it has already stored: its status, and how long it takes.
+    GET /dropped closes the connection without an answer, GET /export answers with a
+    download and GET /empty with 204. GET /framed holds a frame that moves on by itself.
+    GET /inbox long polls /api/updates, which is held open until the app closes; polls
+    counts those requests.
+
+    Every page after sign in names the node that served it, marked volatile, and so does
+    GET /help, around its link to sign in. greeting (plain, or marked volatile) welcomes
+    the user on the order page by a name that differs on every visit. pages counts the
+    pages served, by path."""
+
+    def __init__(
+        self,
+        variant: str = "same",
+        latency_ms: int = 0,
+        *,
+        post_status: dict[str, int] | None = None,
+        post_delay_ms: dict[str, int] | None = None,
+        greeting: str | None = None,
+    ) -> None:
         self.variant = variant
         self.latency_ms = latency_ms
+        self.post_status = post_status or {}
+        self.post_delay_ms = post_delay_ms or {}
+        self.greeting = greeting
+        self.posts: Counter[str] = Counter()
+        self.pages: Counter[str] = Counter()
+        self.polls = 0
+        self._closing = threading.Event()
         self.orders: dict[str, dict] = {}
         self.sessions: set[str] = set()
         self.csrf: set[str] = set()
@@ -97,6 +148,8 @@ class ShopApp:
             def _respond(self, status, body, ctype, headers):
                 if app.latency_ms:
                     time.sleep(app.latency_ms / 1000)
+                if self.command == "POST" and self.path in app.post_delay_ms:
+                    time.sleep(app.post_delay_ms[self.path] / 1000)
                 data = body.encode() if isinstance(body, str) else body
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)
@@ -112,6 +165,30 @@ class ShopApp:
 
             def do_GET(self):
                 path = self.path.split("?")[0]
+                with app._lock:
+                    app.pages[path] += 1
+                if path == "/dropped":
+                    return  # the connection closes with nothing sent
+                if path == "/inbox":
+                    return self._send(200, INBOX)
+                if path == "/export":
+                    return self._send(200, "a,b\n", "text/csv",
+                                      {"Content-Disposition": 'attachment; filename="o.csv"'})
+                if path == "/empty":
+                    return self._send(204, "")
+                if path == "/framed":
+                    return self._send(200, FRAMED)
+                if path.startswith("/frame/"):
+                    name = path.rsplit("/", 1)[1]
+                    return self._send(200, FRAME.format(
+                        name=name, script=NEXT_FRAME if name == "a" else ""))
+                if path == "/help":
+                    return self._send(200, HELP.format(node=secrets.token_hex(4)))
+                if path == "/api/updates":
+                    with app._lock:
+                        app.polls += 1
+                    app._closing.wait()  # no news, ever
+                    return
                 if path in ("/", "/login"):
                     token = secrets.token_hex(16)
                     app.csrf.add(token)
@@ -122,9 +199,11 @@ class ShopApp:
                     same = app.variant == "same"
                     return self._send(200, ORDERS.format(
                         testid='data-testid="place-order"' if same else "",
-                        button="Place order"))
+                        button="Place order", node=secrets.token_hex(4)))
                 if path.startswith("/orders/"):
-                    return self._send(200, ORDER.format(oid=path.rsplit("/", 1)[1]))
+                    return self._send(200, ORDER.format(
+                        oid=path.rsplit("/", 1)[1], node=secrets.token_hex(4),
+                        greeting=app._greeting()))
                 if path.startswith("/api/orders/"):
                     o = app.orders.get(path.rsplit("/", 1)[1])
                     if o is None:
@@ -134,6 +213,8 @@ class ShopApp:
                 return self._send(404, "not found")
 
             def do_POST(self):
+                with app._lock:
+                    app.posts[self.path] += 1
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length).decode()
                 if self.path == "/login":
@@ -155,17 +236,25 @@ class ShopApp:
                         body = (f'{{"id": {oid}, "item": "{item}", "status": "OPEN", '
                                 f'"total": 10.50, "placed_at": "{placed}"}}')
                     app.orders[oid] = body
-                    return self._send(201, body, "application/json")
+                    return self._send(app.post_status.get(self.path, 201), body,
+                                      "application/json")
                 return self._send(403, "{}", "application/json")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
+    def _greeting(self) -> str:
+        if self.greeting is None:
+            return ""
+        marked = " data-liftproof-volatile" if self.greeting == "marked" else ""
+        return f'<p class="greeting"{marked}>Welcome back, visitor {secrets.token_hex(3)}</p>'
+
     def __enter__(self) -> ShopApp:
         self.thread.start()
         return self
 
     def __exit__(self, *exc) -> None:
+        self._closing.set()
         self.server.shutdown()
         self.server.server_close()

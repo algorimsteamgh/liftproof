@@ -54,3 +54,31 @@ resource "aws_kms_alias" "this" {
 locals {
   kms_key_arn = coalesce(var.kms_key_arn, try(aws_kms_key.this[0].arn, null))
 }
+
+# With an existing key (kms_key_arn), its policy is the customer's. CloudWatch Logs
+# cannot use the key without a statement of its own, so the log group fails to create
+# until it is added; the instance role needs one too when the policy does not delegate
+# to IAM. Both are published as an output to paste in before the first apply.
+data "aws_iam_policy_document" "customer_key" {
+  #checkov:skip=CKV_AWS_109:Statements for the customer's own key policy, where "*" means that key
+  #checkov:skip=CKV_AWS_111:Statements for the customer's own key policy, where "*" means that key
+  #checkov:skip=CKV_AWS_356:In a key policy "*" means this key
+  source_policy_documents = [data.aws_iam_policy_document.key.json]
+
+  statement {
+    sid       = "LiftproofInstanceRole"
+    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+    resources = ["*"]
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:${local.partition}:iam::${local.account_id}:role/${local.name}-instance"]
+    }
+  }
+}
+
+locals {
+  customer_key_statements = [
+    for s in jsondecode(data.aws_iam_policy_document.customer_key.json).Statement : s
+    if s.Sid != "AccountAdministration"
+  ]
+}

@@ -1,9 +1,9 @@
 """Canonical column types.
 
-Each engine adapter maps its native types onto one of these. The mapping is a policy
-decision (NUMBER(10,0) to integer, tinyint(1) to boolean) and lives in the adapter's
-type map, which a project can override. The canonical type decides how a value is
-rendered, never the native type.
+Each engine's native types map onto one of these. The mapping is a policy decision
+(NUMBER(10,0) to integer, tinyint(1) to boolean) and lives in the versioned type map,
+typemap.yaml, which a project can override within the alternatives it lists. The
+canonical type decides how a value is rendered, never the native type.
 """
 
 from enum import StrEnum
@@ -23,6 +23,7 @@ class CanonicalType(StrEnum):
     BINARY = "binary"
     UUID = "uuid"
     JSON = "json"  # semantically canonicalised
+    XML = "xml"  # semantically canonicalised; C14N 2.0 less comments and whitespace
     UNSUPPORTED = "unsupported"  # compared by nothing; reported not_checked
 
     @property

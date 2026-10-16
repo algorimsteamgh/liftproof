@@ -71,9 +71,62 @@ terraform apply -var ami_id=ami-... -var source_database_cidr=10.1.2.0/24 \
   -var target_database_cidr=10.42.0.0/20 -var 'application_cidrs=["10.1.3.0/24"]'
 ```
 
+`source_database_cidr` is where the source is read: a read replica's network where there
+is one, the recommended source (README, Protecting the source).
+
 Then store the database logins in Secrets Manager under `liftproof/acme-prod/`
 (`{"username": ..., "password": ...}`), open the UI with the `connect_ui` output, and
-run `liftproof doctor`.
+run `liftproof doctor`. On the instance, doctor also connects to every AWS service
+endpoint the product needs, and names any interface endpoint service (Systems Manager,
+Secrets Manager, KMS, CloudWatch) reached through a public address rather than a VPC
+endpoint. S3 keeps public addresses through its gateway endpoint, so doctor cannot see
+its route: check that the private route tables carry the S3 gateway endpoint
+(`private_route_table_ids` / `PrivateRouteTableIds`).
+
+A baseline holds one snapshot of the source for as long as it runs, and that has a cost
+on the source: PostgreSQL cannot vacuum the rows changed since it began, MySQL's undo
+grows, SQL Server keeps row versions in tempdb, and Oracle needs `undo_retention` to cover
+it or fails the baseline with ORA-01555 (snapshot too old). Where the source cannot afford
+that, set `snapshot: per_table` on it in the project file: each table is read in a
+snapshot of its own, and the report says in plain words that cross table consistency was
+not held (README, Protecting the source).
+
+Each Liftproof process (a run, doctor, the UI, the scheduler) limits its own AWS calls to
+20 requests a second unless `aws_requests_per_second` (CloudFormation:
+`AwsRequestsPerSecond`) says otherwise; runs going at once each have that limit. Lower it
+in an account whose API quotas other workloads already use heavily.
+
+### Bring your own KMS key
+
+With `kms_key_arn` (Terraform) or `KmsKeyArn` (CloudFormation), the key's policy is
+yours, so add two statements to it before deploying. CloudWatch Logs cannot encrypt
+the log group without the first, and the deployment stops there. The second is
+needed only when the policy does not delegate to IAM (no statement for the account
+root). Terraform prints both, filled in, as `customer_key_policy_statements` in
+`terraform plan`. Replace REGION, ACCOUNT and NAME (the deployment name):
+
+```json
+[
+  {
+    "Sid": "CloudWatchLogs",
+    "Effect": "Allow",
+    "Principal": {"Service": "logs.REGION.amazonaws.com"},
+    "Action": ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
+    "Resource": "*",
+    "Condition": {"ArnLike": {"kms:EncryptionContext:aws:logs:arn": "arn:aws:logs:REGION:ACCOUNT:log-group:/liftproof/NAME*"}}
+  },
+  {
+    "Sid": "LiftproofInstanceRole",
+    "Effect": "Allow",
+    "Principal": {"AWS": "arn:aws:iam::ACCOUNT:role/liftproof-NAME-instance"},
+    "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+    "Resource": "*"
+  }
+]
+```
+
+Keys that encrypt the database secrets (`secret_kms_key_arns`, `SecretKmsKeyArns`)
+need the second statement, with only `kms:Decrypt`, under the same condition.
 
 ## Algorims build account
 
@@ -81,9 +134,20 @@ run `liftproof doctor`.
   Logs), GuardDuty, Amazon Inspector (EC2, ECR), Security Hub with AWS Foundational
   Security Best Practices, IAM Access Analyzer, account-wide S3 Block Public Access,
   EBS encryption by default, IMDSv2 by default, a strict password policy, S3 access
-  logging and a monthly budget alert.
+  logging and a monthly budget alert. EBS encryption by default is on in every account
+  except the build account, where it would encrypt the AMI (see below).
 - **Release path:** GitHub Actions assumes `liftproof-github-release` through OIDC, only
-  from `main` and `v*` tags. No stored keys (the second half of IAM-002).
+  from `main` and `v*` tags. No stored keys (the second half of IAM-002). The release
+  job runs without a GitHub environment, because a job in one presents an
+  environment subject that the role does not trust. Its settings are repository
+  variables: `LIFTPROOF_RELEASE_ROLE_ARN`, `LIFTPROOF_BUILD_SUBNET`,
+  `LIFTPROOF_BUILD_SG` and `LIFTPROOF_EVIDENCE_BUCKET`.
+- **Cutting a release:** set `__version__` in `src/liftproof/__init__.py` to the new
+  version through a pull request, then push the tag `v<version>` on that commit of
+  `main`. The release refuses a tag that is not on `main` or does not match
+  `__version__`, and runs the functional suite, the dependency audit and the KPI suite
+  before building. The image's own installed packages are audited again during the
+  build, and that audit is kept with the evidence.
 - **AMI:** Packer builds over Session Manager in a private subnet. Amazon Inspector then
   scans an instance of the new AMI, and any HIGH or CRITICAL finding fails the release
   (ATS-009). Build logs, the dependency audit and scan findings go to an evidence bucket

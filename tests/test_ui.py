@@ -16,7 +16,8 @@ import pytest
 import yaml
 
 from liftproof import cli
-from liftproof.errors import ConfigError
+from liftproof.errors import ConfigError, RunFailed
+from liftproof.store import LocalStore
 from liftproof.ui.server import LOGINS, UI, make_server, new_login
 from liftproof.web.journey import Correlation, Journey, SecretBinding, Step
 
@@ -255,6 +256,37 @@ def test_journeys_bind_secrets_and_confirm_correlations(site):
     assert r.status == 400
     r, _ = client.post("/p/acme/journeys/other/bind", {"confirm": "x"})
     assert r.status == 404 and len(launches.calls) == n
+
+
+def test_a_journey_shows_from_this_instance_when_the_bucket_is_out_of_reach(site, monkeypatch):
+    client, ui, _ = site
+    client.login()
+    Journey("checkout", "http://src.invalid", steps=[Step(1, "goto", url="/login")]).save(
+        ui.workdir / "acme" / "journeys" / "checkout.json")
+
+    class Offline(LocalStore):  # no credentials, or the endpoint unreachable
+        def modified(self, prefix):
+            raise RunFailed(f"S3 list failed for acme/{prefix}: Unable to locate credentials")
+
+    monkeypatch.setattr(cli, "_store", lambda p, workdir: Offline(workdir / p.name))
+    r, page = client.request("GET", "/p/acme/journeys/checkout")
+    assert r.status == 200 and "1 steps" in page and "S3 list failed" not in page
+    r, page = client.request("GET", "/p/acme/journeys/other")
+    assert r.status == 404
+
+
+def test_a_journey_shows_where_each_browser_navigation_went(site):
+    client, ui, _ = site
+    client.login()
+    steps = [Step(1, "goto", url="/login"), Step(2, "back", value="2", page_url="/orders"),
+             Step(3, "reload", page_url="/orders"),
+             Step(4, "goto", url="https://docs.example.com/help", page_url="/help")]  # fmt: skip
+    Journey("browsing", "http://src.invalid", steps=steps, format="2.0").save(
+        ui.workdir / "acme" / "journeys" / "browsing.json")
+    r, page = client.request("GET", "/p/acme/journeys/browsing")
+    assert r.status == 200
+    assert "<td>2 entries, to /orders</td>" in page and "<td>to /orders</td>" in page
+    assert page.count("opened from the instance at replay") == 1
 
 
 def test_binds_to_loopback_only(tmp_path):

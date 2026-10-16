@@ -43,6 +43,10 @@ module "baseline" {
   source        = "../../modules/account-baseline"
   name          = "algorims-liftproof-build"
   budget_emails = var.budget_emails
+  # Packer builds the Marketplace AMI here, and its snapshot must stay unencrypted
+  # (Marketplace does not accept encrypted AMIs). Build and scan instances hold no
+  # data; their volumes are deleted with them.
+  ebs_encryption_by_default = false
 }
 
 module "network" {

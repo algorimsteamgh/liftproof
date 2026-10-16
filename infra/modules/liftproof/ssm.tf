@@ -42,6 +42,12 @@ resource "aws_ssm_document" "run" {
         default        = "latest"
         allowedPattern = "^(latest|b-[0-9]{8}-[0-9]{6}|[a-z0-9-]{1,40})$"
       }
+      resume = {
+        type          = "String"
+        description   = "true: continue the interrupted reconcile, baseline or rebaseline, also on a replacement instance"
+        default       = "false"
+        allowedValues = ["false", "true"]
+      }
       failOn = {
         type          = "String"
         default       = "differences"
@@ -64,6 +70,7 @@ resource "aws_ssm_document" "run" {
           "case '{{ mode }}' in reconcile|validate) args+=(--baseline {{ baseline }});; esac",
           "case '{{ mode }}' in replay|smoke|validate) [ -z '{{ journeys }}' ] || args+=(--journeys '{{ journeys }}');; esac",
           "case '{{ mode }}' in files|validate) [ -z '{{ sets }}' ] || args+=(--sets '{{ sets }}');; esac",
+          "case '{{ mode }}' in reconcile|baseline|rebaseline) [ '{{ resume }}' != true ] || args+=(--resume);; esac",
           "case '{{ mode }}' in ui-login) args=(--workdir /var/lib/mvt/projects --format json);; esac",
           "systemd-run --unit=liftproof-{{ project }}-$(date +%s) --wait --pipe --collect --quiet -p User=mvt -E LIFTPROOF_INVOKED_BY=ssm-run-command /opt/mvt/bin/liftproof {{ mode }} \"$${args[@]}\"",
         ]

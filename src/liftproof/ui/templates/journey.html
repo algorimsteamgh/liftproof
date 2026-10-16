@@ -56,7 +56,7 @@
   <tr><th>#</th><th>Action</th><th>Target</th><th>Requests</th></tr>
   {% for s in j.steps %}
   <tr><td>{{ s.n }}</td><td>{{ s.action }}{% if s.non_idempotent %} <span class="tag">changes data</span>{% endif %}</td>
-    <td>{{ s.url or (s.locator.description if s.locator else '') }}</td><td>{{ s.exchanges | length }}</td></tr>
+    <td>{% if s.locator %}{{ s.locator.description }}{% elif s.action == 'goto' %}{{ s.url }}{% if s.n > 1 and s.url and not s.url.startswith('/') %} <span class="tag">opened from the instance at replay</span>{% endif %}{% else %}{% if s.value %}{{ s.value }} entries, {% endif %}to {{ s.page_url or '' }}{% endif %}</td><td>{{ s.exchanges | length }}</td></tr>
   {% endfor %}
 </table></div>
 {% endif %}

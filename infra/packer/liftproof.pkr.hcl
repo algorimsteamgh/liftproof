@@ -129,7 +129,19 @@ build {
   provisioner "shell" {
     execute_command  = "sudo -E bash -euo pipefail '{{ .Path }}'"
     environment_vars = ["LIFTPROOF_VERSION=${var.version}"]
-    scripts          = ["${path.root}/files/provision.sh", "${path.root}/files/scheduler.sh", "${path.root}/files/harden.sh", "${path.root}/files/cleanup.sh"]
+    scripts          = ["${path.root}/files/provision.sh", "${path.root}/files/scheduler.sh", "${path.root}/files/harden.sh"]
+  }
+
+  # release evidence: what the image installed and its dependency audit (ATS-009)
+  provisioner "file" {
+    direction   = "download"
+    source      = "/var/tmp/ami-dependency-audit.txt"
+    destination = "ami-dependency-audit.txt"
+  }
+
+  provisioner "shell" {
+    execute_command = "sudo -E bash -euo pipefail '{{ .Path }}'"
+    scripts         = ["${path.root}/files/cleanup.sh"]
   }
 
   post-processor "manifest" {
