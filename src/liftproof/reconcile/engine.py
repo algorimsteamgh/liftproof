@@ -33,6 +33,7 @@ from liftproof.reconcile.plan import IgnoreRule, TablePlan, plan_table, row_filt
 from liftproof.reconcile.replication import REASON_BEHIND, ReplicationConfig, check
 
 DB = Comparator.DATABASE
+REASON_STOPPED = "the run stopped before this table was compared"
 
 
 @dataclass
@@ -128,7 +129,14 @@ class Reconciler:
         source: Adapter | None = None,
         baseline: Baseline | None = None,
         progress: Callable[[str], None] | None = None,
+        on_table: Callable[[ReconcileResult], None] | None = None,
+        done: Sequence[TableResult] = (),
+        resumed: bool = False,
+        systemic: bool = False,
     ) -> None:
+        """`on_table` runs after each table, with the findings of every finished table
+        written (a checkpoint). `done` and `resumed` continue an interrupted run: those
+        tables are not compared again and their findings are already written."""
         if source is None and baseline is None:
             raise ValueError("a live source or a baseline is required")
         self.against_target = baseline is not None and baseline.side == "target"
@@ -141,23 +149,58 @@ class Reconciler:
         self.writer = writer
         self.o = options
         self.progress = progress or (lambda _msg: None)
-        self.result = ReconcileResult()
+        self.on_table = on_table or (lambda _result: None)
+        self.result = ReconcileResult(list(done), systemic)
+        self.resumed = resumed
+        self.planned: list[str] = []
         # shared by the workers, which are shallow copies of this object
-        self._flags = {"drill": True}
+        self._flags = {"drill": not systemic}
         self._lock = threading.Lock()
-        self._tally = [0, 0]  # tables different, tables done
+        counted = [t for t in done if t.status in ("matched", "different")]
+        self._tally = [sum(t.status == "different" for t in counted), len(counted)]
+        # per thread: the findings of the table in hand, written when the table completes,
+        # so the written findings only ever cover whole tables
+        self._local = threading.local()
         self._seed = (
             options.sample_seed if options.sample_seed is not None else secrets.randbelow(2**31)
         )
 
     # ------------------------------------------------------------------ helpers
     @property
+    def seed(self) -> int:
+        """The sampling seed: a resumed run passes it back so it samples alike."""
+        return self._seed
+
+    @property
     def _drill(self) -> bool:
         return self._flags["drill"]
 
     def emit(self, kind: Kind, severity: int, obj: str, summary: str, **kw: Any) -> None:
+        finding = Finding(DB, kind, severity, obj, summary, **kw)
+        pending = getattr(self._local, "pending", None)
+        if pending is not None:
+            pending.append(finding)
+            return
         with self._lock:
-            self.writer.write(Finding(DB, kind, severity, obj, summary, **kw))
+            self.writer.write(finding)
+
+    def _write_table(self, res: TableResult, found: list[Finding]) -> None:
+        with self._lock:
+            for f in found:
+                self.writer.write(f)
+        self.result.tables.append(res)
+        self._count(res)
+        self.on_table(self.result)
+
+    def mark_unfinished(self, why: str) -> None:
+        """After a failure: every planned table without a result is named as not
+        checked, so coverage counts what exists, not only what finished (spec 12)."""
+        seen = {t.table for t in self.result.tables}
+        for q in self.planned:
+            if q not in seen:
+                self.emit(Kind.NOT_CHECKED, Severity.MEDIUM, q, f"{REASON_STOPPED}: {why}",
+                          detail={"reason": REASON_STOPPED})  # fmt: skip
+                self.result.tables.append(TableResult(q, "not_checked", reason=REASON_STOPPED))
 
     def _selected(self, tables: Sequence[TableRef]) -> list[TableRef]:
         if not self.o.tables:
@@ -183,11 +226,16 @@ class Reconciler:
         target_schemas = list(dict.fromkeys(self.o.schema_map.get(x, x) for x in self.o.schemas))
         target_tables = {t.qualified.lower(): t for t in self.target.list_tables(target_schemas)}
         source_tables = self._selected(source_tables)
-        if self._replication_behind(source_tables):
+        self.planned = [t.qualified for t in source_tables]
+        finished = {t.table for t in self.result.tables}
+        remaining = [t for t in source_tables if t.qualified not in finished]
+        # Resumed against a live source, the remaining tables are read as of now, so
+        # replication must have applied through the source's position now.
+        if self._replication_behind(remaining):
             return self.result
 
         for t in sorted(set(target_tables) - {self._target_key(s) for s in source_tables}):
-            if self.o.tables:
+            if self.o.tables or self.resumed:  # a resumed run already reported these
                 break
             self.emit(
                 Kind.DIFFERENCE,
@@ -198,7 +246,7 @@ class Reconciler:
 
         order = {t.qualified: i for i, t in enumerate(source_tables)}
         work: list[tuple[TableRef, TableRef]] = []
-        for table in source_tables:
+        for table in remaining:
             rule = self._table_ignored(table)
             if rule:
                 self.emit(
@@ -222,9 +270,9 @@ class Reconciler:
                 self._count(res)
                 continue
             work.append((table, ttable))
-        for res in self._each(work):
-            self.result.tables.append(res)
-            self._count(res)
+        self.on_table(self.result)  # what is known before any table is compared
+        for res, found in self._each(work):
+            self._write_table(res, found)
         self.result.tables.sort(key=lambda r: order.get(r.table, len(order)))
         return self.result
 
@@ -252,7 +300,16 @@ class Reconciler:
                 detail={"tables_checked": done, "tables_different": mismatched},
             )
 
-    def _each(self, work: list[tuple[TableRef, TableRef]]) -> Iterator[TableResult]:
+    def _one(self, table: TableRef, ttable: TableRef) -> tuple[TableResult, list[Finding]]:
+        self._local.pending = found = []
+        try:
+            return self._table(table, ttable), found
+        finally:
+            self._local.pending = None
+
+    def _each(
+        self, work: list[tuple[TableRef, TableRef]]
+    ) -> Iterator[tuple[TableResult, list[Finding]]]:
         """Reconcile the tables, in order on one worker, or on several at once when the
         project asks for it and both engines can open more connections."""
         n = min(self.o.workers, len(work))
@@ -270,7 +327,7 @@ class Reconciler:
         if n <= 1:
             for table, ttable in work:
                 self.progress(f"reconciling {table}")
-                yield self._table(table, ttable)
+                yield self._one(table, ttable)
             return
         free: queue.SimpleQueue[Reconciler] = queue.SimpleQueue()
         free.put(self)
@@ -283,11 +340,11 @@ class Reconciler:
                 clones.append(c)
                 free.put(c)
 
-            def job(table: TableRef, ttable: TableRef) -> TableResult:
+            def job(table: TableRef, ttable: TableRef) -> tuple[TableResult, list[Finding]]:
                 w = free.get()
                 try:
                     self.progress(f"reconciling {table}")
-                    return w._table(table, ttable)
+                    return w._one(table, ttable)
                 finally:
                     free.put(w)
 

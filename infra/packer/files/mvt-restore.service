@@ -1,0 +1,24 @@
+[Unit]
+Description=Liftproof: bring the deployment's project files back from S3 (replacement instance)
+After=network-online.target cloud-final.service
+Wants=network-online.target
+# the scheduler and the UI start after it, whether or not it succeeded
+Before=mvt-scheduler.service mvt-ui.service
+# once per instance: a project file deleted on purpose does not come back at a reboot
+ConditionPathExists=!/var/lib/mvt/.restored
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=mvt
+Group=mvt
+ExecStart=/opt/mvt/bin/liftproof restore --projects-dir /var/lib/mvt/projects
+ExecStartPost=/usr/bin/touch /var/lib/mvt/.restored
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/mvt /var/log/mvt
+
+[Install]
+WantedBy=multi-user.target

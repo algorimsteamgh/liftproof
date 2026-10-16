@@ -69,7 +69,11 @@ def build_report(
     range_block: dict[str, Any],
     run_failed: bool = False,
     failure: str | None = None,
+    not_reached: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    """`not_reached` names what a failed run never got to (file sets, journeys); it
+    counts as not checked, so a stopped run cannot read as fully covered (spec 12)."""
+    not_reached = list(not_reached or [])
     tables = db.tables if db else []
     status = Counter(t.status for t in tables)
     exists = len(tables)
@@ -92,6 +96,7 @@ def build_report(
         for j in journeys
         if j.status == "not_run"
     ]
+    not_covered += not_reached
 
     file_sets = list(files.sets) if files is not None else []
     f_total = sum(fs.files for fs in file_sets)
@@ -134,7 +139,10 @@ def build_report(
             "tables_matched": status["matched"],
             "tables_different": status["different"],
             "differences": kinds[Kind.DIFFERENCE],
-            "not_checked": kinds[Kind.NOT_CHECKED] + status["excluded"] + jstatus["not_run"],
+            "not_checked": kinds[Kind.NOT_CHECKED]
+            + status["excluded"]
+            + jstatus["not_run"]
+            + len(not_reached),
             "partial": kinds[Kind.PARTIAL],
             "flakes": kinds[Kind.FLAKE],
             "errors": kinds[Kind.ERROR],
