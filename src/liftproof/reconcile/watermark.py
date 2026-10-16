@@ -63,6 +63,14 @@ def _text(value: Any) -> tuple[str, str]:
     return str(value), "number"
 
 
+def _usable(value: Any) -> bool:
+    """A time or a finite number. Not PostgreSQL's infinity timestamps (read as Verbatim)
+    or numeric Infinity: no window can be written with them."""
+    if isinstance(value, decimal.Decimal):
+        return value.is_finite()
+    return isinstance(value, (int, dt.datetime))
+
+
 def _utc(text: str) -> dt.datetime:
     """A stored time as an aware UTC datetime (texts differ in precision and offset, so
     they are not compared as strings); a time without an offset is UTC."""
@@ -116,18 +124,28 @@ def windows(
     before: dict[TableRef, Any],
     after: dict[TableRef, Any],
     run_id: str,
-) -> list[Window]:
+) -> tuple[list[Window], list[str]]:
+    """The windows of the tables the replay created rows in, and the reasons for the
+    tables whose watermark no window can be written with."""
     now = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
-    out = []
+    out: list[Window] = []
+    problems: list[str] = []
     for t, col in tables.items():
         hi = after.get(t)
         lo = before.get(t)
-        if hi is None or (lo is not None and hi <= lo):
+        if hi is None:
+            continue  # the table is empty
+        bad = [v for v in (hi, lo) if v is not None and not _usable(v)]
+        if bad:
+            problems.append(f"{t}: watermark {col} reads {bad[0]}; "
+                            "name another column in database.replay_watermarks")  # fmt: skip
+            continue
+        if lo is not None and hi <= lo:
             continue  # nothing created
         upto, kind = _text(hi)
         out.append(Window(t.qualified, col, None if lo is None else _text(lo)[0], upto, kind,
                           run_id, now))  # fmt: skip
-    return out
+    return out, problems
 
 
 def load(path: Path) -> list[Window]:

@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 
 from liftproof import __version__, logs
-from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical import CANONICAL_REVISION, CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.config import Project
 
 REDACTED = "[redacted]"
@@ -99,7 +100,9 @@ def environment(instance_config: dict[str, Any]) -> dict[str, Any]:
     return {
         "product_version": __version__,
         "canonical_version": CANONICAL_VERSION,
+        "canonical_revision": CANONICAL_REVISION,
         "hash_algorithm": HASH_ALGORITHM,
+        "type_map_version": DEFAULT_TYPE_MAP.version,
         "python": sys.version.split()[0],
         "platform": platform.platform(),
         "os": os_release.get("PRETTY_NAME"),
@@ -139,10 +142,15 @@ def project_summary(project: Project) -> dict[str, Any]:
                     "where": r.where,
                     "source_where": r.source_where,
                     "target_where": r.target_where,
+                    "structure": r.structure,
                     "reason": r.reason,
                 }
                 for r in o.ignore
             ],
+            "structure": o.structure.as_dict(),
+            "type_map": o.type_map.record(
+                *(c.engine for c in (project.source, project.target) if c is not None)
+            ),
             "business_keys": o.business_keys,
             "show_values": o.show_values,
         },

@@ -257,6 +257,31 @@ def test_baseline_with_workers(tmp_path, many):
     assert {t.status for t in result.tables} == {"matched"}
 
 
+def test_baseline_per_table(tmp_path, many):
+    """Each table in a snapshot of its own, on as many workers on every engine: nothing
+    is shared between connections."""
+    e, src, tgt, _, _ = many
+    messages: list[str] = []
+    manifest = tmp_path / "b" / "manifest.json"
+    take_baseline(e.adapter(src), manifest, baseline_id="b1", schemas=[e.schema_of(src)],
+                  tables=None, ignore=[], business_keys={}, rows_per_bucket=250, precision=6,
+                  workers=3, progress=messages.append, snapshot="per_table")  # fmt: skip
+    b = Baseline.load(manifest)
+    assert not any("one at a time" in m for m in messages)
+    assert {t.snapshot for t in b.tables.values()} == {"per_table"}
+    c = b.consistency()
+    assert (c["held"], c["snapshot"]) == (False, "per_table")
+    assert f"{TABLES} points" in c["summary"]
+    # replication must reach a position read after the last table, in the engine's own form
+    end = b.reference_position
+    assert end is b.end_position and end["taken_at"] and end["type"] == b.position["type"]
+    writer = FindingWriter(tmp_path / "f", "r")
+    opts = _opts(e, src, tgt, rows_per_bucket=250, workers=3)
+    result = Reconciler(e.adapter(tgt), writer, opts, baseline=b).run()
+    writer.close()
+    assert {t.status for t in result.tables} == {"matched"}
+
+
 # ---------------------------------------------------------------- replication
 def test_dms_status_table_on_the_target(engine):
     tgt, tc = engine.make("tgt")

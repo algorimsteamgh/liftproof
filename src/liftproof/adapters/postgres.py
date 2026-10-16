@@ -2,20 +2,31 @@
 
 Pushdown computes the canonical hashes inside PostgreSQL so only hashes cross the
 network. Tables containing a column that PostgreSQL cannot canonicalise identically
-(json and jsonb, whose text forms reorder keys) are hashed application side by
+(json and jsonb, whose text forms reorder keys, and xml) are hashed application side by
 streaming rows through the reference implementation. Both paths are held to byte
 identical output by the parity tests.
+
+A database whose server encoding is not UTF8 (LATIN1, WIN1252) has no normalize() and
+md5 would hash its own bytes, so its text and char columns are hashed application side,
+read through the UTF8 client encoding.
+
+Dates and timestamps can be infinity or -infinity, which no Python date holds and to_char
+renders as NULL. Both paths render them as PostgreSQL prints them (canonical revision 1).
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
-import time
+import functools
 from collections.abc import Iterator, Sequence
 from typing import Any
 
 import psycopg
 from psycopg import sql
+from psycopg.abc import AdaptContext, Buffer
+from psycopg.adapt import Loader
+from psycopg.pq import Format
 
 from liftproof.adapters import sqllog
 from liftproof.adapters.base import (
@@ -23,37 +34,30 @@ from liftproof.adapters.base import (
     BucketAggregate,
     Column,
     FloatStats,
+    ForeignKey,
     HashPlan,
+    Index,
+    Pacer,
     TableRef,
     TableSchema,
+    fetch_batch,
+    plain_prefix,
 )
-from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, column_digest, value64
+from liftproof.canonical import (
+    GROUP_SIZE,
+    CanonicalType,
+    RowHasher,
+    Verbatim,
+    column_digest,
+    value64,
+)
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
 
-TYPE_MAP: dict[str, CanonicalType] = {
-    "smallint": CanonicalType.INTEGER,
-    "integer": CanonicalType.INTEGER,
-    "bigint": CanonicalType.INTEGER,
-    "numeric": CanonicalType.DECIMAL,
-    "real": CanonicalType.FLOAT,
-    "double precision": CanonicalType.FLOAT,
-    "boolean": CanonicalType.BOOLEAN,
-    "text": CanonicalType.TEXT,
-    "character varying": CanonicalType.TEXT,
-    "name": CanonicalType.TEXT,
-    "citext": CanonicalType.TEXT,
-    "character": CanonicalType.CHAR,
-    "date": CanonicalType.DATE,
-    "time without time zone": CanonicalType.TIME,
-    "timestamp without time zone": CanonicalType.TIMESTAMP,
-    "timestamp with time zone": CanonicalType.TIMESTAMPTZ,
-    "bytea": CanonicalType.BINARY,
-    "uuid": CanonicalType.UUID,
-    "json": CanonicalType.JSON,
-    "jsonb": CanonicalType.JSON,
-}
-
-PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON}
+PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON, CanonicalType.XML}
+TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
+INFINITE_TYPES = {CanonicalType.DATE, CanonicalType.TIMESTAMP, CanonicalType.TIMESTAMPTZ}
+INFINITE = {b"infinity": Verbatim("infinity"), b"-infinity": Verbatim("-infinity")}
 
 NULL_DIGEST = column_digest(None)
 TWO_64 = "18446744073709551616"
@@ -67,8 +71,22 @@ SESSION = {
 }
 
 
-def render_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sql.Composable:
-    """PostgreSQL expression producing the canonical rendering of one column, or NULL."""
+def render_sql(
+    col: sql.Composable, ctype: CanonicalType, precision: int, nfc: bool = True
+) -> sql.Composable:
+    """PostgreSQL expression producing the canonical rendering of one column, or NULL.
+    Without nfc, text is left as stored: normalize() needs a UTF8 server."""
+    expr = _finite_sql(col, ctype, precision, nfc)
+    if ctype in INFINITE_TYPES:
+        # to_char is NULL only for NULL and for infinity and -infinity, which render as
+        # PostgreSQL prints them in any DateStyle; the cast runs for those rows alone
+        return sql.SQL("coalesce({}, ({})::text)").format(expr, col)
+    return expr
+
+
+def _finite_sql(
+    col: sql.Composable, ctype: CanonicalType, precision: int, nfc: bool = True
+) -> sql.Composable:
     match ctype:
         case CanonicalType.INTEGER | CanonicalType.UUID:
             return sql.SQL("({})::text").format(col)
@@ -78,10 +96,14 @@ def render_sql(col: sql.Composable, ctype: CanonicalType, precision: int) -> sql
             return sql.SQL("CASE WHEN {c} IS NULL THEN NULL WHEN {c} THEN '1' ELSE '0' END").format(
                 c=col
             )
-        case CanonicalType.TEXT:
+        case CanonicalType.TEXT if nfc:
             return sql.SQL("normalize(({})::text, NFC)").format(col)
-        case CanonicalType.CHAR:
+        case CanonicalType.TEXT:
+            return sql.SQL("({})::text").format(col)
+        case CanonicalType.CHAR if nfc:
             return sql.SQL("normalize(rtrim(({})::text, ' '), NFC)").format(col)
+        case CanonicalType.CHAR:
+            return sql.SQL("rtrim(({})::text, ' ')").format(col)
         case CanonicalType.DATE:
             return sql.SQL("to_char({}, 'YYYY-MM-DD')").format(col)
         case CanonicalType.BINARY:
@@ -142,6 +164,39 @@ def _excluding(predicate: str | None) -> sql.Composable:
     return sql.SQL(" WHERE ({}) IS NOT TRUE").format(sql.SQL(predicate))  # noqa: S608
 
 
+class InfinityLoader(Loader):
+    """Loads a value as the loader it replaces does, except infinity and -infinity, where
+    that one raises: they load as Verbatim, rendered as PostgreSQL prints them. Checking
+    the first byte keeps the cost on other values to one Python call."""
+
+    replaces: type[Loader]
+
+    def __init__(self, oid: int, context: AdaptContext | None = None) -> None:
+        super().__init__(oid, context)
+        self._load = self.replaces(oid, context).load
+
+    def load(self, data: Buffer) -> Any:
+        if data[0] in b"i-":  # no finite value starts so: years before 1 end in BC
+            word = INFINITE.get(bytes(data))
+            if word is not None:
+                return word
+        return self._load(data)
+
+
+@functools.cache
+def _with_infinity(replaces: type[Loader]) -> type[Loader]:
+    return type(f"Infinity{replaces.__name__}", (InfinityLoader,), {"replaces": replaces})
+
+
+def load_infinity(conn: psycopg.Connection) -> None:
+    """Every read of a date or timestamp on this connection, hashed here, drilled into,
+    or a data range or watermark, gets infinity as Verbatim rather than an error."""
+    for name in ("date", "timestamp", "timestamptz"):
+        oid = conn.adapters.types[name].oid
+        replaces = conn.adapters.get_loader(oid, Format.TEXT)
+        conn.adapters.register_loader(oid, _with_infinity(replaces))
+
+
 def _shown_version(v: int) -> str:
     """psycopg's server_version as PostgreSQL writes it: 160004 is 16.4, and before
     version 10 the minor release had its own two digits (90624 is 9.6.24)."""
@@ -169,8 +224,10 @@ class PostgresAdapter(Adapter):
         sslmode: str = "verify-full",
         sslrootcert: str | None = None,
         statement_timeout_ms: int = 0,
+        lock_timeout_ms: int = 0,
         read_only: bool = True,
         rows_per_second: int = 0,
+        pause_ms: int = 0,
         connect_timeout: int = 10,
     ) -> None:
         self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
@@ -194,10 +251,16 @@ class PostgresAdapter(Adapter):
             raise ConfigError(
                 f"cannot connect to PostgreSQL at {host}:{port}/{database}: {exc}"
             ) from exc
+        load_infinity(self.conn)
         self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
-        self.rows_per_second = rows_per_second
-        settings = dict(SESSION, statement_timeout=str(statement_timeout_ms))
+        self.pacer = Pacer(rows_per_second, pause_ms)
+        self.lock_timeout_ms = lock_timeout_ms
+        settings = dict(
+            SESSION, statement_timeout=str(statement_timeout_ms), lock_timeout=str(lock_timeout_ms)
+        )
+        if rows_per_second:  # one core: the cap is per connection, not per parallel worker
+            settings["max_parallel_workers_per_gather"] = "0"
         if read_only:
             settings["default_transaction_read_only"] = "on"
         with self.conn.cursor() as cur:
@@ -207,8 +270,11 @@ class PostgresAdapter(Adapter):
                         sql.Literal(name), sql.Literal(value)
                     )
                 )
-        self._settings = settings
+        self._settings = dict(
+            settings, rows_per_second=str(rows_per_second), pause_ms=str(pause_ms)
+        )
         self._in_snapshot = False
+        self._utf8 = self.conn.info.parameter_status("server_encoding") == "UTF8"
         self.require_version(_shown_version(self.conn.info.server_version))
 
     def close(self) -> None:
@@ -326,25 +392,65 @@ class PostgresAdapter(Adapter):
     def describe(self, table: TableRef) -> TableSchema:
         with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT column_name, data_type, udt_name FROM information_schema.columns "
+                "SELECT column_name, data_type, udt_name, is_nullable "
+                "FROM information_schema.columns "
                 "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
                 (table.schema, table.name),
             )
             cols = []
-            for name, data_type, udt in cur.fetchall():
+            for name, data_type, udt, nullable in cur.fetchall():
                 native = udt if data_type == "USER-DEFINED" else data_type
-                ctype = TYPE_MAP.get(native, CanonicalType.UNSUPPORTED)
-                cols.append(Column(name, native, ctype, fixed_width=native == "character"))
+                ctype = DEFAULT_TYPE_MAP.canonical(self.engine, native)
+                cols.append(Column(name, native, ctype, fixed_width=native == "character",
+                                   nullable=nullable == "YES"))  # fmt: skip
             if not cols:
                 raise ConfigError(f"table {table} not found")
+            regclass = sql.Identifier(table.schema, table.name).as_string(self.conn)
+            # each valid index, its key columns in key order (NULL for an expression)
             cur.execute(
-                "SELECT a.attname FROM pg_index i "
-                "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
-                "WHERE i.indrelid = %s::regclass AND i.indisprimary",
-                (sql.Identifier(table.schema, table.name).as_string(self.conn),),
+                "SELECT ic.relname, i.indisunique, i.indisprimary, am.amname, "
+                "i.indexprs IS NOT NULL OR i.indisexclusion, i.indpred IS NOT NULL, "
+                "ARRAY(SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(n, pos) "
+                "LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.n "
+                "WHERE k.pos <= i.indnkeyatts ORDER BY k.pos) "
+                "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+                "JOIN pg_am am ON am.oid = ic.relam "
+                "WHERE i.indrelid = %s::regclass AND i.indisvalid ORDER BY ic.relname",
+                (regclass,),
             )
-            pk = [r[0] for r in cur.fetchall()]
-        return TableSchema(table, cols, pk)
+            pk: list[str] = []
+            indexes = []
+            for name, unique, primary, method, expression, partial, keys in cur.fetchall():
+                if primary:
+                    pk = list(keys)
+                    continue
+                kind = (
+                    "other" if method != "btree"
+                    else "expression" if expression
+                    else "partial" if partial
+                    else "btree"
+                )  # fmt: skip
+                indexes.append(Index(name, plain_prefix(keys), unique, kind))
+            # a foreign key to a partitioned table has a copy per partition: parents only
+            cur.execute(
+                "SELECT c.conname, "
+                "ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY k(n, pos) "
+                "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n "
+                "ORDER BY k.pos), rn.nspname, rc.relname, "
+                "ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY k(n, pos) "
+                "JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.n "
+                "ORDER BY k.pos) "
+                "FROM pg_constraint c JOIN pg_class rc ON rc.oid = c.confrelid "
+                "JOIN pg_namespace rn ON rn.oid = rc.relnamespace "
+                "WHERE c.conrelid = %s::regclass AND c.contype = 'f' AND c.conparentid = 0 "
+                "ORDER BY c.conname",
+                (regclass,),
+            )
+            fks = [
+                ForeignKey(n, tuple(cs), TableRef(s, t), tuple(rs))
+                for n, cs, s, t, rs in cur.fetchall()
+            ]
+        return TableSchema(table, cols, pk, indexes, fks)
 
     def _ident(self, table: TableRef) -> sql.Identifier:
         return sql.Identifier(table.schema, table.name)
@@ -356,7 +462,10 @@ class PostgresAdapter(Adapter):
 
     # hashing ------------------------------------------------------------------
     def _pushdown(self, plan: HashPlan) -> bool:
-        return all(ctype in PUSHDOWN_TYPES for _, ctype in plan.columns)
+        return all(
+            ctype in PUSHDOWN_TYPES and (self._utf8 or ctype not in TEXT_TYPES)
+            for _, ctype in plan.columns
+        )
 
     def _digests_sql(self, plan: HashPlan) -> list[sql.Composable]:
         return [
@@ -366,7 +475,10 @@ class PostgresAdapter(Adapter):
 
     def _key_sql(self, plan: HashPlan) -> list[sql.Composable]:
         types = dict(plan.columns)
-        return [render_sql(sql.Identifier(k), types[k], plan.precision) for k in plan.key_columns]
+        return [
+            render_sql(sql.Identifier(k), types[k], plan.precision, self._utf8)
+            for k in plan.key_columns
+        ]
 
     def _hash_query(self, plan: HashPlan) -> sql.Composable:
         digests = self._digests_sql(plan)
@@ -411,26 +523,25 @@ class PostgresAdapter(Adapter):
         q = sql.SQL("SELECT {} FROM {}{}").format(
             cols, self._ident(plan.table), _excluding(plan.filter)
         )
-        interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         with self.conn.transaction(), self.conn.cursor(name="liftproof_stream") as cur:
-            cur.itersize = 5000
+            cur.itersize = fetch_batch(plan, 5000)
             cur.execute(q)
-            for row in cur:
-                if interval:
-                    time.sleep(interval)
-                yield row
+            yield from self.pacer.each(cur)
 
     def _bucket_aggregates_fallback(self, plan: HashPlan) -> dict[int, BucketAggregate]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
+        sample = None if plan.sample is None else set(plan.sample)
         out: dict[int, BucketAggregate] = {}
-        for row in self._stream(plan):
-            rh, kh = hasher.hash_row(row)
-            b = value64(kh) % plan.buckets
-            if plan.sample is not None and b not in plan.sample:
-                continue
-            agg = out.setdefault(b, BucketAggregate(0, 0))
-            agg.count += 1
-            agg.total += value64(rh)
+        # closed at once when a value cannot be hashed, so the connection reads on
+        with contextlib.closing(self._stream(plan)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, sample)
+                if placed is None:
+                    continue
+                b, rh = placed
+                agg = out.setdefault(b, BucketAggregate(0, 0))
+                agg.count += 1
+                agg.total += value64(rh)
         return out
 
     def row_hashes(
@@ -441,11 +552,11 @@ class PostgresAdapter(Adapter):
         wanted = set(buckets)
         if not self._pushdown(plan):
             hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
-            for row in self._stream(plan):
-                rh, kh = hasher.hash_row(row)
-                if value64(kh) % plan.buckets in wanted:
-                    rendered = hasher.rendered(row)
-                    yield tuple(rendered[i] for i in plan.key_positions), rh
+            with contextlib.closing(self._stream(plan)) as rows:
+                for row in rows:
+                    placed = hasher.placed(row, plan.buckets, wanted)
+                    if placed is not None:
+                        yield hasher.key_values(row), placed[1]
             return
         q = sql.SQL("SELECT * FROM ({inner}) h WHERE mod({kh}, {n})::int = ANY(%s)").format(
             inner=self._hash_query(plan),
@@ -456,6 +567,9 @@ class PostgresAdapter(Adapter):
             cur.execute(q, (sorted(wanted),))
             for row in cur:
                 yield tuple(row[2:]), row[0]
+
+    def drill_passes(self, plan: HashPlan, buckets: int) -> int:
+        return 1 if self._pushdown(plan) else buckets
 
     def bucket_rows(
         self, plan: HashPlan, buckets: set[int]

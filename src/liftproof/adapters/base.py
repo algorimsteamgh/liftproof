@@ -7,10 +7,14 @@ engine fixtures. Nothing outside the adapter changes.
 from __future__ import annotations
 
 import abc
+import contextlib
 import datetime as dt
 import decimal
+import itertools
+import math
 import re
-from collections.abc import Iterator, Sequence
+import time
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,13 +41,45 @@ class Column:
     native_type: str
     canonical: CanonicalType
     fixed_width: bool = False
+    nullable: bool | None = None  # None: not known (a baseline from before it was recorded)
+
+
+@dataclass(frozen=True)
+class Index:
+    """An index or unique constraint other than the primary key's own (spec 9.13)."""
+
+    name: str
+    # key columns in key order, as the engine spells them; included columns left out. An
+    # expression index keeps the plain columns before its first expression.
+    columns: tuple[str, ...]
+    unique: bool
+    # btree: a B-tree over plain columns; partial: one with a condition (SQL Server:
+    # filtered); expression: one over expressions; other: GIN, BRIN, hash, full text,
+    # spatial, bitmap, columnstore, XML. Only B-trees compare across engines.
+    kind: str = "btree"
+
+
+def plain_prefix(keys: Iterable[str | None]) -> tuple[str, ...]:
+    """An index's key columns up to its first expression (None)."""
+    return tuple(itertools.takewhile(lambda k: k is not None, keys))
+
+
+@dataclass(frozen=True)
+class ForeignKey:
+    name: str
+    columns: tuple[str, ...]
+    references: TableRef
+    referenced_columns: tuple[str, ...]  # paired with columns, in order
 
 
 @dataclass
 class TableSchema:
     table: TableRef
     columns: list[Column]
-    primary_key: list[str] = field(default_factory=list)
+    primary_key: list[str] = field(default_factory=list)  # in key order
+    # None: not known (a baseline from before they were recorded)
+    indexes: list[Index] | None = None
+    foreign_keys: list[ForeignKey] | None = None
 
     def column(self, name: str) -> Column | None:
         for c in self.columns:
@@ -77,6 +113,15 @@ class HashPlan:
     def key_positions(self) -> list[int]:
         names = [c for c, _ in self.columns]
         return [names.index(k) for k in self.key_columns]
+
+
+XML_BATCH = 25  # rows fetched at once to hash here from a table with an XML column
+
+
+def fetch_batch(plan: HashPlan, rows: int) -> int:
+    """Rows a stream fetches at once: fewer from a table with an XML column, whose
+    documents can run to megabytes each (spec 17: nothing loads a table)."""
+    return XML_BATCH if any(t is CanonicalType.XML for _, t in plan.columns) else rows
 
 
 @dataclass
@@ -115,6 +160,108 @@ def in_list(expr: str, values: Sequence[int], chunk: int | None = None) -> str:
     return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
 
 
+@dataclass
+class Statement:
+    rows: int  # rows the statement reads; raised in the block once more is known
+    start: float = 0.0  # when its latest read began
+    before: int = 0  # rows charged before its latest read
+
+
+class Pacer:
+    """The rows per second cap and the pause of one connection (spec 9.15).
+
+    Every statement that reads a table is charged the rows it reads, and the connection
+    pays for them before its next statement: none starts before the rows read so far fit
+    under the cap, nor sooner than the pause after the last one ended. Nothing waits after
+    the last statement, and time spent idle earns no credit for a burst. The database runs
+    each statement at its own speed; only rows streamed here to be hashed are charged as
+    they arrive, which slows the read itself."""
+
+    def __init__(
+        self,
+        rows_per_second: int = 0,
+        pause_ms: int = 0,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.rate = rows_per_second
+        self.pause = pause_ms / 1000
+        self.clock = clock
+        self.sleep = sleep
+        self.charged = 0  # rows charged so far
+        self.waited = 0.0  # seconds spent waiting
+        self._paid = -math.inf  # when the rows charged so far fit under the cap
+        self._ended = -math.inf  # when the last statement ended
+        self._open: Statement | None = None  # the statement running now
+
+    def _wait(self, until: float) -> None:
+        delay = until - self.clock()
+        if delay > 0:
+            self.sleep(delay)
+            self.waited += delay
+
+    def _charge(self, since: float, rows: int) -> None:
+        if rows <= 0:
+            return
+        self.charged += rows
+        if self.rate:
+            self._paid = max(self._paid, since) + rows / self.rate
+
+    @contextlib.contextmanager
+    def statement(self, rows: int = 0) -> Iterator[Statement]:
+        """Around one statement: waits for the rows before it and the pause, then charges
+        what it read, less what a stream inside it already paid."""
+        s, outer = Statement(rows), self._open
+        self._begin(s)
+        self._open = s
+        try:
+            yield s
+        finally:
+            self._open = outer
+            self._end(s)
+
+    def again(self) -> None:
+        """The statement running now reads the table again, as a statement of its own (an
+        adapter that hashes most rows in the database, then streams the rest to hash
+        here): the first read is paid for, and the pause kept, before the second starts,
+        which is charged the same rows."""
+        if self._open is not None:
+            self._end(self._open)
+            self._begin(self._open)
+
+    def _begin(self, s: Statement) -> None:
+        self._wait(max(self._paid, self._ended + self.pause))
+        s.start, s.before = self.clock(), self.charged
+
+    def _end(self, s: Statement) -> None:
+        self._ended = self.clock()
+        self._charge(s.start, s.rows - (self.charged - s.before))
+
+    def each(self, rows: Iterable[Any], batch: int = 1000) -> Iterator[Any]:
+        """Rows streamed here to be hashed, charged a batch at a time as they arrive."""
+        if not self.rate:
+            # not yield from: stopped early, that would close the cursor, which the
+            # stream's own with block closes (oracledb refuses a second close)
+            for row in rows:
+                yield row
+            return
+        start, n = self.clock(), 0
+        try:
+            for row in rows:
+                yield row
+                n += 1
+                if n == batch:
+                    self._charge(start, n)
+                    self._wait(self._paid)
+                    start, n = self.clock(), 0
+        finally:
+            self._charge(start, n)
+
+
+UNPACED = Pacer()  # an adapter that never set its own: no cap, no pause
+
+
 class Adapter(abc.ABC):
     engine: str = "abstract"
     hash_probe: str = "SELECT md5('liftproof')"  # doctor: MD5 is usable on this server
@@ -122,6 +269,9 @@ class Adapter(abc.ABC):
     minimum_version: tuple[int, ...] = ()  # the oldest server the adapter supports
     minimum_shown: str = ""
     version: str = ""
+    # spec 9.15: every statement that reads a table goes through this connection's pacer
+    pacer: Pacer = UNPACED
+    lock_timeout_ms: int | str = 0  # as the connection applies it; 0: none
 
     def require_version(self, found: str) -> None:
         """Refuse a server older than the oldest supported when connecting, rather than
@@ -178,6 +328,29 @@ class Adapter(abc.ABC):
         for b in sorted(buckets):
             yield b, dict(self.row_hashes(plan, {b}))
 
+    def drill_passes(self, plan: HashPlan, buckets: int) -> int:
+        """How many times bucket_rows reads the whole table for this many buckets."""
+        return buckets
+
+    def paced_bucket_rows(
+        self, plan: HashPlan, buckets: set[int], rows: int
+    ) -> Iterator[tuple[int, dict[tuple[Any, ...], str]]]:
+        """bucket_rows under this connection's cap and pause, each read of the table a
+        statement charged its rows. A single pass is one statement, never paused inside:
+        its cursor holds a transaction open."""
+        found = self.bucket_rows(plan, buckets)
+        try:
+            if self.drill_passes(plan, len(buckets)) == 1:
+                with self.pacer.statement(rows):
+                    yield from found
+                return
+            for _ in range(len(buckets)):
+                with self.pacer.statement(rows):
+                    item = next(found)
+                yield item
+        finally:
+            found.close()
+
     @abc.abstractmethod
     def fetch_rows(
         self, plan: HashPlan, keys: Sequence[tuple[Any, ...]]
@@ -190,6 +363,17 @@ class Adapter(abc.ABC):
     def session_settings(self) -> dict[str, str]:
         """Pinned session parameters, recorded in the manifest."""
         return {}
+
+    def protection(self) -> dict[str, Any]:
+        """What limits this connection's load on its database (spec 9.15), as applied, for
+        the report; 0 is off."""
+        given = getattr(self, "_kwargs", {})
+        return {
+            "rows_per_second": self.pacer.rate,
+            "pause_ms": round(self.pacer.pause * 1000),
+            "statement_timeout_ms": int(given.get("statement_timeout_ms") or 0),  # as given
+            "lock_timeout_ms": self.lock_timeout_ms,
+        }
 
     # replication position (spec 9.2) -----------------------------------------------
     # Engines that cannot answer leave these as they are; the check then reports that

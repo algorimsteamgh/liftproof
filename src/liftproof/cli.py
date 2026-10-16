@@ -26,7 +26,8 @@ from liftproof.adapters.mysql import MySQLAdapter
 from liftproof.adapters.oracle import OracleAdapter
 from liftproof.adapters.postgres import PostgresAdapter
 from liftproof.adapters.sqlserver import SQLServerAdapter
-from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical import CANONICAL_REVISION, CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, legacy_record, shown
 from liftproof.config import TEMPLATE, Connection, Project, load_project
 from liftproof.credentials import from_secrets_manager, secret_value
 from liftproof.errors import (
@@ -117,7 +118,9 @@ def connect(conn: Connection) -> Adapter:
         sslmode=conn.sslmode,
         sslrootcert=_sslrootcert(conn),
         statement_timeout_ms=conn.statement_timeout_ms,
+        lock_timeout_ms=conn.lock_timeout_ms,
         rows_per_second=conn.rows_per_second,
+        pause_ms=conn.pause_ms,
         read_only=True,
     )
 
@@ -182,7 +185,9 @@ def cmd_version(args: argparse.Namespace) -> int:
     info = {
         "liftproof": __version__,
         "canonical_version": CANONICAL_VERSION,
+        "canonical_revision": CANONICAL_REVISION,
         "hash_algorithm": HASH_ALGORITHM,
+        "type_map_version": DEFAULT_TYPE_MAP.version,
         **aws.sdk_versions(),
         "python": sys.version.split()[0],
     }
@@ -252,7 +257,8 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
     throttle = ckpt.Throttle()
     o = project.database
     source_conn, target_conn = project.require_database()
-    with connect(source_conn if side == "source" else target_conn) as db:
+    conn = source_conn if side == "source" else target_conn
+    with connect(conn) as db:
         b = take_baseline(
             db,
             manifest,
@@ -270,6 +276,8 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
             # each finished table reaches the store, so a lost instance resumes (9.16)
             checkpoint=lambda: throttle.due() and ckpt.keep(store, key, manifest),
             with_ranges=o.ranges,
+            snapshot=conn.snapshot,
+            type_map=o.type_map,
         )
     store.put_file(key, manifest)
     ckpt.set_marker(store, marker_local, marker_key, "")
@@ -277,12 +285,14 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
     marker = workdir / "baselines" / LATEST[side]
     marker.write_text(baseline_id, encoding="utf-8")
     store.put_file(f"baselines/{LATEST[side]}", marker)
+    consistency = b.consistency()
     payload = {
         "baseline_id": baseline_id,
         "side": side,
         "tables": len(b.tables),
         "rows": sum(t.row_count for t in b.tables.values()),
         "consistency": b.position,
+        "cross_table_consistency": consistency,
         "manifest": store.location(key),
     }
     _out(
@@ -290,6 +300,7 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
         payload,
         f"{side} baseline {baseline_id}: {payload['tables']} tables, {payload['rows']:,} rows\n"
         f"consistency position: {b.position.get('position')}\nmanifest: {payload['manifest']}"
+        + ("" if consistency["held"] else f"\n{consistency['summary']}")
         + (f"\ncompare against it with: --baseline {LATEST['target']}" if side == "target" else ""),
     )
     return EXIT_OK
@@ -328,6 +339,7 @@ def _save_results(run_dir: Path, result: ReconcileResult) -> None:
                 "systemic": result.systemic,
                 "replication": result.replication,
                 "sample_seed": result.sample_seed,
+                "structure": result.structure,
                 "tables": [t.__dict__ for t in result.tables],
             },
             indent=2,
@@ -346,6 +358,7 @@ def _load_results(run_dir: Path) -> ReconcileResult:
         d["systemic"],
         d.get("replication"),
         d.get("sample_seed"),
+        structure=d.get("structure"),
     )
 
 
@@ -407,6 +420,12 @@ def _reconcile_into(
             resumed=resuming,
             systemic=progress.systemic if resuming else False,
         )  # fmt: skip
+        # what limited the load on each database this run read (spec 9.15)
+        rec.result.protection = {
+            **({"source": source.protection()} if source is not None else {}),
+            "target": target.protection(),
+            "workers": o.workers,
+        }
         if progress is not None:
             progress.sample_seed = rec.seed
         result = rec.run()
@@ -658,7 +677,14 @@ SEGMENT_SECONDS = 60.0
 RESUMED_OPTIONS = ("tables", "no_source", "show_values", "include_replay_rows")
 
 
-def _restore_run(store: Store, run_dir: Path, run_id: str) -> ckpt.RunProgress:
+def _type_map(project: Project, legacy: bool = False) -> dict[str, Any]:
+    """The type map a database run compares under, as its checkpoint and report keep it;
+    `legacy`: the one a checkpoint saved before it was kept was taken under."""
+    engines = [c.engine for c in project.require_database()]
+    return legacy_record(*engines) if legacy else project.database.type_map.record(*engines)
+
+
+def _restore_run(store: Store, run_dir: Path, run_id: str, project: Project) -> ckpt.RunProgress:
     """The progress of an interrupted reconciliation and the findings it had written,
     from the store: the instance that ran it may be gone."""
     local = run_dir / ckpt.PROGRESS
@@ -668,6 +694,20 @@ def _restore_run(store: Store, run_dir: Path, run_id: str) -> ckpt.RunProgress:
     progress = ckpt.RunProgress.load(local)
     if progress.complete:
         raise ConfigError(f"run {run_id} finished every table; there is nothing to resume")
+    if progress.canonical_revision != CANONICAL_REVISION:
+        # its finished tables were hashed under other rules than the rest would be
+        raise ConfigError(
+            f"run {run_id} was started under canonical revision {progress.canonical_revision} "
+            f"and this build hashes under revision {CANONICAL_REVISION}; start a new run"
+        )
+    started = progress.type_map or _type_map(project, legacy=True)
+    now = _type_map(project)
+    if started["fingerprints"] != now["fingerprints"]:
+        # its finished tables were compared under other types than the rest would be
+        raise ConfigError(
+            f"run {run_id} was started under {shown(started)}, not {shown(now)}; resume it "
+            "with the database.type_map it was started with, or start a new run"
+        )
     for name in progress.segments:
         seg = run_dir / name
         if not store.get_file(f"runs/{run_id}/{name}", seg) and not seg.exists():
@@ -694,7 +734,7 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     started = _now()
     progress = None
     if getattr(args, "resume", False):
-        progress = _restore_run(store, run_dir, run_id)
+        progress = _restore_run(store, run_dir, run_id, project)
         for name in RESUMED_OPTIONS:
             setattr(args, name, progress.options.get(name))
         args.baseline = progress.baseline
@@ -725,7 +765,10 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     checkpoint = None
     if mode == "reconcile":
         progress = progress or ckpt.RunProgress(
-            run_id, started, {k: getattr(args, k, None) for k in RESUMED_OPTIONS}
+            run_id,
+            started,
+            {k: getattr(args, k, None) for k in RESUMED_OPTIONS},
+            type_map=_type_map(project),
         )
         checkpoint = ckpt.RunCheckpoint(store, run_dir, progress, writer, uploads)
         ckpt.set_marker(store, workdir / ckpt.RUN_MARKER, ckpt.RUN_MARKER, run_id)
@@ -1001,7 +1044,9 @@ def _record_replay_windows(marks, store: Store, workdir: Path, writer: FindingWr
     target, tables, before = marks
     try:
         after = watermark.read(target, tables)
-        new = watermark.windows(tables, before, after, writer.run_id)
+        new, problems = watermark.windows(tables, before, after, writer.run_id)
+        for p in problems:
+            _replay_mark_notice(writer, p)
         if new:
             local = workdir / watermark.STORE_KEY
             store.get_file(watermark.STORE_KEY, local)
@@ -1128,11 +1173,14 @@ def _report(
     finished_at=None,
     prior=None,
     regenerated=False,
+    canonical_revision=None,
+    type_map=None,
 ) -> dict[str, Any]:
     """`prior` is the run's own report when one is regenerated: what the run was (its
     reference, window, schedule, who ran it, versions) is taken from it as recorded,
     never restated from today's project file. A run that wrote no report is
-    `regenerated` from what it recorded as it started."""
+    `regenerated` from what it recorded as it started, with the `canonical_revision` and
+    `type_map` it compared under, from its checkpoint."""
     findings = list(read_findings(run_dir))
     o = project.database
     finished_at = finished_at or _now()
@@ -1148,6 +1196,8 @@ def _report(
         metadata["regenerated"] = _regenerated()
     if scheduled:
         metadata["schedule"] = scheduled
+    if canonical_revision is not None:
+        metadata["canonical_revision"] = canonical_revision
     if resumed_at:
         # tables finished before a resume were read then; the rest after it
         metadata["resumed_at"] = list(resumed_at)
@@ -1165,9 +1215,13 @@ def _report(
                     else "live source"
                 ),
                 "consistency_position": baseline.position if baseline else "live read",
+                # spec 9.2: says in plain words when the tables were not read at one point
+                **({"cross_table_consistency": baseline.consistency()} if baseline else {}),
                 # lowest and highest key and dates of the rows compared, per side
                 "data_ranges": {t.table: t.ranges for t in result.tables if t.ranges},
                 "replication": result.replication,
+                # the structure compared before data (spec 9.13)
+                "structure": result.structure,
                 "sampling": None
                 if result.sample_seed is None
                 else {
@@ -1182,8 +1236,11 @@ def _report(
                 "tls": {"source": project.source.sslmode, "target": project.target.sslmode},
                 "rows_per_bucket": o.rows_per_bucket,
                 "timestamp_precision": o.precision,
+                "type_map": type_map or _type_map(project),
             }
         )
+        if result.protection:
+            metadata["source_protection"] = result.protection
     if web_result is not None:
         range_block.update(
             {
@@ -1223,6 +1280,7 @@ def _report(
 def _rewrite_report(project, run_id, mode, run_dir, findings, result, started, web_result,
                     files_result, failure, template, prior) -> dict[str, Any]:  # fmt: skip
     run = dict(prior.get("run", {}))
+    run.setdefault("canonical_revision", 0)  # a run from before canonical revisions
     finished = run.pop("finished_at", None) or _now()
     run.pop("started_at", None)
     run["regenerated"] = _regenerated()
@@ -1275,6 +1333,9 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
             f"different, {c['files_missing']} missing)"
         )
     lines.append(f"differences: {c['differences']}, not checked: {c['not_checked']}")
+    consistency = report["range"].get("cross_table_consistency")
+    if consistency and not consistency["held"]:
+        lines.append(consistency["summary"])
     lines.append(f"report: {html}")
     _out(
         args,
@@ -1283,6 +1344,7 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
             "verdict": report["verdict"],
             "counts": c,
             "coverage": {k: v for k, v in cov.items() if k.endswith("_pct")},
+            **({"cross_table_consistency": consistency} if consistency else {}),
             "report_html": html,
             "report_json": store.location(f"runs/{run_id}/report.json"),
         },
@@ -1435,11 +1497,15 @@ def cmd_report(args: argparse.Namespace) -> int:
     info_file = run_dir / ckpt.RUN_INFO
     info = json.loads(info_file.read_text(encoding="utf-8")) if info_file.exists() else {}
     baseline = None
+    revision = type_map = None
     progress_file = run_dir / ckpt.PROGRESS
     if not prior and progress_file.exists():
         # no report was written (the run stopped): its checkpoint names the reference
+        # and the rules it hashed under
         progress = ckpt.RunProgress.load(progress_file)
         started = progress.started_at
+        revision = progress.canonical_revision
+        type_map = progress.type_map or _type_map(project, legacy=True)
         if progress.baseline:
             baseline = _baseline_by_id(store, workdir, progress.baseline)
     else:
@@ -1474,6 +1540,8 @@ def cmd_report(args: argparse.Namespace) -> int:
         invoked_by=info.get("invoked_by"),
         values_shown=info.get("values_shown"),
         regenerated=not prior,
+        canonical_revision=revision,
+        type_map=type_map,
     )
     for name in ("report.html", "report.json"):
         store.put_file(f"runs/{args.run}/{name}", run_dir / name)

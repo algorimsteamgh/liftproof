@@ -33,6 +33,156 @@ liftproof support-bundle --project acme.yaml --doctor
 KPIs, thresholds and how each is measured are in `docs/kpis.md`; `pytest -m perf` runs
 the suite that gates every release.
 
+## Protecting the source
+
+The source is usually production, and the one machine Liftproof must not saturate. Point
+`source` at a read replica where there is one: an RDS or Aurora reader, a PostgreSQL hot
+standby, a MySQL replica, an Oracle Active Data Guard standby or a readable availability
+group secondary. On a PostgreSQL hot standby turn on `hot_standby_feedback`, or set
+`max_standby_streaming_delay` above the longest statement; otherwise the standby cancels
+the hash queries that conflict with replication.
+
+Each connection has its own limits, whole numbers where 0 turns one off:
+
+| Setting | Source default | Target default | What it limits |
+|---|---|---|---|
+| `rows_per_second` | 125000 | 0 | rows read a second by one connection, over its statements |
+| `pause_ms` | 100 | 0 | the least time between two statements on a connection |
+| `lock_timeout_ms` | 10000 | 10000 | how long a read waits for a lock before the run fails |
+| `statement_timeout_ms` | 0 (`init` writes 600000) | 0 | how long one statement may run |
+
+Every statement that reads a table is charged the table's rows: the row count, the bucket
+aggregate (the whole table, whatever row rules or a sample keep), the data ranges, each
+float column's statistics, each pass of a drill-down and the fetch of changed rows'
+values. A connection pays before its next statement, so nothing waits after the last one,
+and idle time earns no credit. The database runs each statement at its own speed, which
+`statement_timeout_ms` bounds; rows Liftproof hashes itself (JSON and XML columns, and rows
+with non-ASCII text outside PostgreSQL) are charged as they stream, which slows the read
+itself. On MySQL, SQL Server and Oracle a table with text (on Oracle also exact numbers or
+binary) is hashed in two statements, each a read of the table: the rows the database
+renders exactly, then the rest, streamed here. Its aggregate and each drill-down pass are
+charged twice, with the pause between. A capped connection runs each statement on one core
+(PostgreSQL `max_parallel_workers_per_gather = 0`, SQL Server `OPTION (MAXDOP 1)`, Oracle
+`DISABLE PARALLEL QUERY`, MySQL `innodb_parallel_read_threads = 1`), so the load is the
+cap times `database.workers`, each worker being another connection. With the defaults a
+matched table costs three reads (count, aggregate, ranges; `database.ranges: false` saves
+one), so a source connection gets through at most 1.5 million rows of table a minute
+(PostgreSQL measured about 1.2 million, docs/kpis.md); one whose aggregate takes two costs
+four. The pause falls between tables, and between the buckets a drill-down reads one pass
+at a time: on MySQL, Oracle and SQL Server, and for tables without a key everywhere.
+PostgreSQL drills into every differing bucket in one pass and is not paused inside it.
+
+The lock timeout is PostgreSQL's `lock_timeout`, SQL Server's `SET LOCK_TIMEOUT` (0 in
+the project file is SQL Server's -1, wait), and MySQL's `lock_wait_timeout` in whole
+seconds rounded up, which covers metadata locks. Oracle queries take no locks, so there
+is nothing to set. A read that times out fails the run with exit code 2 and `--resume`
+carries on; raise the timeout, or set 0 to wait as long as it takes. A live comparison on
+SQL Server reads under READ COMMITTED, taking shared locks that wait for writers, unless
+READ_COMMITTED_SNAPSHOT is on.
+
+Slowing the reads has costs of its own. Everything that holds a snapshot lasts longer: a
+baseline (one snapshot over every table) and PostgreSQL's drill-down cursor. Meanwhile
+PostgreSQL keeps dead rows (bloat), Oracle needs undo to cover it (ORA-01555 when
+`undo_retention` is too short), SQL Server keeps row versions in tempdb, and MySQL's purge
+falls behind. On PostgreSQL and MySQL an `ALTER TABLE` waits for the lock a read holds on
+the table (a baseline holds them to its end), and every later query of that table queues
+behind the `ALTER`: keep schema changes and baselines apart, or give the DDL session its
+own lock timeout.
+
+Where the source cannot hold one snapshot for a whole baseline, set `snapshot: per_table`
+on it (on `target` for `rebaseline`). Each table is then read in a snapshot of its own,
+which lasts as long as that table and holds its locks no longer: its count, hashes and
+ranges are still one state of it, but the tables are read at different points, so a row
+that refers to another table may have been read at a different point than that table.
+The baseline command, the report (a line under the verdict, and `cross_table_consistency`
+in the range block) and the run's output then say that cross table consistency was not
+held, as they do for a baseline finished after a resume and for SQL Server without
+snapshot isolation; the verdict is unchanged. Replication must have applied through a
+position read after the last table. Workers read tables at once on every engine in this
+mode, each with its own snapshot; SQL Server without snapshot isolation, with none to
+open, reads one table at a time. A whole baseline that fails because the snapshot got too
+old (Oracle ORA-01555, PostgreSQL `old_snapshot_threshold`) says to set it and finish
+with `--resume`: the tables done keep their snapshot and the rest are read per table. It
+does not help a single table too large to hold a snapshot for.
+
+The databases' own governors: on SQL Server, `QUERY_GOVERNOR_COST_LIMIT` is not set,
+because the hash queries' estimated cost grows with the table and the governor would
+refuse them outright rather than slow them; a Resource Governor workload group, with a
+classifier on `APP_NAME() = 'liftproof'` and a pool with `CAP_CPU_PERCENT`, limits them
+instead. On Oracle, Resource Manager can map the sessions to a consumer group by
+`CLIENT_PROGRAM` `liftproof` (`DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP_MAPPING`).
+PostgreSQL and MySQL have no governor; a replica is how the load stays off the primary.
+
+After cutover the target is production: give `target` a cap and a pause too, before
+`rebaseline` and scheduled regression runs. The report's run block records the limits of
+each database the run read, as its connections apply them (`source_protection`: MySQL's
+lock timeout rounded up to whole seconds, Oracle's not applicable; no `source` entry when
+the source was not read).
+
+## Schema comparison
+
+Before the data, each table's structure is compared: columns and their types, then
+nullability, keys, foreign keys and indexes. Keys and indexes are matched by their
+columns, names compared without case, never by their own names, which each engine and
+tool makes up its own way.
+
+| Found on the target | Reported |
+|---|---|
+| a NOT NULL, primary key, unique key or foreign key of the reference no longer enforced | medium: the run fails |
+| a unique key enforced only by a partial (SQL Server: filtered) unique index | low |
+| a NOT NULL, unique key or foreign key the reference does not have | low |
+| no B-tree index or primary key starting with the columns of a reference index | low |
+| an index only the target has; a primary key moved while the old key stays unique | notice |
+
+A key is compared as the uniqueness it guarantees: a target that moved its primary key to
+a surrogate column and kept the old key unique still enforces it; a partitioned target
+whose key now includes the partition column does not. A foreign key matches on its
+column pairs and the table it refers to, its schema mapped by `schema_map`. Partial and
+expression indexes and other kinds (GIN, BRIN, hash, full text, spatial, bitmap,
+columnstore, XML) are listed in the report's exclusions, not compared; but a partial
+unique index is a unique key lost when the target has no unique key on its columns or on
+fewer of them. A table whose structure differs is marked so in the report's tables; its
+status is its data's.
+
+An AWS DMS full load creates tables without secondary indexes or foreign keys. Turn off
+what is built after the load, for the whole project, or accept one difference with a
+reason the report prints next to the coverage figures:
+
+```yaml
+database:
+  structure:                 # true (the default) or false turns every check on or off
+    indexes: false           # nullability, keys, foreign_keys, indexes
+  ignore:
+    - table: events
+      structure: keys        # with column: only what holds that column
+      reason: partitioned target; its primary key includes created_at
+```
+
+A baseline records each table's structure. One taken by an earlier build has none, so
+only primary keys are compared against it, and the report's range block (`structure`)
+names those tables.
+
+Which canonical type each native type is compared as comes from the type map,
+`src/liftproof/canonical/typemap.yaml` (docs/canonical-v1.md). A column the target holds as
+another type, such as a MySQL `tinyint(1)` moved into a `smallint`, is a type change and is
+left out of the data comparison. Where the move was intended, the project compares it as one
+of the alternatives the map lists for that type:
+
+```yaml
+database:
+  type_map:
+    mysql:
+      tinyint(1): integer      # the target column is a smallint
+      datetime: timestamptz    # it holds UTC times
+    oracle:
+      NUMBER(1): boolean       # 0 is false, any other value true
+      DATE: date               # a DATE with a time of day still differs
+```
+
+The report names each column compared so and records the map's version and overrides. A
+baseline taken under another map is hashed again from the source for the tables whose plan
+it changes; without the source they are not checked, naming the columns.
+
 ## Record and replay
 
 ```bash
@@ -149,9 +299,14 @@ liftproof restore    --projects-dir /var/lib/mvt/projects   # what the service r
 A resumed run compares only the tables it had not finished and keeps the run id, the
 reference baseline and the sampling of the first attempt; its report says when it
 resumed. Against a live source, the tables compared after the resume are read as of the
-resume. The lost instance's run lock expires 15 minutes after its last renewal; until
-then a resume is refused with exit code 2. A run that fails rather than stops names each
-table, file set and journey it never reached as not checked.
+resume. A resumed baseline reads the tables left in a new snapshot (one each with
+`snapshot: per_table`), so it says that cross table consistency was not held (Protecting
+the source), and replication must reach that later point. The lost instance's run
+lock expires 15 minutes after its last renewal; until then a resume is refused with exit
+code 2. A resume on a build that hashes under another canonical revision
+(docs/canonical-v1.md) is refused with exit code 3: start a new run. So is a resume of a run
+or a baseline under another `database.type_map` than it was started with. A run that fails
+rather than stops names each table, file set and journey it never reached as not checked.
 
 A replay is never resumed, as its journeys created data on the target. The journeys it
 finished keep their findings and results; those it had not finished are listed as not
@@ -186,10 +341,20 @@ schemas and tables, the run window and, per table and side, the lowest and highe
 and the earliest and latest value of each date and time column of the rows compared
 (`data_ranges`). Those are aggregates of integer keys and dates only; a text key's ends
 appear only with `show_values`. `database.ranges: false` turns them off, saving one
-MIN/MAX statement per table and side. `liftproof report --run ID` rebuilds the HTML and
-JSON from the run's findings (copying from the bucket what this instance does not hold,
-or holds an older copy of) and keeps what the run was (its reference, window, schedule
-and who ran it), adding when it was regenerated.
+MIN/MAX statement per table and side. A PostgreSQL date or timestamp can be `infinity` or
+`-infinity`, shown and compared as those words: never equal to NULL or to a sentinel date
+on the other side. XML columns (PostgreSQL `xml`, Oracle `XMLTYPE`, SQL Server `xml`) are
+compared as documents: attribute order, where namespaces are declared, comments and
+indentation are not differences. A value that cannot be read as XML (an XHTML `&nbsp;`, an
+undeclared `xsi:type` prefix) takes its column out of that table's comparison, reported as
+not checked with the parser's reason, and a baseline taken before XML was compared reports
+its XML columns as not checked until it is taken again. A table with an XML column is
+hashed here, about a fifth as fast as in the database for small documents
+(docs/kpis.md). The run block records the canonical version and revision the run
+hashed under. `liftproof report --run ID` rebuilds the HTML and JSON from the run's
+findings (copying from the bucket what this instance does not hold, or holds an older copy
+of) and keeps what the run was (its reference, window, schedule and who ran it),
+adding when it was regenerated.
 
 ## Tests
 
@@ -202,6 +367,12 @@ Database tests need PostgreSQL, MySQL, Oracle and SQL Server: set
 `_USER`, `_PASSWORD`, and `LIFTPROOF_TEST_MSSQL_HOST`, `_PORT`, `_USER`, `_PASSWORD` (CI uses
 service containers; for Oracle, `gvenzl/oracle-free:23-slim-faststart`, for SQL Server,
 `mcr.microsoft.com/mssql/server:2022-latest`); they are skipped when no server is reachable.
+The character set tests (spec 19) also need a WE8MSWIN1252 Oracle, which only Oracle's own
+Free image can create; `.github/workflows/charset.yml` starts one, and
+`tests/test_charset_oracle.py` says how to run it locally. With
+`LIFTPROOF_TEST_ORACLE_CHARSET` set, a missing Oracle or one in another character set fails
+the tests instead of skipping them. LATIN1 and WIN1252 PostgreSQL databases are created on
+the PostgreSQL test server.
 Cross engine tests load the same data into each engine and require identical hashes. The suite includes the golden vectors that pin the
 canonical wire format, pushdown against fallback parity for every type rule, and the
 PRD F6 acceptance test (a ten row injected difference, reported exactly).
@@ -209,7 +380,7 @@ PRD F6 acceptance test (a ten row injected difference, reported exactly).
 ## Layout
 
 ```
-src/liftproof/canonical   canonical v1.0 encoding and hashing (docs/canonical-v1.md)
+src/liftproof/canonical   canonical v1.0 encoding and hashing, the type map (docs/canonical-v1.md)
 src/liftproof/adapters    one adapter per database engine
 src/liftproof/reconcile   planning, baselines, reconciliation
 src/liftproof/web         recorder, replay engine, UI and API comparison

@@ -71,6 +71,9 @@ terraform apply -var ami_id=ami-... -var source_database_cidr=10.1.2.0/24 \
   -var target_database_cidr=10.42.0.0/20 -var 'application_cidrs=["10.1.3.0/24"]'
 ```
 
+`source_database_cidr` is where the source is read: a read replica's network where there
+is one, the recommended source (README, Protecting the source).
+
 Then store the database logins in Secrets Manager under `liftproof/acme-prod/`
 (`{"username": ..., "password": ...}`), open the UI with the `connect_ui` output, and
 run `liftproof doctor`. On the instance, doctor also connects to every AWS service
@@ -79,6 +82,14 @@ Secrets Manager, KMS, CloudWatch) reached through a public address rather than a
 endpoint. S3 keeps public addresses through its gateway endpoint, so doctor cannot see
 its route: check that the private route tables carry the S3 gateway endpoint
 (`private_route_table_ids` / `PrivateRouteTableIds`).
+
+A baseline holds one snapshot of the source for as long as it runs, and that has a cost
+on the source: PostgreSQL cannot vacuum the rows changed since it began, MySQL's undo
+grows, SQL Server keeps row versions in tempdb, and Oracle needs `undo_retention` to cover
+it or fails the baseline with ORA-01555 (snapshot too old). Where the source cannot afford
+that, set `snapshot: per_table` on it in the project file: each table is read in a
+snapshot of its own, and the report says in plain words that cross table consistency was
+not held (README, Protecting the source).
 
 Each Liftproof process (a run, doctor, the UI, the scheduler) limits its own AWS calls to
 20 requests a second unless `aws_requests_per_second` (CloudFormation:
