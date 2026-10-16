@@ -64,12 +64,12 @@ jobs:
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
-      - name: Start Oracle Free in WE8MSWIN1252
+      - name: Start Oracle Free
         run: |
           docker run -d --name oracle -p 1521:1521 -e ORACLE_PWD=ci-only-local-service \
             -e ORACLE_CHARACTERSET=WE8MSWIN1252 "$ORACLE_IMAGE"
       - run: python -m pip install -e ".[dev]"
-      - name: Wait for the database (created on first start)
+      - name: Wait for the prebuilt database
         run: |
           start=$SECONDS
           until docker exec oracle /opt/oracle/checkDBStatus.sh; do
@@ -84,6 +84,29 @@ jobs:
             sleep 20
           done
           echo "Oracle ready after $((SECONDS - start)) s"
+          df -h /
+      # The registry image ships a database already created in AL32UTF8, so it ignores
+      # ORACLE_CHARACTERSET. Delete it and configure a new one through the image's own
+      # init script, the way docker-images' createDB.sh does when it creates the database.
+      - name: Recreate the database in WE8MSWIN1252
+        run: |
+          docker exec -u root oracle bash -c 'ls /etc/init.d/ /etc/sysconfig/'
+          script=$(docker exec oracle bash -c 'ls /etc/init.d/oracle-free-* | head -n 1')
+          conf=$(docker exec oracle bash -c 'ls /etc/sysconfig/oracle-free-*.conf | head -n 1')
+          start=$SECONDS
+          { yes || true; } | docker exec -i -u root oracle "$script" delete
+          docker exec -u root oracle sed -i 's/^CHARSET=.*/CHARSET=WE8MSWIN1252/' "$conf"
+          docker exec -u root oracle grep '^CHARSET=' "$conf"
+          printf '%s\n%s\n' "$LIFTPROOF_TEST_ORACLE_PASSWORD" "$LIFTPROOF_TEST_ORACLE_PASSWORD" \
+            | docker exec -i -u root oracle "$script" configure
+          until docker exec oracle /opt/oracle/checkDBStatus.sh; do
+            if [ $((SECONDS - start)) -gt 2400 ]; then
+              echo "Oracle not recreated after $((SECONDS - start)) s"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Database recreated after $((SECONDS - start)) s"
           df -h /
       - name: Character set as seen from FREEPDB1
         run: |

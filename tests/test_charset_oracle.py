@@ -9,11 +9,14 @@ would pass every AL32UTF8 test and hash Windows-1252 bytes here.
 These tests run in the main suite against its AL32UTF8 server, where the ones that only
 mean something when every character is one byte skip. The charset workflow
 (.github/workflows/charset.yml) runs them, with tests/test_oracle_parity.py, against
-Oracle's own Free image created in WE8MSWIN1252. Locally:
+Oracle's own Free image, its database recreated in WE8MSWIN1252. Locally, start
 
     docker run -d --name lp-oracle-1252 -p 127.0.0.1:1522:1521 \\
-      -e ORACLE_PWD=ci-only-local-service -e ORACLE_CHARACTERSET=WE8MSWIN1252 \\
-      container-registry.oracle.com/database/free:23.26.0.0
+      -e ORACLE_PWD=ci-only-local-service container-registry.oracle.com/database/free:23.26.0.0
+
+then recreate its database in WE8MSWIN1252 as the workflow's "Recreate the database" step
+does (the image ships one already created in AL32UTF8), and run
+
     LIFTPROOF_TEST_ORACLE_PORT=1522 LIFTPROOF_TEST_ORACLE_CHARSET=WE8MSWIN1252 \\
       pytest tests/test_charset_oracle.py tests/test_oracle_parity.py
 
