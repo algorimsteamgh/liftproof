@@ -319,7 +319,30 @@ data "aws_iam_policy_document" "release" {
       "arn:${local.partition}:ec2:${local.region}::image/*",
       "arn:${local.partition}:ec2:${local.region}:${local.account_id}:network-interface/*",
       "arn:${local.partition}:ec2:${local.region}:${local.account_id}:volume/*",
+      "arn:${local.partition}:ec2:${local.region}:${local.account_id}:key-pair/packer_*",
     ]
+  }
+
+  statement {
+    sid = "PackerTemporaryKeyPair"
+    # Packer's SSH session runs over Session Manager but still uses a key pair it
+    # creates for the build and deletes afterwards (named packer_<uuid>).
+    actions = ["ec2:CreateKeyPair", "ec2:DeleteKeyPair"]
+    resources = [
+      "arn:${local.partition}:ec2:${local.region}:${local.account_id}:key-pair/packer_*",
+    ]
+  }
+
+  statement {
+    sid = "PackerInstanceAttributes"
+    # ena_support and sriov_support are set on the stopped build instance
+    actions   = ["ec2:ModifyInstanceAttribute"]
+    resources = ["arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/liftproof:build"
+      values   = ["true"]
+    }
   }
 
   statement {
@@ -351,6 +374,12 @@ data "aws_iam_policy_document" "release" {
     sid       = "PassBuilderRole"
     actions   = ["iam:PassRole"]
     resources = [aws_iam_role.builder.arn]
+  }
+
+  statement {
+    sid       = "CheckBuilderProfile"
+    actions   = ["iam:GetInstanceProfile"] # Packer checks iam_instance_profile before launch
+    resources = [aws_iam_instance_profile.builder.arn]
   }
 
   statement {

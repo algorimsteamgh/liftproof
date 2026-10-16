@@ -257,6 +257,31 @@ def test_baseline_with_workers(tmp_path, many):
     assert {t.status for t in result.tables} == {"matched"}
 
 
+def test_baseline_per_table(tmp_path, many):
+    """Each table in a snapshot of its own, on as many workers on every engine: nothing
+    is shared between connections."""
+    e, src, tgt, _, _ = many
+    messages: list[str] = []
+    manifest = tmp_path / "b" / "manifest.json"
+    take_baseline(e.adapter(src), manifest, baseline_id="b1", schemas=[e.schema_of(src)],
+                  tables=None, ignore=[], business_keys={}, rows_per_bucket=250, precision=6,
+                  workers=3, progress=messages.append, snapshot="per_table")  # fmt: skip
+    b = Baseline.load(manifest)
+    assert not any("one at a time" in m for m in messages)
+    assert {t.snapshot for t in b.tables.values()} == {"per_table"}
+    c = b.consistency()
+    assert (c["held"], c["snapshot"]) == (False, "per_table")
+    assert f"{TABLES} points" in c["summary"]
+    # replication must reach a position read after the last table, in the engine's own form
+    end = b.reference_position
+    assert end is b.end_position and end["taken_at"] and end["type"] == b.position["type"]
+    writer = FindingWriter(tmp_path / "f", "r")
+    opts = _opts(e, src, tgt, rows_per_bucket=250, workers=3)
+    result = Reconciler(e.adapter(tgt), writer, opts, baseline=b).run()
+    writer.close()
+    assert {t.status for t in result.tables} == {"matched"}
+
+
 # ---------------------------------------------------------------- replication
 def test_dms_status_table_on_the_target(engine):
     tgt, tc = engine.make("tgt")
@@ -403,3 +428,56 @@ def test_mysql_replica_gtid_and_binlog(make_mysql_db, mysql_adapter_for):
     assert k("binlog", "mysql-bin.000010:4") < k("binlog", "mysql-bin.000010:120")
     # not a replica: nothing to read for a binlog position
     assert a.replication_reached("replica", "", "binlog", "mysql-bin.000001:4") is None
+
+
+# ---------------------------------------------------------------- report data ranges
+def test_data_ranges_follow_the_rule(tmp_path, pair):
+    """Spec 12: the range block names the key and date ranges of the rows compared."""
+    e, src, tgt, _, _ = pair
+    _, tables, _ = _run(tmp_path, e, src, tgt)
+    [(column, span)] = tables["orders"].ranges.items()
+    assert column.lower() == "id" and span["role"] == "key"
+    assert span["source"] == span["target"] == [1, N]
+    _, tables, _ = _run(tmp_path, e, src, tgt, ignore=[ARCHIVED], name="g")
+    [span] = tables["orders"].ranges.values()
+    assert span["source"] == span["target"] == [1, N - 1]  # row N is archived
+
+    _exec(e, pair[4], e.status_ddl)
+    marks = ", ".join(e.mark(i) for i in range(7))
+    early, late = dt.datetime(2026, 10, 1, 8, 30), dt.datetime(2026, 10, 9, 17, 5, 1)
+    for when in (late, early):
+        pair[4].execute(f"INSERT INTO awsdms_status VALUES ({marks})",
+                        ("h", "T", "RUNNING", when, 0, when, when))  # fmt: skip
+    if e.name == "oracle":
+        pair[4].connection.commit()
+    table = TableRef(e.schema_of(tgt), "AWSDMS_STATUS" if e.name == "oracle" else "awsdms_status")
+    column = "STATUS_TIME" if e.name == "oracle" else "status_time"
+    assert e.adapter(tgt).value_ranges(table, [column]) == {column: (early, late)}
+
+
+def test_statements_are_logged_at_debug_without_their_values(pair):
+    """Spec 16: --log-level debug shows the SQL each engine is sent, never parameters."""
+    import logging
+
+    e, src, tgt, _, tc = pair
+    _exec(e, tc, e.status_ddl)
+    sql_log = logging.getLogger("liftproof.sql")
+    seen: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: seen.append(record.getMessage())
+    old = sql_log.level
+    sql_log.setLevel(logging.DEBUG)
+    sql_log.addHandler(handler)
+    try:
+        a = e.adapter(tgt)
+        t = TableRef(e.schema_of(tgt), "ORDERS" if e.name == "oracle" else "orders")
+        a.value_ranges(t, ["ID" if e.name == "oracle" else "id"], "status = 'ARCHIVED'")
+        schema = e.schema_of(tgt) if e.name != "sqlserver" else None
+        assert a.dms_status(schema, "task-named-in-a-parameter") is None
+    finally:
+        sql_log.removeHandler(handler)
+        sql_log.setLevel(old)
+    assert any("MIN(" in s and "ARCHIVED" in s for s in seen), seen
+    assert any("awsdms_status" in s.lower() for s in seen)
+    assert all(s.startswith(f"{a.engine}: ") for s in seen)
+    assert not any("task-named-in-a-parameter" in s for s in seen)

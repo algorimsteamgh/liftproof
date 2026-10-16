@@ -40,7 +40,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from jinja2 import Environment, PackageLoader, select_autoescape
 
 from liftproof.config import Project, load_project
-from liftproof.errors import ConfigError
+from liftproof.errors import ConfigError, LiftproofError
 
 log = logging.getLogger(__name__)
 
@@ -175,19 +175,38 @@ class UI:
         return path, p
 
     def runs(self, name: str) -> list[dict[str, Any]]:
-        from liftproof.cli import run_history
+        from liftproof.cli import _store, run_history, sync_reports
 
-        return run_history(self.workdir / name / "runs")
+        runs_dir = self.workdir / name / "runs"
+        try:
+            _, p = self.project(name)
+            sync_reports(_store(p, self.workdir), runs_dir)
+        except (LookupError, LiftproofError) as exc:  # the reports held here still show
+            log.warning("run history of %s from this instance only: %s", name, exc)
+        return run_history(runs_dir)
 
     def journey_ids(self, p: Project) -> list[str]:
-        local = self.workdir / p.name / "journeys"
+        from liftproof.cli import _store, journey_index
+
         listed = list(p.web.journeys or []) if p.web is not None else []
-        return sorted({*listed, *(f.stem for f in local.glob("*.json"))})
+        try:
+            recorded = journey_index(_store(p, self.workdir), self.workdir / p.name)
+        except LiftproofError as exc:
+            log.warning("journeys of %s from this instance only: %s", p.name, exc)
+            recorded = [f.stem for f in (self.workdir / p.name / "journeys").glob("*.json")]
+        return sorted({*listed, *recorded})
 
     def journey(self, p: Project, journey_id: str):
         from liftproof.cli import _load_journey, _store
+        from liftproof.store import LocalStore
 
-        return _load_journey(_store(p, self.workdir), self.workdir / p.name, journey_id)
+        workdir = self.workdir / p.name
+        try:
+            return _load_journey(_store(p, self.workdir), workdir, journey_id)
+        except LiftproofError as exc:  # the bucket out of reach: the copy held here shows
+            journey = _load_journey(LocalStore(workdir), workdir, journey_id)
+            log.warning("journey %s of %s from this instance only: %s", journey_id, p.name, exc)
+            return journey
 
     # starting the CLI ------------------------------------------------------------
     def start(self, project: str, command: str, form: dict[str, str], person: str) -> Job:

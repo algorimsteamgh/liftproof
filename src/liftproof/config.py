@@ -15,12 +15,16 @@ from typing import Any
 
 import yaml
 
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
 from liftproof.files.compare import FileSetConfig, IgnoreFile
+from liftproof.reconcile.baseline import SNAPSHOT_MODES
 from liftproof.reconcile.engine import ReconcileOptions
 from liftproof.reconcile.plan import IgnoreRule
 from liftproof.reconcile.replication import ReplicationConfig
+from liftproof.reconcile.structure import CHECKS, StructureChecks
 from liftproof.schedule import Schedule, parse_schedules
+from liftproof.web.journey import IgnoreRegion
 
 FORBIDDEN_KEYS = re.compile(
     r"(password|passwd|secret_access_key|access_key_id|session_token)", re.I
@@ -28,6 +32,12 @@ FORBIDDEN_KEYS = re.compile(
 DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306, "oracle": 1521, "sqlserver": 1433}
 ENGINES = set(DEFAULT_PORTS)
 VERIFYING_TLS = {"verify-full", "verify-ca"}
+# Spec 9.15: the source is the machine not to saturate. Left out of the project file, its
+# connections read at most this many rows a second each, on one core, and pause between
+# statements; the target's do neither. Every connection gives up a lock wait after 10 s.
+SOURCE_ROWS_PER_SECOND = 125_000
+SOURCE_PAUSE_MS = 100
+LOCK_TIMEOUT_MS = 10_000
 
 
 @dataclass
@@ -41,7 +51,11 @@ class Connection:
     sslmode: str = "verify-full"
     sslrootcert: str | None = None
     statement_timeout_ms: int = 0
-    rows_per_second: int = 0
+    rows_per_second: int = 0  # 0: no cap
+    pause_ms: int = 0  # least time between two statements on a connection
+    lock_timeout_ms: int = LOCK_TIMEOUT_MS  # 0: wait for a lock as long as it takes
+    # a baseline of this database: one snapshot over every table, or one per table
+    snapshot: str = "whole"
 
     @property
     def tls_verified(self) -> bool:
@@ -61,15 +75,19 @@ class StoreConfig:
 @dataclass
 class WebConfig:
     """Record and replay settings (spec 5 to 8). Bodies are kept only for capture_bodies
-    URL patterns; everything else is reduced to a hash and a shape."""
+    URL patterns, and page snapshots only for capture_snapshots patterns (matched on the
+    page a step ended on); everything else is reduced to a hash and a shape."""
 
     source_url: str
     target_url: str | None = None
     journeys: list[str] | None = None  # default: every recorded journey
     capture_bodies: list[str] = field(default_factory=list)
+    capture_snapshots: list[str] = field(default_factory=list)
     compare_headers: list[str] = field(default_factory=list)
     ignore_json_paths: list[str] = field(default_factory=list)
     ignore_text: list[str] = field(default_factory=list)
+    # page parts never compared, by CSS selector, each with its reason (spec 7, 9.12)
+    ignore_regions: list[IgnoreRegion] = field(default_factory=list)
     step_timeout_ms: int = 15_000
     chromium_path: str | None = None
     # journeys replayed at once (spec 6). 1, the default, is sequential; more is an opt in
@@ -119,6 +137,13 @@ def _scan_for_credentials(node: Any, where: str = "") -> None:
             _scan_for_credentials(v, f"{where}{i}.")
 
 
+def _whole(d: dict[str, Any], key: str, default: int, where: str) -> int:
+    v = d.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise ConfigError(f"{where}.{key} is a whole number, 0 or more (0 turns it off)")
+    return v
+
+
 def _connection(d: dict[str, Any], role: str) -> Connection:
     if not isinstance(d, dict):
         raise ConfigError(f"{role}: connection settings missing")
@@ -127,6 +152,14 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
         raise ConfigError(
             f"{role}.engine {engine!r} is not supported in this build "
             f"(supported: {', '.join(sorted(ENGINES))})"
+        )
+    cap, pause = (SOURCE_ROWS_PER_SECOND, SOURCE_PAUSE_MS) if role == "source" else (0, 0)
+    snapshot = d.get("snapshot", "whole")
+    if snapshot not in SNAPSHOT_MODES:
+        raise ConfigError(
+            f"{role}.snapshot is whole (a baseline holds one snapshot over every table, the "
+            "default) or per_table (one snapshot per table, where the database cannot hold "
+            "one that long; the report then says cross table consistency was not held)"
         )
     try:
         return Connection(
@@ -139,7 +172,10 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
             sslmode=d.get("sslmode", "verify-full"),
             sslrootcert=d.get("sslrootcert"),
             statement_timeout_ms=int(d.get("statement_timeout_ms", 0)),
-            rows_per_second=int(d.get("rows_per_second", 0)),
+            rows_per_second=_whole(d, "rows_per_second", cap, role),
+            pause_ms=_whole(d, "pause_ms", pause, role),
+            lock_timeout_ms=_whole(d, "lock_timeout_ms", LOCK_TIMEOUT_MS, role),
+            snapshot=snapshot,
         )
     except KeyError as exc:
         raise ConfigError(f"{role}.{exc.args[0]} is required") from None
@@ -186,9 +222,15 @@ def _options(
             r.get("where"),
             r.get("source_where"),
             r.get("target_where"),
+            r.get("structure"),
         )
         if rule.rows and rule.column:
             raise ConfigError(f"database.ignore.{i}: a rule leaves out a column or rows, not both")
+        if rule.structure is not None and (rule.structure not in CHECKS or rule.rows):
+            raise ConfigError(
+                f"database.ignore.{i}.structure is one of {', '.join(CHECKS)}, accepted for the "
+                "table or, with column, for what holds that column; it takes no row predicate"
+            )
         for key in ("where", "source_where", "target_where"):
             pred = getattr(rule, key)
             if pred is not None and (not str(pred).strip() or UNSAFE_SQL.search(str(pred))):
@@ -207,8 +249,13 @@ def _options(
         precision=int(d.get("timestamp_precision", 6)),
         diff_row_limit=int(d.get("diff_row_limit", 100)),
         show_values=bool(d.get("show_values", False)),
+        ranges=bool(d.get("ranges", True)),
     )
     opts.replication = ReplicationConfig.from_dict(d.get("replication"))
+    opts.structure = _structure(d.get("structure", True))
+    if d.get("type_map") is not None:
+        engines = {c.engine for c in (source, target) if c is not None}
+        opts.type_map = DEFAULT_TYPE_MAP.with_overrides(d["type_map"], engines)
     breaker = d.get("circuit_breaker") or {}
     opts.breaker_bucket_ratio = float(breaker.get("bucket_ratio", opts.breaker_bucket_ratio))
     opts.breaker_table_ratio = float(breaker.get("table_ratio", opts.breaker_table_ratio))
@@ -237,6 +284,22 @@ def _options(
     return opts
 
 
+def _structure(v: Any) -> StructureChecks:
+    """database.structure: true (every check, the default), false, or a map of checks."""
+    if isinstance(v, bool):
+        return StructureChecks(**dict.fromkeys(CHECKS, v))
+    if (
+        not isinstance(v, dict)
+        or set(v) - set(CHECKS)
+        or not all(isinstance(x, bool) for x in v.values())
+    ):
+        raise ConfigError(
+            f"database.structure is true, false or a map of {', '.join(CHECKS)} to true or "
+            "false (each true when left out)"
+        )
+    return StructureChecks(**v)
+
+
 def _web(d: Any) -> WebConfig | None:
     if not d:
         return None
@@ -254,13 +317,42 @@ def _web(d: Any) -> WebConfig | None:
         target_url=d.get("target_url"),
         journeys=strings("journeys") or None,
         capture_bodies=strings("capture_bodies"),
+        capture_snapshots=strings("capture_snapshots"),
         compare_headers=strings("compare_headers"),
         ignore_json_paths=strings("ignore_json_paths"),
         ignore_text=strings("ignore_text"),
+        ignore_regions=_regions(d.get("ignore_regions")),
         step_timeout_ms=int(d.get("step_timeout_ms", 15_000)),
         chromium_path=d.get("chromium_path"),
         parallel_journeys=_parallel(d.get("parallel_journeys", 1)),
     )
+
+
+SELECTOR_KEYS = ("selector", "source_selector", "target_selector")
+
+
+def _regions(v: Any) -> list[IgnoreRegion]:
+    """web.ignore_regions: `selector` (both sides) or `source_selector` / `target_selector`
+    (one side each), and a reason. The browser checks that each is CSS before a run."""
+    if not v:
+        return []
+    if not isinstance(v, list):
+        raise ConfigError("web.ignore_regions must be a list of {selector, reason}")
+    rules = []
+    for i, r in enumerate(v):
+        if not isinstance(r, dict) or not r.get("reason") or not any(map(r.get, SELECTOR_KEYS)):
+            raise ConfigError(
+                f"web.ignore_regions.{i}: every ignore region needs a selector (CSS; quote one "
+                "that starts with [ or #) and a reason; the reasons are printed in the report"
+            )
+        for k in SELECTOR_KEYS:
+            if r.get(k) is not None and not isinstance(r[k], str):
+                raise ConfigError(
+                    f"web.ignore_regions.{i}.{k} must be a string: quote a selector that "
+                    "starts with [ or #"
+                )
+        rules.append(IgnoreRegion(str(r["reason"]), *(r.get(k) or None for k in SELECTOR_KEYS)))
+    return rules
 
 
 MAX_PARALLEL_JOURNEYS = 8  # each runs its own browser on the instance
@@ -284,6 +376,13 @@ def _side(d: Any, where: str) -> tuple[str, str | None, str | None]:
     if isinstance(d, str) and d:
         return d, None, None
     if isinstance(d, dict) and d.get("location"):
+        if d.get("secret_arn") and not d.get("endpoint_url"):
+            # keys in a secret would mean an IAM user with long lived keys (IAM-002)
+            raise ConfigError(
+                f"{where}.secret_arn is for an S3 compatible store outside AWS, with its "
+                "endpoint_url; a bucket in AWS is read with the instance role, so leave "
+                "secret_arn out and grant the role s3:ListBucket and s3:GetObject"
+            )
         return str(d["location"]), d.get("endpoint_url"), d.get("secret_arn")
     raise ConfigError(f"{where} must be a path, an s3:// location, or {{location: ...}}")
 
@@ -408,7 +507,7 @@ store:
   s3_prefix: {name}
   # kms_key_id: arn:aws:kms:REGION:ACCOUNT:key/ID   # customer managed key (optional)
 
-source:
+source:                         # a read replica where there is one (README: Protecting the source)
   engine: postgresql
   host: source.db.example.internal
   port: 5432
@@ -416,10 +515,16 @@ source:
   secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/source   # username, password
   sslmode: verify-full          # full certificate verification; lowering it is reported
                                 # Oracle: TLS is TCPS, usually on port 2484
-                                # SQL Server: verify-ca or verify-full (needs sslrootcert)
-  # sslrootcert: /opt/liftproof/certs/private-ca.pem
+                                # SQL Server: verify-ca or verify-full
+  # sslrootcert: /var/lib/mvt/certs/private-ca.pem   # only for a private CA; the AMI
+                                # already trusts Amazon RDS and public certificate authorities
   statement_timeout_ms: 600000
-  rows_per_second: 0            # application side hashing only; 0 = unlimited
+  lock_timeout_ms: 10000        # a read kept waiting this long for a lock fails the run
+  rows_per_second: 125000       # rows read a second, on one core, by each connection (each
+                                # worker has its own); 0 = no cap, e.g. for a read replica
+  pause_ms: 100                 # at least this long between two statements on a connection
+  # snapshot: per_table         # a baseline holds one snapshot over every table; per_table
+                                # when the source cannot (README: Protecting the source)
 
 target:
   engine: postgresql            # postgresql, mysql, oracle or sqlserver; may differ
@@ -427,16 +532,26 @@ target:
   port: 5432
   database: app
   secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/target
-  sslmode: verify-full
-  sslrootcert: /opt/liftproof/certs/rds-global-bundle.pem
+  sslmode: verify-full          # RDS certificates verify against the bundle on the AMI
+  lock_timeout_ms: 10000
+  rows_per_second: 0            # no cap; set one once the target is production
+  pause_ms: 0
+  # snapshot: per_table         # rebaseline: one snapshot per table instead
 
 web:                            # record and replay; omit for database only projects
   source_url: https://app.example.internal
   target_url: https://app.example.com
   capture_bodies: ["/api/*"]    # bodies kept for value comparison; others: hash and shape
+  capture_snapshots: []         # pages whose text is kept for comparison, e.g. ["/orders/*"];
+                                # others: hash and structure. Kept ones expire with the bucket
   compare_headers: []           # only these response headers are compared
-  ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag"
+  ignore_json_paths: []         # e.g. "$.generated_at" or "GET /api/orders/{{id}} $.etag";
+                                # [*] is every element: "$.orders[*].updated_at"
   ignore_text: []               # regular expressions masked in page content
+  ignore_regions: []            # page parts never compared, by CSS selector, with a reason:
+                                # {{selector: ".recently-viewed", reason: personalised}};
+                                # or source_selector / target_selector where markup differs.
+                                # Elements marked data-liftproof-volatile are never compared
   step_timeout_ms: 15000
   parallel_journeys: 1          # 1 = in sequence; more only for journeys that do not interfere
 
@@ -461,8 +576,21 @@ database:
   timestamp_precision: 6
   diff_row_limit: 100
   show_values: false            # the report is an egress path; values need an explicit opt in
+  ranges: true                  # lowest/highest integer key and dates per table, in the report
   business_keys: {{}}           # e.g. orders: [order_number] where keys were renumbered
   workers: 1                    # tables hashed at once; each is another source connection
+  # type_map:                  # how native types compare (docs/canonical-v1.md); the
+  #   mysql:                    # report names each column compared otherwise
+  #     tinyint(1): integer     # the target column is a smallint, not a boolean
+  #     datetime: timestamptz   # it holds UTC times; the target's are zone aware
+  #   oracle:
+  #     NUMBER(1): boolean      # 0 is false, any other value true
+  #     DATE: date              # a DATE with a time of day differs from every date
+  # structure:                  # compared before data; false turns all of it off
+  #   nullability: true
+  #   keys: true                # primary and unique keys
+  #   foreign_keys: true        # false where the target's are added after the load
+  #   indexes: true             # false where the target's are built after the load
   # sampling:                    # large tables: compare a random share of the buckets;
   #   above_rows: 500000000      # the report gives the share and marks the rest not checked
   #   percent: 10
@@ -479,6 +607,9 @@ database:
     #   source_where: "tenant = 'test'"
     #   target_where: "tenant = 'qa'"
     #   reason: test tenant renamed in the target
+    # - table: events               # a structural difference accepted (keys, nullability,
+    #   structure: keys             # foreign_keys or indexes; with column, only what holds it)
+    #   reason: partitioned target; its primary key includes created_at
   # replay_watermarks:          # rows a replay creates are left out of later reconciliations,
   #   orders: id                # told apart by a column that only grows; default: a single
   #   events: created_at        # column primary key (journeys name tables: record --writes)

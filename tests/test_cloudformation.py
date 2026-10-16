@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from liftproof import aws
+
 ROOT = Path(__file__).resolve().parents[1]
 CFN = ROOT / "infra/cloudformation/liftproof.yaml"
 MODULE = ROOT / "infra/modules/liftproof"
@@ -41,6 +43,7 @@ INPUTS = {
     "log_retention_days": ["LogRetentionDays"],
     "operator_principal_arns": ["OperatorPrincipalArns"],
     "alarm_topic_arn": ["AlarmTopicArn"],
+    "aws_requests_per_second": ["AwsRequestsPerSecond"],
     "tags": [],  # stack tags propagate in CloudFormation
 }
 
@@ -121,6 +124,12 @@ def test_instance_settings_match(template):
     user_data = template["Resources"]["Instance"]["Properties"]["UserData"]["Fn::Base64"]
     cfn_keys = re.findall(r"^\s+(\w+): \$\{", user_data["Fn::Sub"][0], re.M)
     assert sorted(cfn_keys) == sorted(tf_keys)
+    # every product process runs as mvt, so the file must be readable by that group
+    for user_data_text in (user_data["Fn::Sub"][0], tf("compute.tf")):
+        written = re.search(
+            r'path: /etc/mvt/config\.yaml\s+permissions: "(\d+)"\s+owner: (\S+)', user_data_text
+        )
+        assert written.groups() == ("0640", "root:mvt")
     lt = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]
     assert lt["MetadataOptions"]["HttpTokens"] == "required"
     assert lt["BlockDeviceMappings"][0]["Ebs"]["Encrypted"] is True
@@ -136,6 +145,15 @@ def test_endpoints_match(template):
         and r["Properties"]["VpcEndpointType"] == "Interface"
     }
     assert cfn == tf_endpoints
+    gateways = {
+        r["Properties"]["ServiceName"]["Fn::Sub"].rsplit(".", 1)[1]
+        for r in template["Resources"].values()
+        if r["Type"] == "AWS::EC2::VPCEndpoint"
+        and r["Properties"]["VpcEndpointType"] == "Gateway"
+    }
+    # what doctor checks is what the deployment creates
+    assert set(aws.GATEWAY_SERVICES) == gateways
+    assert sorted(aws.ENDPOINT_SERVICES) == sorted(tf_endpoints | gateways)
 
 
 def test_no_inbound_and_no_public_address(template):
@@ -152,3 +170,14 @@ def test_alarm_dimension_is_what_the_cli_publishes(template):
     dims = template["Resources"]["SkippedRunsAlarm"]["Properties"]["Dimensions"]
     assert [d["Name"] for d in dims] == ["Deployment"]
     assert "dimensions          = { Deployment = var.name }" in tf("monitoring.tf")
+
+
+def test_customer_key_statements_are_published(template):
+    """With the customer's own key the log group fails to create until its policy allows
+    CloudWatch Logs; the statements are an output and in the deployment guide."""
+    assert 'output "customer_key_policy_statements"' in tf("outputs.tf")
+    guide = (ROOT / "infra/README.md").read_text(encoding="utf-8")
+    for sid in re.findall(r'sid\s*=\s*"(\w+)"', tf("kms.tf")):
+        if sid != "AccountAdministration":
+            assert f'"Sid": "{sid}"' in guide, sid
+    assert "Bring your own KMS key" in template["Parameters"]["KmsKeyArn"]["Description"]

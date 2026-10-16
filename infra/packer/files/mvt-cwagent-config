@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Point the CloudWatch agent at the log group named in /etc/mvt/config.yaml.
 set -euo pipefail
-group=$(awk -F': *' '$1=="log_group"{print $2}' /etc/mvt/config.yaml)
+# A YAML parser, not a pattern: Terraform's yamlencode quotes the keys, CloudFormation
+# does not.
+group=$(/opt/mvt/bin/python -c '
+import yaml
+print((yaml.safe_load(open("/etc/mvt/config.yaml")) or {}).get("log_group") or "")')
 [ -n "$group" ] || exit 0
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<JSON
 {

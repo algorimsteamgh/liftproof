@@ -32,6 +32,16 @@ variable "enable_security_hub" {
   default     = true
 }
 
+variable "ebs_encryption_by_default" {
+  description = <<-EOT
+    EBS encryption by default for the account and region. Turn it off where AMIs for
+    AWS Marketplace are built: it encrypts the image's snapshot with the AWS managed
+    key, which cannot be shared, and Marketplace does not accept encrypted AMIs.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "tags" {
   type    = map(string)
   default = {}
@@ -57,7 +67,7 @@ resource "aws_s3_account_public_access_block" "this" {
 }
 
 resource "aws_ebs_encryption_by_default" "this" {
-  enabled = true
+  enabled = var.ebs_encryption_by_default
 }
 
 resource "aws_ec2_instance_metadata_defaults" "this" {

@@ -76,6 +76,10 @@ class RunLock:
 
     def release(self) -> None: ...
 
+    def holder(self) -> dict[str, Any] | None:
+        """The run holding the lock now, if any, without taking it."""
+        ...
+
     def _heartbeat(self) -> None:
         while not self._stop.wait(self.lease / 3):
             try:
@@ -128,9 +132,36 @@ class LocalRunLock(RunLock):
             os.close(self._fd)
             self._fd = None
 
+    def holder(self) -> dict[str, Any] | None:
+        try:
+            fd = os.open(self.path, os.O_RDONLY)
+        except FileNotFoundError:
+            return None
+        try:
+            body = os.read(fd, 4096)
+            if not body:  # released
+                return None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                try:
+                    return json.loads(body)
+                except ValueError:
+                    return {}
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None  # left by a process that died
+        finally:
+            os.close(fd)
+
 
 def _code(exc: ClientError) -> str:
     return exc.response.get("Error", {}).get("Code", "")
+
+
+def _live(holder: dict[str, Any]) -> bool:
+    """A lease that has expired was left by a lost process or instance."""
+    expires = holder.get("expires_at")
+    return bool(expires) and dt.datetime.fromisoformat(expires.replace("Z", "+00:00")) > _now()
 
 
 class S3RunLock(RunLock):
@@ -173,8 +204,7 @@ class S3RunLock(RunLock):
             if _code(exc) in ("NoSuchKey", "404"):
                 return self.acquire()  # released between our two calls
             raise RunFailed(f"cannot read the run lock: {_code(exc)}") from None
-        expires = holder.get("expires_at")
-        if expires and dt.datetime.fromisoformat(expires.replace("Z", "+00:00")) > _now():
+        if _live(holder):
             raise RunInProgress(holder)
         try:
             self.etag = self._put(IfMatch=etag)  # take over a stale lock, once
@@ -187,6 +217,18 @@ class S3RunLock(RunLock):
     def renew(self) -> None:
         if self.etag:
             self.etag = self._put(IfMatch=self.etag)
+
+    def holder(self) -> dict[str, Any] | None:
+        try:
+            resp = self.s3.get_object(Bucket=self.bucket, Key=self.key)
+            holder = json.loads(resp["Body"].read() or b"{}")
+        except ClientError as exc:
+            if _code(exc) in ("NoSuchKey", "404"):
+                return None
+            raise RunFailed(f"cannot read the run lock: {_code(exc)}") from None
+        except BotoCoreError as exc:
+            raise RunFailed(f"cannot read the run lock: {exc}") from None
+        return holder if _live(holder) else None
 
     def release(self) -> None:
         if not self.etag:

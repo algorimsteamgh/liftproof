@@ -151,4 +151,18 @@
       send({ action: "press", locator: describe(e.target), value: "Enter" });
     }
   }, true);
+
+  // Back and Forward in the browser window. The Navigation API marks a traversal the browser
+  // started (toolbar, Alt+Left, mouse back button) userInitiated; a page's own history.back()
+  // is not, and the click that ran it is already a step. The recorder counts how far it went
+  // in the browser's history, which has the entries frames added too; delta, the page's own
+  // count, is null when the destination is on another origin.
+  if (window === window.top && window.navigation) {
+    navigation.addEventListener("navigate", (e) => {
+      if (e.navigationType !== "traverse" || !e.userInitiated) return;
+      const to = e.destination.index;
+      const from = navigation.currentEntry ? navigation.currentEntry.index : -1;
+      send({ action: "traverse", delta: to >= 0 && from >= 0 ? to - from : null });
+    });
+  }
 })();

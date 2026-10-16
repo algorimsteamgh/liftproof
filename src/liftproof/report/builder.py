@@ -20,7 +20,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, PackageLoader, select_autoescape
 
 from liftproof import __version__, aws
-from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical import CANONICAL_REVISION, CANONICAL_VERSION, HASH_ALGORITHM
 from liftproof.findings import Finding, Kind, Severity
 from liftproof.reconcile.engine import ReconcileResult
 
@@ -69,7 +69,11 @@ def build_report(
     range_block: dict[str, Any],
     run_failed: bool = False,
     failure: str | None = None,
+    not_reached: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    """`not_reached` names what a failed run never got to (file sets, journeys); it
+    counts as not checked, so a stopped run cannot read as fully covered (spec 12)."""
+    not_reached = list(not_reached or [])
     tables = db.tables if db else []
     status = Counter(t.status for t in tables)
     exists = len(tables)
@@ -92,6 +96,7 @@ def build_report(
         for j in journeys
         if j.status == "not_run"
     ]
+    not_covered += not_reached
 
     file_sets = list(files.sets) if files is not None else []
     f_total = sum(fs.files for fs in file_sets)
@@ -134,7 +139,10 @@ def build_report(
             "tables_matched": status["matched"],
             "tables_different": status["different"],
             "differences": kinds[Kind.DIFFERENCE],
-            "not_checked": kinds[Kind.NOT_CHECKED] + status["excluded"] + jstatus["not_run"],
+            "not_checked": kinds[Kind.NOT_CHECKED]
+            + status["excluded"]
+            + jstatus["not_run"]
+            + len(not_reached),
             "partial": kinds[Kind.PARTIAL],
             "flakes": kinds[Kind.FLAKE],
             "errors": kinds[Kind.ERROR],
@@ -147,6 +155,11 @@ def build_report(
             # those replayed. Reported separately on purpose (spec 12).
             "journeys_coverage_pct": _pct(j_attempted, len(journeys)),
             "journeys_success_pct": _pct(jstatus["passed"], j_attempted),
+            # how the pages after each step were compared: text, or structure (decision 99)
+            "ui_compared": {
+                k: sum(j.ui_compared.get(k, 0) for j in journeys)
+                for k in ("text", "shape", "expired")
+            },
             "files_coverage_pct": _pct(f_attempted, f_total),
             "files_success_pct": _pct(f_matched, f_attempted),
             "not_covered": not_covered,
@@ -161,7 +174,13 @@ def build_report(
                 if t.partial
             ],
             "exclusions": [
-                {"object": f.object, "column": f.column, "reason": f.detail.get("reason")}
+                {
+                    "object": f.object,
+                    "column": f.column,
+                    "reason": f.detail.get("reason"),
+                    # a structure check or an index not compared, rather than data
+                    **{k: f.detail[k] for k in ("structure", "index") if k in f.detail},
+                }
                 for f in findings
                 if f.kind == Kind.NOTICE and "reason" in f.detail
             ],
@@ -201,6 +220,7 @@ def build_report(
             "finished_at": finished_at,
             "product_version": __version__,
             "canonical_version": CANONICAL_VERSION,
+            "canonical_revision": CANONICAL_REVISION,
             "hash_algorithm": HASH_ALGORITHM,
             "aws_sdk": aws.sdk_versions(),
             **metadata,

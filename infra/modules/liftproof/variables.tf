@@ -139,6 +139,16 @@ variable "alarm_topic_arn" {
   default     = null
 }
 
+variable "aws_requests_per_second" {
+  description = "Ceiling on the AWS API calls each Liftproof process (a run, the UI, the scheduler) makes per second, all services together. Runs going at once each have this ceiling."
+  type        = number
+  default     = 20
+  validation {
+    condition     = var.aws_requests_per_second >= 1 && var.aws_requests_per_second <= 1000
+    error_message = "aws_requests_per_second is between 1 and 1000."
+  }
+}
+
 variable "tags" {
   description = "Tags applied to every resource."
   type        = map(string)

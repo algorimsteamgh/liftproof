@@ -125,6 +125,11 @@ def replicated(make_db, adapter_for):
         except psycopg.Error:
             pass
         c.execute(q)
+    # a disabled subscription's walsender lets go of the slot a moment later
+    deadline = time.monotonic() + 30
+    while sc.execute("SELECT 1 FROM pg_replication_slots WHERE slot_name = %s AND active",
+                     (slot,)).fetchone() and time.monotonic() < deadline:  # fmt: skip
+        time.sleep(0.2)
     sc.execute("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
                "WHERE slot_name = %s", (slot,))  # fmt: skip
 

@@ -92,16 +92,9 @@ class S3Source(FileSource):
             self.prefix += "/"
         self.endpoint_url = endpoint_url
         self.skipped: list[tuple[str, str]] = []
-        if client is not None:
-            self.s3 = client
-        elif endpoint_url or credentials:
-            import boto3
-
-            self.s3 = boto3.session.Session().client(
-                "s3", endpoint_url=endpoint_url, **(credentials or {})
-            )
-        else:
-            self.s3 = aws.client("s3")  # the instance role
+        # an S3 compatible store outside AWS (endpoint_url, keys from a secret), or AWS S3
+        # with the instance role; rate limited either way
+        self.s3 = client or aws.client("s3", endpoint_url=endpoint_url, credentials=credentials)
 
     def describe(self) -> str:
         where = f"s3://{self.bucket}/{self.prefix}"

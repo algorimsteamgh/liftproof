@@ -23,8 +23,8 @@ your AWS account on one private EC2 instance with no inbound access, and compare
 and target on three fronts:
 
 - **Databases:** every row of every table, by hashing inside each database and narrowing
-  any difference down to the rows involved. PostgreSQL, MySQL, MariaDB, Oracle and SQL
-  Server, in any pairing, including the Amazon RDS and Aurora versions.
+  any difference down to the rows involved. PostgreSQL 13+, MySQL 8.0+, Oracle 19c+ and SQL
+  Server 2016+, in any pairing, including the Amazon RDS and Aurora versions.
 - **Files:** local folders, network shares or Amazon S3 on either side, matched by size
   and SHA-256, with text aware comparison of PDF, CSV and JSON so a regenerated document
   is not reported as a lost one.
@@ -64,9 +64,13 @@ your data. Nothing is sent to Algorims.
 4. When the stack finishes, connect to the instance with Session Manager
    (`aws ssm start-session --target` and the **InstanceId** output), or call the
    **RunDocument** output with mode `doctor`, to check network paths, credentials and
-   permissions before the first comparison. (The **ConnectUi** output is for the web
-   interface, which is not built yet.)
-5. To start a run from a pipeline, give the pipeline's role the **OperatorPolicyArn**
+   permissions before the first comparison. The **ConnectUi** output opens the web
+   interface (see `docs/ui.md`).
+5. For a first report before any of your own systems are set up, run the worked
+   example: the **RunDocument** output with project `example` and mode `files`. It
+   compares two folders shipped on the instance, finds one changed invoice amount, and
+   writes the report to the deployment's bucket.
+6. To start a run from a pipeline, give the pipeline's role the **OperatorPolicyArn**
    output and call the command in the **StartRun** output.
 
 Deleting the stack keeps the S3 bucket and its locked reports (DeletionPolicy Retain).
