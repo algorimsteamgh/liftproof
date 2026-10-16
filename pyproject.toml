@@ -16,7 +16,7 @@ dependencies = [
   "psycopg[binary]>=3.2",
   "pypdf>=5",
   # rsa: caching_sha2_password logins without TLS. Below 1.2: 1.2.3 fails the full
-  # caching_sha2_password exchange (AttributeError in _request_authentication).
+  # caching_sha2_password exchange without TLS (tests/test_mysql_auth.py).
   "pymysql[rsa]>=1.1.1,<1.2",
   # thin mode: no Oracle client libraries on the image
   "oracledb>=2.5,<27",
