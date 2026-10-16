@@ -8,6 +8,7 @@ pointed at the same bucket carries on. LocalStore serves development and tests.
 from __future__ import annotations
 
 import datetime as dt
+import os
 import shutil
 from pathlib import Path
 
@@ -26,6 +27,14 @@ class Store:
     def get_file(self, key: str, path: Path) -> bool: ...
 
     def location(self, key: str) -> str: ...
+
+    def list_keys(self, prefix: str) -> list[str]:
+        """Keys under a prefix, relative to the store, sorted."""
+        ...
+
+    def modified(self, prefix: str) -> dict[str, float]:
+        """When each object under a prefix was last written (a POSIX time), by key."""
+        ...
 
 
 class LocalStore(Store):
@@ -50,6 +59,21 @@ class LocalStore(Store):
 
     def location(self, key: str) -> str:
         return str(self.root / key)
+
+    def list_keys(self, prefix: str) -> list[str]:
+        base = self.root / prefix
+        if not base.exists():
+            return []
+        if base.is_file():  # a whole key, which an S3 prefix lists too
+            return [prefix]
+        return sorted(
+            p.relative_to(self.root).as_posix()
+            for p in base.rglob("*")
+            if p.is_file() and not p.name.endswith((".partial", ".tmp"))
+        )
+
+    def modified(self, prefix: str) -> dict[str, float]:
+        return {key: (self.root / key).stat().st_mtime for key in self.list_keys(prefix)}
 
     def run_lock(self, run_id: str, command: str) -> RunLock:
         return LocalRunLock(self.root / LOCK_KEY, run_id, command)
@@ -111,17 +135,47 @@ class S3Store(Store):
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self._key(key))
         except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            code = exc.response.get("Error", {}).get("Code", "error")
+            if code in ("NoSuchKey", "404"):
                 return False
-            raise ConfigError(f"cannot read s3://{self.bucket}/{self._key(key)}") from None
+            raise ConfigError(f"cannot read s3://{self.bucket}/{self._key(key)}: {code}") from None
+        except BotoCoreError as exc:
+            raise RunFailed(f"S3 read failed for {self._key(key)}: {exc}") from None
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as fh:
             for chunk in resp["Body"].iter_chunks():
                 fh.write(chunk)
+        if "LastModified" in resp:  # the object's time: a stopped run's end is read from it
+            written = resp["LastModified"].timestamp()
+            os.utime(path, (written, written))
         return True
 
     def location(self, key: str) -> str:
         return f"s3://{self.bucket}/{self._key(key)}"
+
+    def list_keys(self, prefix: str) -> list[str]:
+        return sorted(self.modified(prefix))
+
+    def modified(self, prefix: str) -> dict[str, float]:
+        strip = len(self.prefix) + 1 if self.prefix else 0
+        keys: dict[str, float] = {}
+        try:
+            pages = self.s3.get_paginator("list_objects_v2").paginate(
+                Bucket=self.bucket, Prefix=self._key(prefix)
+            )
+            for page in pages:
+                keys.update(
+                    (o["Key"][strip:], o["LastModified"].timestamp())
+                    for o in page.get("Contents", [])
+                )
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "error")
+            raise ConfigError(
+                f"cannot list s3://{self.bucket}/{self._key(prefix)}: {code}"
+            ) from None
+        except BotoCoreError as exc:
+            raise RunFailed(f"S3 list failed for {self._key(prefix)}: {exc}") from None
+        return keys
 
     def run_lock(self, run_id: str, command: str) -> RunLock:
         return S3RunLock(

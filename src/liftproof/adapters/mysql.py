@@ -13,64 +13,44 @@ In MySQL a schema is a database, so TableRef.schema is the database name.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
+import math
 import ssl
-import time
 from collections.abc import Iterator, Sequence
 from typing import Any
 
 import pymysql
 import pymysql.cursors
 
+from liftproof.adapters import sqllog
 from liftproof.adapters.base import (
     Adapter,
     BucketAggregate,
     Column,
     FloatStats,
+    ForeignKey,
     HashPlan,
+    Index,
+    Pacer,
     TableRef,
     TableSchema,
     all_of,
     in_list,
+    plain_prefix,
 )
 from liftproof.canonical import GROUP_SIZE, CanonicalType, RowHasher, Verbatim, column_digest
 from liftproof.canonical import value64 as _value64
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
 
-TYPE_MAP: dict[str, CanonicalType] = {
-    "tinyint": CanonicalType.INTEGER,
-    "smallint": CanonicalType.INTEGER,
-    "mediumint": CanonicalType.INTEGER,
-    "int": CanonicalType.INTEGER,
-    "bigint": CanonicalType.INTEGER,
-    "year": CanonicalType.INTEGER,
-    "decimal": CanonicalType.DECIMAL,
-    "float": CanonicalType.FLOAT,
-    "double": CanonicalType.FLOAT,
-    "varchar": CanonicalType.TEXT,
-    "tinytext": CanonicalType.TEXT,
-    "text": CanonicalType.TEXT,
-    "mediumtext": CanonicalType.TEXT,
-    "longtext": CanonicalType.TEXT,
-    "enum": CanonicalType.TEXT,
-    "set": CanonicalType.TEXT,
-    "char": CanonicalType.CHAR,
-    "date": CanonicalType.DATE,
-    "time": CanonicalType.TIME,
-    "datetime": CanonicalType.TIMESTAMP,  # no zone: rendered as stored
-    "timestamp": CanonicalType.TIMESTAMPTZ,  # stored as UTC, read in a UTC session
-    "binary": CanonicalType.BINARY,
-    "varbinary": CanonicalType.BINARY,
-    "tinyblob": CanonicalType.BINARY,
-    "blob": CanonicalType.BINARY,
-    "mediumblob": CanonicalType.BINARY,
-    "longblob": CanonicalType.BINARY,
-    "json": CanonicalType.JSON,
-}
-
 TEXT_TYPES = {CanonicalType.TEXT, CanonicalType.CHAR}
-PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {CanonicalType.JSON, CanonicalType.UUID}
+PUSHDOWN_TYPES = {t for t in CanonicalType if t.hashed} - {
+    CanonicalType.JSON,
+    CanonicalType.XML,  # no MySQL type maps to it
+    CanonicalType.UUID,
+}
 
 NULL_DIGEST = column_digest(None)
 
@@ -217,23 +197,21 @@ def _ssl_args(sslmode: str, sslrootcert: str | None) -> dict[str, Any]:
             return {"ssl_disabled": True}
         case "require" | "prefer":
             return {"ssl": {"check_hostname": False, "verify_mode": ssl.CERT_NONE}}
-        case "verify-ca":
-            return {
-                "ssl": {
-                    "ca": sslrootcert,
-                    "check_hostname": False,
-                    "verify_mode": ssl.CERT_REQUIRED,
-                }
-            }
-        case "verify-full":
-            return {
-                "ssl": {"ca": sslrootcert, "check_hostname": True, "verify_mode": ssl.CERT_REQUIRED}
-            }
+        case "verify-ca" | "verify-full":
+            # A context, not PyMySQL's dict: given a dict with no "ca", PyMySQL turns
+            # certificate and host name checks off. With no sslrootcert this context
+            # trusts the system CAs, as Oracle and SQL Server do.
+            ctx = ssl.create_default_context(cafile=sslrootcert)
+            ctx.check_hostname = sslmode == "verify-full"
+            return {"ssl": ctx}
     raise ConfigError(f"sslmode {sslmode!r} is not one of disable, require, verify-ca, verify-full")
 
 
 class MySQLAdapter(Adapter):
     engine = "mysql"
+    product = "MySQL"
+    minimum_version = (8, 0)
+    minimum_shown = "MySQL 8.0 (Aurora MySQL 3)"
     supports_row_filters = True
     supports_sampling = True
     # Each connection opens its own snapshot: workers reconcile live tables, a baseline
@@ -256,8 +234,10 @@ class MySQLAdapter(Adapter):
         sslmode: str = "verify-full",
         sslrootcert: str | None = None,
         statement_timeout_ms: int = 0,
+        lock_timeout_ms: int = 0,
         read_only: bool = True,
         rows_per_second: int = 0,
+        pause_ms: int = 0,
         connect_timeout: int = 10,
     ) -> None:
         self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
@@ -281,17 +261,42 @@ class MySQLAdapter(Adapter):
             raise ConfigError(
                 f"cannot connect to MySQL at {host}:{port}/{database}: {exc}"
             ) from exc
+        self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
-        self.rows_per_second = rows_per_second
+        self.pacer = Pacer(rows_per_second, pause_ms)
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT VERSION()")
+            version = cur.fetchone()[0]
+        if "mariadb" in version.lower():
+            # different session variables (max_statement_time) and functions; never tested
+            self.close()
+            raise ConfigError(f"MariaDB ({version}) is not supported yet; only MySQL 8.0 and "
+                              "later, including Aurora MySQL 3")  # fmt: skip
+        self.require_version(version)
+        protect = {}
+        if lock_timeout_ms:  # whole seconds, at least one; it covers metadata locks
+            protect["lock_wait_timeout"] = math.ceil(lock_timeout_ms / 1000)
+        self.lock_timeout_ms = protect.get("lock_wait_timeout", 0) * 1000
+        if rows_per_second:  # one thread: the cap is per connection
+            protect["innodb_parallel_read_threads"] = 1
         with self.conn.cursor() as cur:
             for name, value in SESSION.items():
                 cur.execute(f"SET SESSION {name} = %s", (value,))
             cur.execute("SET SESSION max_execution_time = %s", (int(statement_timeout_ms),))
+            for name, value in protect.items():
+                cur.execute(f"SET SESSION {name} = %s", (value,))
             if read_only:
                 cur.execute("SET SESSION TRANSACTION READ ONLY")
-            cur.execute("SELECT VERSION()")
-            self.version = cur.fetchone()[0]
-        settings = dict(SESSION, max_execution_time=str(statement_timeout_ms))
+        settings = dict(
+            SESSION,
+            max_execution_time=str(statement_timeout_ms),
+            lock_wait_timeout="server default",
+        )
+        settings.update(
+            {k: str(v) for k, v in protect.items()},
+            rows_per_second=str(rows_per_second),
+            pause_ms=str(pause_ms),
+        )
         if read_only:
             settings["transaction_read_only"] = "ON"
         self._settings = settings
@@ -433,29 +438,52 @@ class MySQLAdapter(Adapter):
 
     def describe(self, table: TableRef) -> TableSchema:
         rows = self._query(
-            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.COLUMNS "
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE "
+            "FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION",
             (table.schema, table.name),
         )
         if not rows:
             raise ConfigError(f"table {table} not found")
         cols = []
-        for name, data_type, column_type in rows:
+        for name, data_type, column_type, nullable in rows:
             native = str(column_type).lower()
-            ctype = TYPE_MAP.get(str(data_type).lower(), CanonicalType.UNSUPPORTED)
-            if native.startswith("tinyint(1)"):
-                ctype = CanonicalType.BOOLEAN  # MySQL's BOOLEAN is TINYINT(1)
-            cols.append(Column(name, native, ctype, fixed_width=data_type == "char"))
-        pk = [
-            r[0]
-            for r in self._query(
-                "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
-                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND CONSTRAINT_NAME = 'PRIMARY' "
-                "ORDER BY ORDINAL_POSITION",
-                (table.schema, table.name),
-            )
-        ]
-        return TableSchema(table, cols, pk)
+            ctype = DEFAULT_TYPE_MAP.canonical(self.engine, native)
+            cols.append(Column(name, native, ctype, fixed_width=data_type == "char",
+                               nullable=nullable == "YES"))  # fmt: skip
+        # each index's key parts in order; an expression (functional key part) has no
+        # column name, and a prefix length is ignored
+        found: dict[str, tuple[bool, str, list[str | None]]] = {}
+        for name, non_unique, kind, column in self._query(
+            "SELECT INDEX_NAME, NON_UNIQUE, INDEX_TYPE, COLUMN_NAME "
+            "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+            "ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+            (table.schema, table.name),
+        ):
+            found.setdefault(name, (not int(non_unique), str(kind).upper(), []))[2].append(column)
+        pk: list[str] = []
+        indexes = []
+        for name, (unique, kind, keys) in found.items():
+            if name == "PRIMARY":
+                pk = [str(k) for k in keys]
+            else:
+                shape = "expression" if None in keys else "btree" if kind == "BTREE" else "other"
+                indexes.append(Index(name, plain_prefix(keys), unique, shape))
+        fks: dict[str, list[tuple[str, str, str, str]]] = {}
+        for name, column, schema, ref, ref_column in self._query(
+            "SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, "
+            "REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND REFERENCED_TABLE_NAME IS NOT NULL "
+            "ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+            (table.schema, table.name),
+        ):
+            fks.setdefault(name, []).append((column, schema, ref, ref_column))
+        foreign_keys = [
+            ForeignKey(n, tuple(p[0] for p in ps), TableRef(ps[0][1], ps[0][2]),
+                       tuple(p[3] for p in ps))
+            for n, ps in fks.items()
+        ]  # fmt: skip
+        return TableSchema(table, cols, pk, indexes, foreign_keys)
 
     def _ident(self, table: TableRef) -> str:
         return f"{quote(table.schema)}.{quote(table.name)}"
@@ -493,7 +521,8 @@ class MySQLAdapter(Adapter):
             f"FROM ({self._hash_query(plan, ascii_rows)}) h{sample} GROUP BY b"
         )
         out = {int(b): BucketAggregate(int(c), int(t)) for b, c, t in self._query(q)}
-        if ascii_rows:
+        if ascii_rows:  # another read of the table (spec 9.15)
+            self.pacer.again()
             self._bucket_aggregates_fallback(plan, where=f"NOT ({ascii_rows})", into=out)
         return out
 
@@ -501,13 +530,10 @@ class MySQLAdapter(Adapter):
         cols = ", ".join(quote(c) for c, _ in plan.columns)
         where = all_of(where, _excluding(plan.filter))
         q = f"SELECT {cols} FROM {self._ident(plan.table)}" + (f" WHERE {where}" if where else "")
-        interval = 1.0 / self.rows_per_second if self.rows_per_second else 0.0
         types = [t for _, t in plan.columns]
         with self.conn.cursor(pymysql.cursors.SSCursor) as cur:
             cur.execute(q)
-            for row in cur:
-                if interval:
-                    time.sleep(interval)
+            for row in self.pacer.each(cur):
                 yield [prepare(v, t, plan.precision) for v, t in zip(row, types, strict=True)]
 
     def _bucket_aggregates_fallback(
@@ -519,14 +545,16 @@ class MySQLAdapter(Adapter):
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = into if into is not None else {}
         sample = None if plan.sample is None else set(plan.sample)
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            b = _value64(kh) % plan.buckets
-            if sample is not None and b not in sample:
-                continue
-            agg = out.setdefault(b, BucketAggregate(0, 0))
-            agg.count += 1
-            agg.total += _value64(rh)
+        # closed at once when a value cannot be hashed, so the connection reads on
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, sample)
+                if placed is None:
+                    continue
+                b, rh = placed
+                agg = out.setdefault(b, BucketAggregate(0, 0))
+                agg.count += 1
+                agg.total += _value64(rh)
         return out
 
     def _fallback_row_hashes(
@@ -534,11 +562,11 @@ class MySQLAdapter(Adapter):
     ) -> list[tuple[tuple[Any, ...], str]]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         out = []
-        for row in self._stream(plan, where):
-            rh, kh = hasher.hash_row(row)
-            if _value64(kh) % plan.buckets in wanted:
-                rendered = hasher.rendered(row)
-                out.append((tuple(rendered[i] for i in plan.key_positions), rh))
+        with contextlib.closing(self._stream(plan, where)) as rows:
+            for row in rows:
+                placed = hasher.placed(row, plan.buckets, wanted)
+                if placed is not None:
+                    out.append((hasher.key_values(row), placed[1]))
         return out
 
     def row_hashes(
@@ -557,7 +585,8 @@ class MySQLAdapter(Adapter):
             f"WHERE MOD({unsigned64_sql('kh')}, {int(plan.buckets)}) IN ({marks})"
         )
         rows = [(tuple(r[2:]), r[0]) for r in self._query(q)]
-        if ascii_rows:
+        if ascii_rows:  # another read of the table (spec 9.15)
+            self.pacer.again()
             rows += self._fallback_row_hashes(plan, wanted, where=f"NOT ({ascii_rows})")
         yield from rows
 

@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from liftproof.adapters.base import HashPlan, TableRef
+from liftproof.adapters.base import ForeignKey, HashPlan, Index, TableRef
 from liftproof.adapters.sqlserver import (
     SQLServerAdapter,
     _pushable_sql,
@@ -22,6 +22,8 @@ from liftproof.adapters.sqlserver import (
 from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import render
 from liftproof.errors import ConfigError
+from liftproof.reconcile.baseline import Baseline, take_baseline
+from tests.conftest import type_map_alternatives
 
 pytestmark = pytest.mark.sqlserver
 
@@ -113,6 +115,10 @@ COLUMNS = [
 ]
 
 
+# the fixture column of each native type the type map has alternatives for
+ALTERNATIVES = {"bit": "flag"}
+
+
 @pytest.fixture
 def loaded(make_sqlserver_db, sqlserver_adapter_for):
     db, cur = make_sqlserver_db()
@@ -144,6 +150,22 @@ def test_pushdown_matches_reference(loaded, precision, keyed):
     rows_ref = sorted(a.row_hashes(plan, set(range(3))))
     assert rows_push == rows_ref
     assert len(rows_push) == 5
+
+
+@pytest.mark.parametrize(("column", "ctype"), type_map_alternatives("sqlserver", ALTERNATIVES))
+@pytest.mark.parametrize("precision", [0, 3, 6])
+@pytest.mark.parametrize("keyed", [True, False])
+def test_type_map_alternatives_match_reference(loaded, column, ctype, precision, keyed):
+    """A column compared as an alternative a project chose (database.type_map): bit as
+    integer, and as decimal against an exact number."""
+    a = loaded
+    columns = [(n, ctype if n == column else t) for n, t in COLUMNS]
+    plan = HashPlan(table(), columns, ["id"] if keyed else [], 3, precision)
+    assert a._pushdown(plan)
+    assert a.bucket_aggregates(plan) == a._bucket_aggregates_fallback(plan)
+    rows_push = sorted(a.row_hashes(plan, set(range(3))))
+    a._pushdown = lambda p: False
+    assert rows_push == sorted(a.row_hashes(plan, set(range(3))))
 
 
 def test_only_ascii_rows_are_rendered_in_the_database(loaded):
@@ -198,14 +220,79 @@ def test_describe_maps_types(loaded):
     assert natives["code"] == "char(6)" and natives["ncode"] == "nchar(4)"
 
 
+def test_describe_reads_nullability_keys_and_indexes(make_sqlserver_db, sqlserver_adapter_for):
+    db, cur = make_sqlserver_db()
+    cur.execute("CREATE TABLE dbo.parent (id int PRIMARY KEY, code varchar(20), "
+                "CONSTRAINT parent_uq UNIQUE (code, id))")  # fmt: skip
+    cur.execute(
+        "CREATE TABLE dbo.child (amount decimal(9,2), code nvarchar(20), c varchar(100) NOT NULL, "
+        "d varchar(100), e int, pid int, pcode varchar(20), "
+        "CONSTRAINT child_pk PRIMARY KEY (code, amount), CONSTRAINT child_uq UNIQUE (c), "
+        "CONSTRAINT fk2 FOREIGN KEY (pcode, pid) REFERENCES dbo.parent (code, id))"
+    )
+    for ddl in ("CREATE INDEX ix_c ON dbo.child (c, e) INCLUDE (d)",
+                "CREATE UNIQUE INDEX ux_d ON dbo.child (d) WHERE d IS NOT NULL",
+                "CREATE NONCLUSTERED COLUMNSTORE INDEX ncc ON dbo.child (e, pid)",
+                "CREATE INDEX ix_off ON dbo.child (e)",
+                "ALTER INDEX ix_off ON dbo.child DISABLE"):  # fmt: skip
+        cur.execute(ddl)
+    s = sqlserver_adapter_for(db).describe(TableRef("dbo", "child"))
+    assert s.primary_key == ["code", "amount"]  # key order
+    assert [c.name for c in s.columns if not c.nullable] == ["amount", "code", "c"]
+    assert sorted(s.indexes, key=lambda i: i.name) == [
+        Index("child_uq", ("c",), True),
+        Index("ix_c", ("c", "e"), False),  # included columns are not keys
+        Index("ncc", ("e", "pid"), False, "other"),
+        Index("ux_d", ("d",), True, "partial"),  # filtered
+    ]  # not a disabled one
+    assert s.foreign_keys == [
+        ForeignKey("fk2", ("pcode", "pid"), TableRef("dbo", "parent"), ("code", "id"))
+    ]
+
+
 def test_type_rules():
-    assert canonical_type("xml") is T.UNSUPPORTED
+    assert canonical_type("xml") is T.XML
     assert canonical_type("geography") is T.UNSUPPORTED
     assert canonical_type("sql_variant") is T.UNSUPPORTED
     assert canonical_type("timestamp") is T.BINARY  # rowversion
     assert canonical_type("NVARCHAR") is T.TEXT
     assert native_name("varbinary", -1, 0, 0) == "varbinary(max)"
     assert native_name("time", 5, 16, 7) == "time(7)"
+
+
+XML_ROWS = [
+    (1, "<a b='2' a=\"1\">\n  <x></x>\n  <y>t</y>\n</a>", '<a a="1" b="2"><x></x><y>t</y></a>'),
+    (2, "<a/><b/>caf\u00e9", "<a></a><b></b>caf\u00e9"),
+    (3, None, None),
+    (4, "<?xml version='1.0'?><a><!-- c --><![CDATA[x < y]]></a>", "<a>x &lt; y</a>"),
+    (5, '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>',
+     '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>'),
+]  # fmt: skip
+
+
+def test_xml_hashes_like_its_canonical_text(make_sqlserver_db, sqlserver_adapter_for):
+    """SQL Server rewrites xml as it stores it (no declaration, <x/>, whitespace only
+    text dropped, a preserved space as a character reference); it still hashes as the
+    canonical text does."""
+    db, cur = make_sqlserver_db()
+    cur.execute("CREATE TABLE docs (id int PRIMARY KEY, doc xml, canon nvarchar(max))")
+    for row in XML_ROWS:
+        cur.execute("INSERT INTO docs VALUES (%s, %s, %s)", row)
+    a = sqlserver_adapter_for(db)
+    docs = TableRef("dbo", "docs")
+    assert {c.name: c.canonical for c in a.describe(docs).columns} == {
+        "id": T.INTEGER, "doc": T.XML, "canon": T.TEXT,
+    }  # fmt: skip
+
+    def plan(col, **kw):
+        return HashPlan(docs, [(col, T.XML), ("id", T.INTEGER)], ["id"], 3, **kw)
+
+    assert a.bucket_aggregates(plan("doc")) == a.bucket_aggregates(plan("canon"))
+    assert sorted(a.row_hashes(plan("doc"), {0, 1, 2})) == sorted(
+        a.row_hashes(plan("canon"), {0, 1, 2})
+    )
+    [stored] = a.fetch_rows(plan("doc"), [("1",)]).values()
+    assert stored[0] == '<a b="2" a="1"><x/><y>t</y></a>'  # as SQL Server wrote it
 
 
 def test_tls_settings():
@@ -247,6 +334,27 @@ def test_snapshot_isolation(loaded, make_sqlserver_db, sqlserver_adapter_for):
     assert snap["type"] == "none" and snap["consistent"] is False
     assert not a.snapshot_available()
     a.end_snapshot()
+
+
+def test_a_baseline_per_table_without_snapshot_isolation(tmp_path, make_sqlserver_db,
+                                                         sqlserver_adapter_for):  # fmt: skip
+    """Per table there is no snapshot to open either: the tables are read one at a time,
+    not by several locking readers, and the baseline says no point was held."""
+    db, cur = make_sqlserver_db("nosnap", snapshot=False)
+    for t in ("a", "b", "c"):
+        cur.execute(f"CREATE TABLE dbo.{t} (id int PRIMARY KEY, v nvarchar(10))")
+        cur.execute(f"INSERT INTO dbo.{t} VALUES (1, N'x'), (2, N'y')")
+    messages: list[str] = []
+    manifest = tmp_path / "b" / "manifest.json"
+    take_baseline(sqlserver_adapter_for(db), manifest, baseline_id="b1", schemas=["dbo"],
+                  tables=None, ignore=[], business_keys={}, rows_per_bucket=10, precision=6,
+                  workers=3, progress=messages.append, snapshot="per_table")  # fmt: skip
+    b = Baseline.load(manifest)
+    assert any("without a snapshot; tables are baselined one at a time" in m for m in messages)
+    assert {t.snapshot for t in b.tables.values()} == {"none"}
+    c = b.consistency()
+    assert (c["held"], c["snapshot"]) == (False, "none")
+    assert "snapshot isolation is off" in c["summary"]
 
 
 def test_verify_read_only(make_sqlserver_db, sqlserver_adapter_for):

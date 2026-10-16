@@ -11,10 +11,11 @@ from decimal import Decimal
 
 import pytest
 
-from liftproof.adapters.base import HashPlan, TableRef
+from liftproof.adapters.base import ForeignKey, HashPlan, Index, TableRef
 from liftproof.adapters.oracle import OracleAdapter, _pushable_sql, canonical_type
 from liftproof.canonical import CanonicalType as T
 from liftproof.canonical import render
+from tests.conftest import type_map_alternatives
 
 pytestmark = pytest.mark.oracle
 
@@ -153,6 +154,10 @@ COLUMNS = [
 ]
 
 
+# the fixture column of each native type the type map has alternatives for
+ALTERNATIVES = {"number(p)": "I2", "date": "DAY"}
+
+
 def _upper(columns):
     return [(n.upper(), t) for n, t in columns]
 
@@ -191,6 +196,37 @@ def test_pushdown_matches_reference(loaded, precision, keyed):
     rows_ref = sorted(a.row_hashes(plan, set(range(3))))
     assert rows_push == rows_ref
     assert len(rows_push) == 6
+
+
+@pytest.mark.parametrize(("column", "ctype"), type_map_alternatives("oracle", ALTERNATIVES))
+@pytest.mark.parametrize("precision", [0, 3, 6])
+@pytest.mark.parametrize("keyed", [True, False])
+def test_type_map_alternatives_match_reference(loaded, column, ctype, precision, keyed):
+    """A column compared as an alternative a project chose (database.type_map): NUMBER(5)
+    as boolean; DATE as date, rows at midnight and rows with a time of day."""
+    a, schema = loaded
+    columns = [(n, ctype if n == column else t) for n, t in _upper(COLUMNS)]
+    plan = HashPlan(TableRef(schema, "EVERYTHING"), columns, ["ID"] if keyed else [], 3,
+                    precision)  # fmt: skip
+    assert a._pushdown(plan)
+    assert a.bucket_aggregates(plan) == a._bucket_aggregates_fallback(plan)
+    rows_push = sorted(a.row_hashes(plan, set(range(3))))
+    a._pushdown = lambda p: False
+    assert rows_push == sorted(a.row_hashes(plan, set(range(3))))
+
+
+def test_a_date_compared_as_date_differs_by_its_time_of_day(loaded):
+    a, schema = loaded
+    plan = HashPlan(TableRef(schema, "EVERYTHING"), [("ID", T.INTEGER), ("DAY", T.DATE)],
+                    ["ID"], 1)  # fmt: skip
+    q = f'SELECT "ID", {a._render(plan, "DAY", T.DATE)} FROM "{schema}"."EVERYTHING" ORDER BY 1'
+    assert {int(i): d for i, d in a._query(q)} == {
+        1: "2026-01-31T13:14:15", 2: "1999-12-31", 3: None, 4: "2026-02-28T23:59:59",
+        5: "1901-01-01", 6: "2000-02-29T12:00:00",
+    }  # fmt: skip
+    rows = a.fetch_rows(plan, [("1",), ("2",)])
+    assert render(rows[("1",)][1], T.DATE) == "2026-01-31T13:14:15"
+    assert render(rows[("2",)][1], T.DATE) == "1999-12-31"
 
 
 def test_rows_oracle_cannot_render_take_the_reference_path(loaded):
@@ -257,6 +293,51 @@ def test_lob_and_json_columns_hash_like_their_short_forms(make_oracle_db, oracle
     assert agg("J", T.JSON) == agg("JT", T.JSON)
 
 
+def test_xmltype_hashes_like_its_canonical_text(make_oracle_db, oracle_adapter_for):
+    """An XMLTYPE value is read through XMLSERIALIZE, unindented, whatever its storage
+    pretty prints; it hashes as the canonical text does, pretty printed or not."""
+    schema, cur = make_oracle_db()
+    cur.execute(
+        "CREATE TABLE docs (id NUMBER(9) PRIMARY KEY, doc XMLTYPE, pretty XMLTYPE, "
+        "canon VARCHAR2(400))"
+    )
+    cur.execute("SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'")
+    # a single-byte database (charset.yml) cannot hold the combining accent
+    e = "e\u0301" if cur.fetchone()[0] == "AL32UTF8" else "\u00e9"
+    cur.executemany(
+        "INSERT INTO docs VALUES (:i, CASE WHEN :d IS NULL THEN NULL ELSE XMLTYPE(:d) END, "
+        "CASE WHEN :p IS NULL THEN NULL ELSE XMLTYPE(:p) END, :c)",
+        [
+            {"i": 1, "d": '<a b="2" a="1"><x/><y>t</y></a>',
+             "p": "<a a='1' b='2'>\n  <x></x>\n  <y>t</y>\n</a>\n",
+             "c": '<a a="1" b="2"><x></x><y>t</y></a>'},
+            {"i": 2, "d": None, "p": None, "c": None},
+            {"i": 3, "d": "<?xml version='1.0'?><a><!-- c --><b>caf\u00e9</b></a>",
+             "p": f"<a>\n  <b>caf{e}</b>\n</a>", "c": "<a><b>caf\u00e9</b></a>"},
+            {"i": 4, "d": '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>',
+             "p": '<p:a xmlns:p="urn:p">\n<p:b xml:space="preserve">  </p:b></p:a>',
+             "c": '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>'},
+        ],
+    )  # fmt: skip
+    a = oracle_adapter_for()
+    docs = TableRef(schema, "DOCS")
+    described = a.describe(docs)
+    assert {c.name: c.canonical for c in described.columns} == {
+        "ID": T.INTEGER, "DOC": T.XML, "PRETTY": T.XML, "CANON": T.TEXT,
+    }  # fmt: skip
+    assert {c.name: c.native_type for c in described.columns}["DOC"] == "XMLTYPE"
+
+    def plan(col):
+        return HashPlan(docs, [(col, T.XML), ("ID", T.INTEGER)], ["ID"], 2)
+
+    aggregates = a.bucket_aggregates(plan("DOC"))
+    assert aggregates == a.bucket_aggregates(plan("PRETTY")) == a.bucket_aggregates(plan("CANON"))
+    assert sum(b.count for b in aggregates.values()) == 4
+    rows = a.fetch_rows(plan("PRETTY"), [("1",), ("2",)])
+    assert rows[("1",)][0] == '<a a="1" b="2"><x/><y>t</y></a>'  # serialised unindented
+    assert rows[("2",)][0] is None
+
+
 def test_describe_maps_types(loaded):
     a, schema = loaded
     s = a.describe(TableRef(schema, "EVERYTHING"))
@@ -268,6 +349,62 @@ def test_describe_maps_types(loaded):
     assert natives["ANYNUM"] == "NUMBER" and natives["CODE"] == "CHAR(6)"
 
 
+def test_describe_reads_nullability_keys_and_indexes(make_oracle_db, oracle_adapter_for):
+    schema, cur = make_oracle_db()
+    cur.execute("CREATE TABLE parent (id NUMBER(10) PRIMARY KEY, code VARCHAR2(20), "
+                "CONSTRAINT parent_uq UNIQUE (code, id))")  # fmt: skip
+    cur.execute(
+        "CREATE TABLE child (b NUMBER(10), a NUMBER(10), c VARCHAR2(100) NOT NULL, "
+        "d VARCHAR2(100), pid NUMBER(10), pcode VARCHAR2(20), "
+        "CONSTRAINT child_pk PRIMARY KEY (a, b), CONSTRAINT child_uq UNIQUE (b, a, c), "
+        "CONSTRAINT child_du UNIQUE (d) DEFERRABLE INITIALLY DEFERRED, "
+        "CONSTRAINT fk2 FOREIGN KEY (pcode, pid) REFERENCES parent (code, id))"
+    )
+    for ddl in ("CREATE INDEX ix_desc ON child (a DESC, c)",
+                "CREATE INDEX ix_fn ON child (lower(c))",
+                "CREATE BITMAP INDEX ix_bm ON child (pcode)",
+                "CREATE INDEX ix_rev ON child (pid) REVERSE",
+                "CREATE INDEX ix_gone ON child (pid, c)",
+                "ALTER INDEX ix_gone UNUSABLE"):  # fmt: skip
+        cur.execute(ddl)
+    s = oracle_adapter_for().describe(TableRef(schema, "CHILD"))
+    assert s.primary_key == ["A", "B"]
+    assert [c.name for c in s.columns if not c.nullable] == ["B", "A", "C"]
+    assert sorted(s.indexes, key=lambda i: i.name) == [
+        Index("CHILD_DU", ("D",), False),  # its index; the constraint below is the key
+        Index("CHILD_DU", ("D",), True),
+        Index("CHILD_UQ", ("B", "A", "C"), True),
+        Index("IX_BM", ("PCODE",), False, "other"),
+        Index("IX_DESC", ("A", "C"), False),  # a descending column is still a column
+        Index("IX_FN", (), False, "expression"),
+        Index("IX_REV", ("PID",), False),
+    ]  # not the primary key's own index, nor an unusable one
+    assert s.foreign_keys == [
+        ForeignKey("FK2", ("PCODE", "PID"), TableRef(schema, "PARENT"), ("CODE", "ID"))
+    ]
+
+
+def test_describe_leaves_out_indexes_with_unusable_partitions(make_oracle_db, oracle_adapter_for):
+    """A partitioned index keeps its status per partition (ALL_INDEXES says N/A), or per
+    subpartition when the table is composite partitioned."""
+    schema, cur = make_oracle_db()
+    for ddl in (
+        "CREATE TABLE part (id NUMBER(10), at DATE NOT NULL, v NUMBER(10), w NUMBER(10), "
+        "CONSTRAINT part_pk PRIMARY KEY (id, at)) PARTITION BY RANGE (at) "
+        "SUBPARTITION BY HASH (id) SUBPARTITIONS 2 "
+        "(PARTITION p1 VALUES LESS THAN (DATE '2026-01-01'), "
+        "PARTITION p2 VALUES LESS THAN (MAXVALUE))",
+        "CREATE INDEX part_v ON part (v) LOCAL",
+        "CREATE INDEX part_w ON part (w) GLOBAL PARTITION BY HASH (w) (PARTITION w1, PARTITION w2)",
+        "CREATE INDEX part_vw ON part (v, w) LOCAL",
+        "ALTER INDEX part_v UNUSABLE",  # each subpartition
+        "ALTER INDEX part_w MODIFY PARTITION w2 UNUSABLE",  # one partition is enough
+    ):
+        cur.execute(ddl)
+    s = oracle_adapter_for().describe(TableRef(schema, "PART"))
+    assert s.indexes == [Index("PART_VW", ("V", "W"), False)]
+
+
 def test_canonical_type_rules():
     assert canonical_type("NUMBER", None, 0) is T.INTEGER  # INTEGER
     assert canonical_type("NUMBER", 5, -2) is T.INTEGER
@@ -276,6 +413,7 @@ def test_canonical_type_rules():
     assert canonical_type("TIMESTAMP(3) WITH LOCAL TIME ZONE", None, 3) is T.TIMESTAMPTZ
     assert canonical_type("INTERVAL DAY(2) TO SECOND(6)", None, None) is T.UNSUPPORTED
     assert canonical_type("LONG", None, None) is T.UNSUPPORTED
+    assert canonical_type("XMLTYPE", None, None) is T.XML
 
 
 def test_float_stats_counts_nan_and_infinity(loaded):

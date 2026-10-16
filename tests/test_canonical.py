@@ -1,19 +1,26 @@
 """Canonical v1.0 rules, one test per rule (Technical Spec 19).
 
 The golden vectors pin the wire format: if any of them changes, baselines taken by an
-earlier build can no longer be compared, and CANONICAL_VERSION must be bumped.
+earlier build can no longer be compared, and CANONICAL_VERSION must be bumped. A rule that
+only gives a rendering to values that had none adds vectors and raises CANONICAL_REVISION.
 """
 
 import datetime as dt
 import itertools
+import json
+import pyexpat
+import time
 import uuid
 from decimal import Decimal
 
 import pytest
 
 from liftproof.canonical import (
+    CANONICAL_REVISION,
     GROUP_SIZE,
     MOD64,
+    RowHasher,
+    Verbatim,
     aggregate,
     bucket_of,
     column_digest,
@@ -27,6 +34,9 @@ from liftproof.canonical import (
     CanonicalType as T,
 )
 from liftproof.canonical.render import RenderError
+from liftproof.errors import ConfigError
+from liftproof.reconcile.baseline import Baseline, BaselineTable, hashed_infinity_as_null
+from liftproof.reconcile.plan import NOT_IN_BASELINE
 
 
 # -- rendering (9.4) ---------------------------------------------------------------
@@ -41,6 +51,8 @@ from liftproof.canonical.render import RenderError
         (Decimal("1E+3"), "1000"),
         (Decimal("12345678901234567890.123"), "12345678901234567890.123"),
         (Decimal("NaN"), "NaN"),
+        (Decimal("Infinity"), "Infinity"),
+        (Decimal("-Infinity"), "-Infinity"),
         (7, "7"),
     ],
 )
@@ -82,6 +94,17 @@ def test_timestamps():
         render(aware, T.TIMESTAMP)
 
 
+@pytest.mark.parametrize("ctype", [T.DATE, T.TIMESTAMP, T.TIMESTAMPTZ])
+@pytest.mark.parametrize("precision", [0, 3, 6])
+def test_postgres_infinity_dates(ctype, precision):
+    # as PostgreSQL prints them, with no fraction: never NULL, never each other, never a
+    # finite date (which starts with a digit)
+    for word in ("infinity", "-infinity"):
+        assert render(Verbatim(word), ctype, precision=precision) == word
+    digests = {column_digest(v) for v in ("infinity", "-infinity", None, "9999-12-31")}
+    assert len(digests) == 4
+
+
 def test_binary_uuid_json():
     assert render(b"\x00\xff", T.BINARY) == "00ff"
     u = "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"
@@ -91,10 +114,130 @@ def test_binary_uuid_json():
     assert render({"a": 1}, T.JSON) == '{"a":1}'
 
 
+XSI = 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+
+
+def _typed_items(*uris: str) -> str:
+    return f"<r {XSI}>" + "".join(f'<i xmlns:q1="{u}" xsi:type="q1:T"/>' for u in uris) + "</r>"
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        ('<?xml version="1.0"?>\n<a>\n  <b>t</b>\n</a>\n', "<a><b>t</b></a>"),
+        ("<a b='2' a=\"1\"/>", '<a a="1" b="2"></a>'),
+        ("<a><x/><y /></a>", "<a><x></x><y></y></a>"),
+        ('<p:a xmlns:q="v" xmlns:p="u"><p:b xmlns:p="u"/></p:a>', '<p:a xmlns:p="u"><p:b/></p:a>'),
+        # a declaration is in scope to the end of its element, not for its later siblings
+        ('<r xmlns:p="u"><a xmlns:q="u"/><p:b/></r>', '<r xmlns:p="u"><a/><p:b/></r>'),
+        ('<r><a xmlns:q="u"/><p:b xmlns:p="u"/></r>', '<r><a/><p:b xmlns:p="u"/></r>'),
+        ("<a><![CDATA[<x & y>]]></a>", "<a>&lt;x &amp; y&gt;</a>"),
+        ("<a>&#x41;&#66;</a>", "<a>AB</a>"),
+        ("<a><!-- generated --><b/></a>", "<a><b/></a>"),
+        ("<a>cafe\u0301</a>", "<a>caf\u00e9</a>"),
+        ('<a t="cafe\u0301"/>', '<a t="caf\u00e9"/>'),
+        ("<!DOCTYPE a><?pi x?><a/>", "<?pi x?><a/>"),
+        ('<!DOCTYPE a [<!ENTITY e "hi">]><a>&e;</a>', "<a>hi</a>"),
+        ("<a>x\r\ny</a>", "<a>x\ny</a>"),
+        ("\ufeff<?xml version='1.0' encoding='UTF-16'?><a/>", "<a/>"),
+        (b"<a>caf\xc3\xa9</a>", "<a>caf\u00e9</a>"),
+    ],
+)
+def test_equivalent_xml_renders_alike(a, b):
+    assert render(a, T.XML) == render(b, T.XML)
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        ("<a> x </a>", "<a>x</a>"),  # whitespace inside text is kept
+        ('<a b="1"/>', '<a b="2"/>'),
+        ("<a><b/><c/></a>", "<a><c/><b/></a>"),
+        ('<a xmlns="urn:one"/>', '<a xmlns="urn:two"/>'),
+        ('<a xml:space="preserve"> <b/> </a>', '<a xml:space="preserve"><b/></a>'),
+        ("<a>x<b/>y</a>", "<a>xy<b/></a>"),
+        # an xsi:type prefix bound to another namespace (C14N drops a declaration used
+        # only in an attribute value unless told the attribute holds a QName)
+        (
+            f'<a {XSI} xmlns:t="urn:one" xsi:type="t:T"/>',
+            f'<a {XSI} xmlns:t="urn:two" xsi:type="t:T"/>',
+        ),
+        # each item binds its own q1, as .NET's XmlSerializer writes it
+        (_typed_items("urn:car", "urn:boat"), _typed_items("urn:car", "urn:jet")),
+    ],
+)
+def test_xml_differences_survive(a, b):
+    assert render(a, T.XML) != render(b, T.XML)
+
+
+def test_xml_fragments_and_empty_values():
+    # PostgreSQL and SQL Server store content: several elements, text at the top level
+    assert render("<a/><b/>", T.XML) == "<a></a><b></b>"
+    assert render("x<a/>y", T.XML) == "x<a></a>y"
+    assert render(" <a/>\n ", T.XML) == "<a></a>"
+    digests = {column_digest(render(v, T.XML)) for v in ("", "<a/>", None)}
+    assert len(digests) == 3
+    # NFC per text run: a combining character after '>' never joins the markup
+    assert render("<a/>\u0338", T.XML) == "<a></a>\u0338"
+    assert render("<a>\u0338</a>", T.XML) == "<a>\u0338</a>"
+
+
+@pytest.mark.parametrize(
+    "value, reason",
+    [
+        ("<a>secret-value", "not well-formed XML: as content, mismatched tag"),
+        ("<a>&nbsp;</a>", "undefined entity"),
+        ("<x:a>secret-value</x:a>", "unbound prefix"),
+        (f'<a {XSI} xsi:type="zz:secret_value"/>', "an xsi:type value names an undeclared"),
+        (f'<r {XSI}><a xmlns:zz="u"/><b xsi:type="zz:secret_value"/></r>', "an undeclared"),
+        (b"\xffsecret-value", r"XML is not UTF-8 \(byte 0\)"),
+    ],
+)
+def test_xml_that_cannot_be_canonicalised_is_refused_without_its_value(value, reason):
+    with pytest.raises(RenderError, match=reason) as caught:
+        render(value, T.XML)
+    assert "secret" not in str(caught.value)
+    assert caught.value.column is None
+
+
+def test_xml_parser_never_reads_files_or_expands_without_bound(tmp_path):
+    assert pyexpat.version_info >= (2, 4, 1)  # entity amplification limits
+    marker = tmp_path / "marker.txt"
+    marker.write_text("MARKER-7f3a")
+    for doc in (
+        f'<!DOCTYPE a [<!ENTITY x SYSTEM "file://{marker}">]><a>&x;</a>',
+        f'<!DOCTYPE a SYSTEM "file://{marker}"><a>&x;</a>',
+    ):
+        with pytest.raises(RenderError) as caught:
+            render(doc, T.XML)
+        assert "MARKER" not in str(caught.value)
+    assert render(f'<!DOCTYPE a SYSTEM "file://{marker}"><a/>', T.XML) == "<a></a>"
+    lol = "".join(f'<!ENTITY l{i} "{(f"&l{i - 1};" if i else "lol") * 10}">' for i in range(10))
+    started = time.perf_counter()
+    with pytest.raises(RenderError, match="amplification"):
+        render(f"<!DOCTYPE a [{lol}]><a>&l9;</a>", T.XML)
+    assert time.perf_counter() - started < 1
+
+
+def test_row_hasher_names_the_column_it_cannot_render():
+    hasher = RowHasher([("doc", T.XML), ("id", T.INTEGER)], key_positions=[1])
+    with pytest.raises(RenderError, match="^column doc: not well-formed XML") as caught:
+        hasher.hash_row(["<a>", 1])
+    assert caught.value.column == "doc"
+    assert caught.value.reason.startswith("not well-formed XML")
+    # a row outside the wanted buckets is placed on its key alone, documents unread
+    rh, kh = hasher.hash_row(["<a/>", 1])
+    b = value64(kh) % 7
+    assert hasher.placed(["<a>", 1], 7, {b + 1}) is None
+    assert hasher.placed(["<a/>", 1], 7, {b}) == hasher.placed(["<a/>", 1], 7) == (b, rh)
+    assert hasher.key_values(["<a>", 1]) == ("1",)
+
+
 def test_floats_are_not_hashed():
     with pytest.raises(RenderError):
         render(1.5, T.FLOAT)
     assert not T.FLOAT.hashed
+    assert T.XML.hashed and T.JSON.hashed
 
 
 # -- framing (9.3) -----------------------------------------------------------------
@@ -159,3 +302,100 @@ def test_golden_vectors():
     b = row_hash(["2", "OPEN", None])
     assert a == "76fc102734908db654e63701c08f3b38"
     assert aggregate([a, b]) == "5ef4b266564d16d3"
+
+
+def test_golden_vectors_of_revision_1():
+    assert CANONICAL_REVISION >= 1
+    assert column_digest("infinity") == "4090a77607bb447150404f8a998bba1a"
+    assert column_digest("-infinity") == "418090c1b3d71ee0febfff882916eac7"
+
+
+def test_golden_vectors_of_revision_2():
+    assert CANONICAL_REVISION >= 2
+    doc = render('<a b="1" a="2"><c/></a>', T.XML)
+    assert doc == '<a a="2" b="1"><c></c></a>'
+    assert column_digest(doc) == "6ee72206e8eaafd589af92396530f3d6"
+    ns = render(
+        '<o:order xmlns:o="urn:o" id="7">\n  <o:line sku="A-1"> 2 </o:line>\n</o:order>', T.XML
+    )
+    assert ns == '<o:order xmlns:o="urn:o" id="7"><o:line sku="A-1"> 2 </o:line></o:order>'
+    assert column_digest(ns) == "13caba2d12a337dfd2589f55b8f36297"
+    assert row_hash(["1", doc]) == "1590b46167f97dd56707d3b509f5882b"
+
+
+# -- revisions in baselines ----------------------------------------------------------
+def _entry(columns, revision=None, entry_ranges=None, natives=None):
+    natives = natives or {}
+    d = {
+        "columns": [[n, natives.get(n, t), t, False] for n, t in columns],
+        "primary_key": ["id"],
+        "plan": {"columns": columns, "key_columns": ["id"], "buckets": 1, "precision": 6},
+        "row_count": 1,
+        "bucket_aggregates": {"0": [1, "5"]},
+        "completed_at": "2026-10-01T00:00:00+00:00",
+    }
+    if revision is not None:
+        d["canonical_revision"] = revision
+    if entry_ranges is not None:
+        d["ranges"] = entry_ranges
+    return d
+
+
+def test_entries_that_may_hold_infinity_hashed_as_null():
+    dated = [["id", "integer"], ["valid_from", "date"], ["valid_to", "timestamptz"]]
+    both = {"id": [1, 9], "valid_from": ["2026-01-01", "2026-02-01"], "valid_to": [None, None]}
+
+    def stale(engine, d):
+        return hashed_infinity_as_null(engine, BaselineTable.from_dict("public.t", d))
+
+    assert stale("postgresql", _entry(dated))  # before ranges: nothing shows it held none
+    assert stale("postgresql", _entry(dated, 0, {"valid_from": both["valid_from"]}))
+    assert not stale("postgresql", _entry(dated, 0, both))  # reading the ranges would fail
+    assert not stale("postgresql", _entry(dated, 1))
+    assert not stale("mysql", _entry(dated))
+    assert not stale("postgresql", _entry([["id", "integer"], ["name", "text"]]))
+    # hashed here: loading infinity failed
+    assert not stale("postgresql", _entry([*dated, ["doc", "json"]]))
+
+    entry = BaselineTable.from_dict("public.t", _entry(dated))
+    assert entry.canonical_revision == 0
+    entry.canonical_revision = CANONICAL_REVISION
+    assert entry.to_dict()["canonical_revision"] == CANONICAL_REVISION
+
+
+def test_xml_columns_of_an_entry_from_before_revision_2_are_not_in_it():
+    # XML was not hashed then: stored unsupported, and left out of the plan
+    columns = [["id", "integer"], ["doc", "unsupported"], ["shape", "unsupported"]]
+    plan = [["id", "integer"]]
+    d = _entry(columns, 1, natives={"doc": "XMLTYPE", "shape": "SDO_GEOMETRY"})
+    d["plan"]["columns"] = plan
+    entry = BaselineTable.from_dict("APP.T", d)
+    types = {c.name: c.canonical for c in entry.schema.columns}
+    assert types == {"id": T.INTEGER, "doc": T.XML, "shape": T.UNSUPPORTED}
+    assert list(entry.unhashed) == ["doc"]
+    assert entry.unhashed["doc"][0] == NOT_IN_BASELINE
+    assert "canonical revision 2" in entry.unhashed["doc"][1]
+    # kept when the manifest is written again (a resumed baseline)
+    again = BaselineTable.from_dict("APP.T", entry.to_dict())
+    assert again.unhashed == entry.unhashed and again.canonical_revision == 1
+    d = _entry([["id", "integer"], ["doc", "xml"]], 2, natives={"doc": "xml"})
+    assert BaselineTable.from_dict("public.t", d).unhashed == {}
+
+
+def test_a_baseline_from_a_newer_revision_is_refused(tmp_path):
+    # refused before its tables are read: a later revision may hash types this build lacks
+    path = tmp_path / "manifest.json"
+    later = _entry([["id", "integer"], ["doc", "a type from later"]], CANONICAL_REVISION + 1)
+    doc = {
+        "baseline_id": "b9", "canonical_version": "1.0", "hash_algorithm": "md5",
+        "product_version": "9", "engine": "postgresql", "consistency": {}, "session": {},
+        "taken_at": "2026-10-01T00:00:00+00:00", "selection": ["public.t"],
+        "tables": {"public.t": later},
+    }  # fmt: skip
+    path.write_text(json.dumps(doc))
+    newer = f"canonical revision {CANONICAL_REVISION + 1}; this build knows revision"
+    with pytest.raises(ConfigError, match=newer):
+        Baseline.load(path)
+    doc["tables"]["public.t"] = _entry([["id", "integer"]], CANONICAL_REVISION)
+    path.write_text(json.dumps(doc))
+    assert Baseline.load(path).tables["public.t"].canonical_revision == CANONICAL_REVISION

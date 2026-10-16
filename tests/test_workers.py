@@ -81,6 +81,8 @@ def test_baseline_workers_read_one_snapshot(tmp_path, pair, monkeypatch):
     assert {q: t.row_count for q, t in b.tables.items()} == {
         f"public.t{i}": 1000 * (i + 1) for i in range(TABLES)
     }
+    assert {t.read_at for t in b.tables.values()} == {b.position["taken_at"]}
+    assert b.consistency()["held"] and b.reference_position is b.position
     monkeypatch.setattr(PostgresAdapter, "bucket_aggregates", real)
     result, _ = _run(tmp_path, tgt, baseline=b, workers=3)
     assert {t.status for t in result.tables} == {"matched"}

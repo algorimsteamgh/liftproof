@@ -24,13 +24,19 @@ the byte-size grouping sketched in the Technical Specification.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Container, Iterable, Sequence
 from typing import Any
 
-from liftproof.canonical.render import render
+from liftproof.canonical.render import RenderError, render
 from liftproof.canonical.types import CanonicalType
 
 CANONICAL_VERSION = "1.0"
+# Rules added within a version that give a rendering to values that had none (they failed
+# to load, hashed as NULL, or their columns were not compared); a baseline records the
+# revision of each table it holds.
+#   1: PostgreSQL infinity and -infinity dates and timestamps
+#   2: XML columns (PostgreSQL xml, Oracle XMLTYPE, SQL Server xml)
+CANONICAL_REVISION = 2
 HASH_ALGORITHM = "md5"
 GROUP_SIZE = 32
 MOD64 = 1 << 64
@@ -102,11 +108,25 @@ class RowHasher:
         self.key_positions = list(key_positions)
         self.precision = precision
 
-    def rendered(self, row: Sequence[Any]) -> list[str | None]:
-        return [
-            render(value, ctype, precision=self.precision)
-            for value, (_, ctype) in zip(row, self.columns, strict=True)
-        ]
+    def rendered(
+        self, row: Sequence[Any], positions: Sequence[int] | None = None
+    ) -> list[str | None]:
+        """The row's values rendered, or only those at positions. A value that cannot be
+        rendered raises RenderError naming its column."""
+        columns = self.columns if positions is None else [self.columns[i] for i in positions]
+        values = row if positions is None else [row[i] for i in positions]
+        try:
+            return [
+                render(value, ctype, precision=self.precision)
+                for value, (_, ctype) in zip(values, columns, strict=True)
+            ]
+        except RenderError as exc:
+            for value, (name, ctype) in zip(values, columns, strict=True):  # which column
+                try:
+                    render(value, ctype, precision=self.precision)
+                except RenderError:
+                    raise RenderError(exc.reason, name) from None
+            raise
 
     def digests(self, row: Sequence[Any]) -> list[str]:
         return [column_digest(v) for v in self.rendered(row)]
@@ -118,3 +138,20 @@ class RowHasher:
         if not self.key_positions:
             return rh, rh
         return rh, combine([digests[i] for i in self.key_positions])
+
+    def key_values(self, row: Sequence[Any]) -> tuple[str | None, ...]:
+        return tuple(self.rendered(row, self.key_positions))
+
+    def placed(
+        self, row: Sequence[Any], buckets: int, wanted: Container[int] | None = None
+    ) -> tuple[int, str] | None:
+        """(bucket, row hash), or None when the row's bucket is not among those wanted.
+        The key is hashed first, so a row outside them costs only its key columns'
+        rendering, never its documents' (an XML column is never a key)."""
+        if wanted is None or not self.key_positions:
+            rh, kh = self.hash_row(row)
+            b = value64(kh) % buckets
+            return (b, rh) if wanted is None or b in wanted else None
+        kh = combine([column_digest(v) for v in self.rendered(row, self.key_positions)])
+        b = value64(kh) % buckets
+        return (b, combine(self.digests(row))) if b in wanted else None

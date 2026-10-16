@@ -13,28 +13,65 @@ permissions:
 env:
   AWS_REGION: ap-south-1
 
+# Every run step is bash with pipefail, so a piped command (pip-audit | tee) fails the
+# step when the first command fails, not only when the last one does.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   performance:
     # PRD N9: the KPI suite gates every release; its numbers are kept with the evidence
     uses: ./.github/workflows/perf.yml
 
-  ami:
-    needs: performance
+  tests:
+    # OPE-004: the functional suite and the dependency audit gate the release itself,
+    # on the tagged commit, not only the pull request that came before it
+    uses: ./.github/workflows/ci.yml
+
+  charset:
+    # spec 19: the character set fixtures, against a WE8MSWIN1252 Oracle
+    uses: ./.github/workflows/charset.yml
+
+  reviewed:
     runs-on: ubuntu-24.04
-    environment: release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on main (reached through a reviewed pull request)
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: The product reports the version being released (B6)
+        run: |
+          version=$(python3 -c 'import re, pathlib; print(re.search(r"__version__ = \"(.+)\"",
+            pathlib.Path("src/liftproof/__init__.py").read_text()).group(1))')
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "src/liftproof/__init__.py says $version but the tag is $GITHUB_REF_NAME;"
+            echo "set __version__ to ${GITHUB_REF_NAME#v} on main, then tag that commit"
+            exit 1
+          fi
+
+  ami:
+    needs: [performance, tests, charset, reviewed]
+    runs-on: ubuntu-24.04
+    # No `environment:` here. A job in an environment gets the OIDC subject
+    # repo:<repo>:environment:<name>, which the release role's trust policy does not
+    # accept: it trusts only the tag refs (infra/modules/build-account). The variables
+    # below are repository variables.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install build pip-audit
-      - name: Dependency gate (ATS-009)
-        run: pip-audit --strict . | tee pip-audit.log
-      - run: python -m build --wheel
+      # Credentials first, so the evidence step can keep the log of a blocked release
       - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.LIFTPROOF_RELEASE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      - run: pip install build pip-audit
+      - name: Dependency gate (ATS-009)
+        run: pip-audit --strict . | tee pip-audit.log
+      - run: python -m build --wheel
       - uses: hashicorp/setup-packer@main
         with:
           version: "1.16.1"
@@ -62,6 +99,7 @@ jobs:
         if: always()
         run: |
           prefix="s3://${{ vars.LIFTPROOF_EVIDENCE_BUCKET }}/releases/${GITHUB_REF_NAME}/${GITHUB_RUN_ID}"
-          for f in pip-audit.log perf-results.json packer-manifest.json scan-findings.json ami-id.txt; do
-            [ -f "$f" ] && aws s3 cp "$f" "$prefix/$f"
+          for f in pip-audit.log perf-results.json packer-manifest.json ami-dependency-audit.txt \
+            scan-findings.json ami-id.txt; do
+            if [ -f "$f" ]; then aws s3 cp "$f" "$prefix/$f"; fi
           done

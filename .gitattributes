@@ -1,0 +1,2 @@
+# The worked example compares these bytes exactly, line endings included
+infra/packer/files/example/** -text

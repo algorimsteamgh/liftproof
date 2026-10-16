@@ -1,0 +1,16 @@
+# A worked example that runs on this instance with nothing to set up: two folders
+# under /opt/mvt/example stand in for the files an application keeps before and after
+# its move. One invoice amount was changed on the "target" side, and one export only
+# changed its line endings. Run it with:
+#   sudo -u mvt liftproof files --project /var/lib/mvt/projects/example.yaml
+# or the run document with project=example and mode=files. The report lands in this
+# deployment's bucket, which also proves the instance can write there.
+project: example
+
+files:
+  - name: invoices
+    source: /opt/mvt/example/source/invoices
+    target: /opt/mvt/example/target/invoices
+  - name: exports
+    source: /opt/mvt/example/source/exports
+    target: /opt/mvt/example/target/exports

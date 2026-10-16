@@ -1,0 +1,139 @@
+# The type map (Technical Spec 9.13): how each engine's native types are compared.
+#
+# A column's native type, as describe() reads it, is looked up by its keys, most specific
+# first (docs/canonical-v1.md, "Type map"); a type with no entry is unsupported, reported
+# as not checked. Each entry is the canonical type it is compared as by default, or
+# {canonical: <default>, also: [<alternative>, ...]}: the other canonical types a project
+# may compare it as (database.type_map). Every alternative renders alike in the database
+# and in the reference implementation, which the engine's parity test proves for each.
+#
+# compatible: two canonical types that compare as one when the source and the target
+# differ by just that.
+#
+# Change any entry, alternative or compatible pair, and raise version.
+version: "1.0"
+
+engines:
+  postgresql:
+    smallint: integer
+    integer: integer
+    bigint: integer
+    numeric: decimal
+    real: float
+    double precision: float
+    boolean: boolean
+    text: text
+    character varying: text
+    name: text
+    citext: text
+    character: char
+    date: date
+    time without time zone: time
+    timestamp without time zone: timestamp
+    timestamp with time zone: timestamptz
+    bytea: binary
+    uuid: uuid
+    json: json
+    jsonb: json
+    xml: xml
+
+  mysql:
+    tinyint(1): {canonical: boolean, also: [integer]}  # MySQL's BOOLEAN
+    tinyint: integer
+    smallint: integer
+    mediumint: integer
+    int: integer
+    bigint: integer
+    year: integer
+    decimal: decimal
+    float: float
+    double: float
+    varchar: text
+    tinytext: text
+    text: text
+    mediumtext: text
+    longtext: text
+    enum: text
+    set: text
+    char: char
+    date: date
+    time: time
+    # no zone: rendered as stored; as timestamptz, the stored values are taken as UTC
+    datetime: {canonical: timestamp, also: [timestamptz]}
+    # stored as UTC and read in a UTC session; as timestamp, the UTC values
+    timestamp: {canonical: timestamptz, also: [timestamp]}
+    binary: binary
+    varbinary: binary
+    tinyblob: binary
+    blob: binary
+    mediumblob: binary
+    longblob: binary
+    json: json
+
+  oracle:
+    # NUMBER(p), NUMBER(p,0) and NUMBER(p,-s); as boolean, any value other than 0 is 1
+    number(p): {canonical: integer, also: [boolean]}
+    integer: integer  # NUMBER(*,0)
+    number(p,s): decimal
+    number: decimal
+    float: float  # binary precision NUMBER; targets store it as a double
+    binary_float: float
+    binary_double: float
+    varchar2: text
+    nvarchar2: text
+    varchar: text
+    clob: text
+    nclob: text
+    char: char
+    nchar: char
+    # it has a time of day; as date, a value with one renders as a timestamp and so
+    # differs from every date
+    date: {canonical: timestamp, also: [date]}
+    timestamp: timestamp
+    timestamp with time zone: timestamptz
+    timestamp with local time zone: timestamptz
+    raw: binary
+    blob: binary
+    json: json
+    xmltype: xml
+    boolean: boolean  # 23ai
+
+  sqlserver:
+    tinyint: integer
+    smallint: integer
+    int: integer
+    bigint: integer
+    decimal: decimal
+    numeric: decimal
+    money: decimal
+    smallmoney: decimal
+    real: float
+    float: float
+    bit: {canonical: boolean, also: [integer]}
+    varchar: text
+    nvarchar: text
+    text: text
+    ntext: text
+    sysname: text
+    char: char
+    nchar: char
+    date: date
+    time: time
+    datetime: timestamp
+    datetime2: timestamp
+    smalldatetime: timestamp
+    datetimeoffset: timestamptz
+    binary: binary
+    varbinary: binary
+    image: binary
+    timestamp: binary  # rowversion
+    uniqueidentifier: uuid
+    json: json  # SQL Server 2025 and Azure SQL
+    xml: xml
+
+compatible:
+  # the strip rule only applies when both sides are fixed width
+  - {types: [char, text], as: text}
+  # a whole number renders alike either way (Oracle NUMBER to bigint); a fraction lost in
+  # the move shows up as a changed value
+  - {types: [integer, decimal], as: decimal}

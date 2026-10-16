@@ -20,12 +20,14 @@ from typing import Any
 import yaml
 
 from liftproof import __version__, aws, logs, support
+from liftproof import checkpoint as ckpt
 from liftproof.adapters.base import Adapter
 from liftproof.adapters.mysql import MySQLAdapter
 from liftproof.adapters.oracle import OracleAdapter
 from liftproof.adapters.postgres import PostgresAdapter
 from liftproof.adapters.sqlserver import SQLServerAdapter
-from liftproof.canonical import CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical import CANONICAL_REVISION, CANONICAL_VERSION, HASH_ALGORITHM
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, legacy_record, shown
 from liftproof.config import TEMPLATE, Connection, Project, load_project
 from liftproof.credentials import from_secrets_manager, secret_value
 from liftproof.errors import (
@@ -47,12 +49,16 @@ from liftproof.report.builder import build_report, who_ran_it, write_reports
 from liftproof.runlock import RunInProgress
 from liftproof.store import LocalStore, S3Store, Store
 from liftproof.web import correlate
-from liftproof.web.journey import Journey
+from liftproof.web.journey import Journey, check_steps
 from liftproof.web.run import WebResult
 
 log = logging.getLogger("liftproof.cli")
 
 DEFAULT_WORKDIR = Path(os.environ.get("LIFTPROOF_WORKDIR", "/var/lib/mvt/projects"))
+PROJECT_KEY = "project.yaml"  # the project file, in the store (spec 4)
+# Every project's file again, at the bucket root, where `liftproof restore` finds them all
+# whatever prefix each project uses.
+PROJECT_INDEX = ".liftproof/projects"
 
 
 def _now() -> str:
@@ -86,6 +92,18 @@ def _refuse_env_credentials() -> None:
         )
 
 
+# The AMI ships the system CA certificates and the Amazon RDS CA bundle in one file
+# (spec 15), so RDS and publicly signed endpoints verify with no setting. A project's
+# own sslrootcert (a private CA) takes its place.
+CA_BUNDLE = Path(os.environ.get("LIFTPROOF_CA_BUNDLE", "/opt/mvt/certs/ca-bundle.pem"))
+
+
+def _sslrootcert(conn: Connection) -> str | None:
+    if conn.sslrootcert or not conn.tls_verified:
+        return conn.sslrootcert
+    return str(CA_BUNDLE) if CA_BUNDLE.is_file() else None
+
+
 def connect(conn: Connection) -> Adapter:
     creds = from_secrets_manager(conn.secret_arn) if conn.secret_arn else None
     cls = {"mysql": MySQLAdapter, "oracle": OracleAdapter, "sqlserver": SQLServerAdapter}.get(
@@ -98,9 +116,11 @@ def connect(conn: Connection) -> Adapter:
         user=(creds.username if creds and creds.username else conn.user),
         password=creds.password if creds else None,
         sslmode=conn.sslmode,
-        sslrootcert=conn.sslrootcert,
+        sslrootcert=_sslrootcert(conn),
         statement_timeout_ms=conn.statement_timeout_ms,
+        lock_timeout_ms=conn.lock_timeout_ms,
         rows_per_second=conn.rows_per_second,
+        pause_ms=conn.pause_ms,
         read_only=True,
     )
 
@@ -112,8 +132,31 @@ def _instance_config() -> dict[str, Any]:
     """Instance level settings written at launch by the deployment template."""
     try:
         return yaml.safe_load(INSTANCE_CONFIG.read_text(encoding="utf-8")) or {}
-    except (FileNotFoundError, PermissionError):
+    except FileNotFoundError:
         return {}
+    except PermissionError:
+        # Carrying on without them would quietly drop the deployment's bucket, key and
+        # report lock, so this is a configuration error, not a default.
+        raise ConfigError(
+            f"cannot read the instance settings in {INSTANCE_CONFIG}; run Liftproof as "
+            "the mvt user (sudo -u mvt liftproof ...)"
+        ) from None
+
+
+def _configure_aws() -> None:
+    """The deployment's region, and its ceiling on AWS calls per second (AWSAPI-002)."""
+    try:
+        inst = _instance_config()
+    except ConfigError:
+        inst = {}  # a command that needs the settings says so itself
+    aws.configure_region(inst.get("region"))
+    rate = inst.get("aws_requests_per_second")
+    try:
+        aws.configure_rate_limit(float(rate) if rate else aws.DEFAULT_RATE)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"aws_requests_per_second in {INSTANCE_CONFIG} is not a number: {rate!r}"
+        ) from None
 
 
 def _store(project: Project, workdir: Path) -> Store:
@@ -142,7 +185,9 @@ def cmd_version(args: argparse.Namespace) -> int:
     info = {
         "liftproof": __version__,
         "canonical_version": CANONICAL_VERSION,
+        "canonical_revision": CANONICAL_REVISION,
         "hash_algorithm": HASH_ALGORITHM,
+        "type_map_version": DEFAULT_TYPE_MAP.version,
         **aws.sdk_versions(),
         "python": sys.version.split()[0],
     }
@@ -183,7 +228,14 @@ def _take_baseline(args: argparse.Namespace, side: str) -> int:
     project = _project(args)
     project.require_database()
     store = _store(project, Path(args.workdir))
-    baseline_id = args.baseline_id or _new_id("b" if side == "source" else "t")
+    marker = Path(args.workdir) / project.name / ckpt.baseline_marker(side)
+    baseline_id = args.baseline_id
+    if baseline_id is None and args.resume:
+        # the interrupted one, wherever it ran: the marker is in the store
+        baseline_id = ckpt.read_marker(store, marker, ckpt.baseline_marker(side))
+        if baseline_id is None:
+            raise ConfigError(f"no interrupted {side} baseline to resume; give --baseline-id")
+    baseline_id = baseline_id or _new_id("b" if side == "source" else "t")
     if baseline_id in LATEST.values():
         raise ConfigError(f"{baseline_id!r} is reserved; choose another baseline id")
     mode = "baseline" if side == "source" else "rebaseline"
@@ -199,9 +251,14 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
     key = f"baselines/{baseline_id}/manifest.json"
     if args.resume:
         store.get_file(key, manifest)
+    marker_key = ckpt.baseline_marker(side)
+    marker_local = workdir / marker_key
+    ckpt.set_marker(store, marker_local, marker_key, baseline_id)
+    throttle = ckpt.Throttle()
     o = project.database
     source_conn, target_conn = project.require_database()
-    with connect(source_conn if side == "source" else target_conn) as db:
+    conn = source_conn if side == "source" else target_conn
+    with connect(conn) as db:
         b = take_baseline(
             db,
             manifest,
@@ -216,18 +273,26 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
             side=side,
             progress=lambda m: log.info(m),
             workers=o.workers,
+            # each finished table reaches the store, so a lost instance resumes (9.16)
+            checkpoint=lambda: throttle.due() and ckpt.keep(store, key, manifest),
+            with_ranges=o.ranges,
+            snapshot=conn.snapshot,
+            type_map=o.type_map,
         )
     store.put_file(key, manifest)
+    ckpt.set_marker(store, marker_local, marker_key, "")
     # The marker goes to the store too, so a replacement instance still finds it.
     marker = workdir / "baselines" / LATEST[side]
     marker.write_text(baseline_id, encoding="utf-8")
     store.put_file(f"baselines/{LATEST[side]}", marker)
+    consistency = b.consistency()
     payload = {
         "baseline_id": baseline_id,
         "side": side,
         "tables": len(b.tables),
         "rows": sum(t.row_count for t in b.tables.values()),
         "consistency": b.position,
+        "cross_table_consistency": consistency,
         "manifest": store.location(key),
     }
     _out(
@@ -235,6 +300,7 @@ def _baseline_locked(args, project: Project, store: Store, baseline_id: str, sid
         payload,
         f"{side} baseline {baseline_id}: {payload['tables']} tables, {payload['rows']:,} rows\n"
         f"consistency position: {b.position.get('position')}\nmanifest: {payload['manifest']}"
+        + ("" if consistency["held"] else f"\n{consistency['summary']}")
         + (f"\ncompare against it with: --baseline {LATEST['target']}" if side == "target" else ""),
     )
     return EXIT_OK
@@ -255,7 +321,15 @@ def _load_baseline(args, project: Project, store: Store, workdir: Path) -> Basel
     path = workdir / "baselines" / bid / "manifest.json"
     if not path.exists() and not store.get_file(f"baselines/{bid}/manifest.json", path):
         raise ConfigError(f"baseline {bid} not found")
-    return Baseline.load(path)
+    baseline = Baseline.load(path)
+    if not baseline.complete:
+        how = "baseline" if baseline.side == "source" else "rebaseline"
+        raise ConfigError(
+            f"baseline {bid} is unfinished ({len(baseline.tables)} of "
+            f"{len(baseline.selection)} tables); finish it with "
+            f"liftproof {how} --resume --baseline-id {bid}"
+        )
+    return baseline
 
 
 def _save_results(run_dir: Path, result: ReconcileResult) -> None:
@@ -265,6 +339,7 @@ def _save_results(run_dir: Path, result: ReconcileResult) -> None:
                 "systemic": result.systemic,
                 "replication": result.replication,
                 "sample_seed": result.sample_seed,
+                "structure": result.structure,
                 "tables": [t.__dict__ for t in result.tables],
             },
             indent=2,
@@ -283,13 +358,21 @@ def _load_results(run_dir: Path) -> ReconcileResult:
         d["systemic"],
         d.get("replication"),
         d.get("sample_seed"),
+        structure=d.get("structure"),
     )
 
 
 def _reconcile_into(
-    args: argparse.Namespace, project: Project, store: Store, workdir: Path, writer: FindingWriter
+    args: argparse.Namespace,
+    project: Project,
+    store: Store,
+    workdir: Path,
+    writer: FindingWriter,
+    checkpoint: ckpt.RunCheckpoint | None = None,
 ) -> tuple[ReconcileResult, Baseline | None]:
-    """The database comparison of a run. Failures propagate to _run, which records them."""
+    """The database comparison of a run. Failures propagate to _run, which records them.
+    With a checkpoint, finished tables reach the store as the run goes, and a resumed run
+    carries on after them."""
     src_conn, tgt_conn = project.require_database()
     o = project.database
     if getattr(args, "tables", None):
@@ -297,6 +380,12 @@ def _reconcile_into(
     if args.show_values:
         o.show_values = True
     baseline = _load_baseline(args, project, store, workdir)
+    progress = checkpoint.progress if checkpoint is not None else None
+    resuming = progress is not None and progress.prelude_done
+    if progress is not None:
+        progress.baseline = baseline.baseline_id if baseline is not None else None
+        if resuming and progress.sample_seed is not None:
+            o.sample_seed = progress.sample_seed
     target = source = None
     rec = None
     try:
@@ -310,7 +399,7 @@ def _reconcile_into(
                 if baseline is None:
                     raise
                 log.warning("source unreachable; comparing against the baseline only")
-        for conn in (src_conn, tgt_conn):
+        for conn in (src_conn, tgt_conn) if not resuming else ():  # written the first time
             if not conn.tls_verified:
                 writer.write(
                     Finding(
@@ -325,10 +414,32 @@ def _reconcile_into(
         if not getattr(args, "include_replay_rows", False):
             o = _without_replay_rows(o, store, workdir, target, baseline)
         rec = Reconciler(
-            target, writer, o, source=source, baseline=baseline, progress=lambda m: log.info(m)
-        )
-        return rec.run(), baseline
+            target, writer, o, source=source, baseline=baseline, progress=lambda m: log.info(m),
+            on_table=checkpoint.table_done if checkpoint is not None else None,
+            done=progress.done() if resuming else (),
+            resumed=resuming,
+            systemic=progress.systemic if resuming else False,
+        )  # fmt: skip
+        # what limited the load on each database this run read (spec 9.15)
+        rec.result.protection = {
+            **({"source": source.protection()} if source is not None else {}),
+            "target": target.protection(),
+            "workers": o.workers,
+        }
+        if progress is not None:
+            progress.sample_seed = rec.seed
+        result = rec.run()
+        if checkpoint is not None:
+            checkpoint.save(result, complete=True)
+            try:
+                ckpt.set_marker(store, workdir / ckpt.RUN_MARKER, ckpt.RUN_MARKER, "")
+            except LiftproofError as exc:  # --resume then finds the run complete and says so
+                log.warning("could not clear the in-progress run marker: %s", exc)
+        return result, baseline
     except Exception as exc:
+        if rec is not None:
+            # coverage counts what exists, not only what finished (spec 12, 18)
+            rec.mark_unfinished(f"{type(exc).__name__}: {logs.scrub(str(exc))}"[:300])
         exc.partial_result = rec.result if rec else ReconcileResult()  # type: ignore[attr-defined]
         exc.baseline = baseline  # type: ignore[attr-defined]
         raise
@@ -422,9 +533,66 @@ def _locked(args, project: Project, store: Store, run_id: str, mode: str, body) 
     try:
         if lock.body.get("took_over"):
             log.warning("took over the run lock of lost run %s", lock.body["took_over"])
+        _publish_project(project, store)
         return body()
     finally:
         lock.__exit__(None, None, None)
+
+
+def _publish_project(project: Project, store: Store) -> None:
+    """Every run copies its project file to the store (spec 3, 4): connections (secret
+    ARNs, never credentials), rules and schedules then outlive the instance, and
+    `liftproof restore` brings them back on a replacement."""
+    if project.path is None or not Path(project.path).is_file():
+        return
+    ckpt.keep(store, PROJECT_KEY, Path(project.path))
+    if isinstance(store, S3Store):
+        index = S3Store(store.bucket, "", store.kms_key_id, client=store.s3)
+        ckpt.keep(index, f"{PROJECT_INDEX}/{project.name}.yaml", Path(project.path))
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Put the deployment's project files back on this instance from the bucket. A
+    replacement instance runs this at boot (mvt-restore.service), so the scheduler and
+    the UI find every project again; recordings, baselines and reports are read from the
+    bucket as they are needed. A project file already on the instance is never replaced."""
+    inst = _instance_config()
+    bucket = args.bucket or inst.get("bucket")
+    if not bucket:
+        raise ConfigError("no bucket: this instance has no deployment settings; give --bucket")
+    store = S3Store(bucket, "", inst.get("kms_key"))
+    projects_dir = Path(args.projects_dir)
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    restored: list[str] = []
+    kept: list[str] = []
+    unreadable: list[str] = []
+    for key in store.list_keys(f"{PROJECT_INDEX}/"):
+        name = key[len(PROJECT_INDEX) + 1 :]
+        if "/" in name or not name.endswith(".yaml"):
+            continue
+        dest = projects_dir / name
+        if dest.exists():
+            kept.append(name)
+            continue
+        partial = dest.with_suffix(".partial")
+        if not store.get_file(key, partial):
+            continue
+        try:
+            load_project(partial)
+        except ConfigError as exc:
+            log.warning("not restoring %s: %s", name, exc)
+            partial.unlink(missing_ok=True)
+            unreadable.append(name)
+            continue
+        partial.replace(dest)
+        restored.append(name)
+    payload = {"bucket": bucket, "restored": restored, "kept": kept, "unreadable": unreadable}
+    text = [f"restored {len(restored)} project file(s) from s3://{bucket} to {projects_dir}"]
+    text += [f"  restored {n}" for n in restored]
+    text += [f"  kept {n} (already on this instance)" for n in kept]
+    text += [f"  skipped {n} (not a valid project file)" for n in unreadable]
+    _out(args, payload, "\n".join(text))
+    return EXIT_OK
 
 
 def _skipped(args, project: Project, store: Store, run_id: str, mode: str, exc) -> int:
@@ -471,12 +639,91 @@ def _run(
     and must not then be reconciled or compared against), then one report over every
     finding."""
     project = _project(args)
+    if web and (database or files):
+        _check_regions(project)
     store = _store(project, Path(args.workdir))
     run_id = args.run_id or _new_id("r")
+    if getattr(args, "resume", False) and not args.run_id:
+        marker = Path(args.workdir) / project.name / ckpt.RUN_MARKER
+        run_id = ckpt.read_marker(store, marker, ckpt.RUN_MARKER) or ""
+        if not run_id:
+            raise ConfigError("no interrupted reconciliation to resume; give --run-id")
     return _locked(
         args, project, store, run_id, mode,
         lambda: _run_locked(args, mode, project, store, run_id, database, web, files),
     )  # fmt: skip
+
+
+def _check_regions(project: Project) -> None:
+    """A selector the browser refuses stops the run before it starts: found by the replay,
+    after a reconciliation, the error would end the run with no report of what it did. A
+    browser that does not start is left for the replay to report, as it would."""
+    from liftproof.web.browser import check_regions
+
+    web = project.web
+    if web is None or not web.ignore_regions:
+        return
+    try:
+        check_regions(web.ignore_regions, web.chromium_path)
+    except ConfigError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the replay reports it
+        log.warning("web.ignore_regions not checked before the run: %s", exc)
+
+
+# Findings reach the store at least this often while a run goes (spec 3).
+SEGMENT_SECONDS = 60.0
+# What a resumed reconciliation must be asked again, exactly as the first time.
+RESUMED_OPTIONS = ("tables", "no_source", "show_values", "include_replay_rows")
+
+
+def _type_map(project: Project, legacy: bool = False) -> dict[str, Any]:
+    """The type map a database run compares under, as its checkpoint and report keep it;
+    `legacy`: the one a checkpoint saved before it was kept was taken under."""
+    engines = [c.engine for c in project.require_database()]
+    return legacy_record(*engines) if legacy else project.database.type_map.record(*engines)
+
+
+def _restore_run(store: Store, run_dir: Path, run_id: str, project: Project) -> ckpt.RunProgress:
+    """The progress of an interrupted reconciliation and the findings it had written,
+    from the store: the instance that ran it may be gone."""
+    local = run_dir / ckpt.PROGRESS
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if not store.get_file(f"runs/{run_id}/{ckpt.PROGRESS}", local) and not local.exists():
+        raise ConfigError(f"run {run_id} has no saved progress to resume")
+    progress = ckpt.RunProgress.load(local)
+    if progress.complete:
+        raise ConfigError(f"run {run_id} finished every table; there is nothing to resume")
+    if progress.canonical_revision != CANONICAL_REVISION:
+        # its finished tables were hashed under other rules than the rest would be
+        raise ConfigError(
+            f"run {run_id} was started under canonical revision {progress.canonical_revision} "
+            f"and this build hashes under revision {CANONICAL_REVISION}; start a new run"
+        )
+    started = progress.type_map or _type_map(project, legacy=True)
+    now = _type_map(project)
+    if started["fingerprints"] != now["fingerprints"]:
+        # its finished tables were compared under other types than the rest would be
+        raise ConfigError(
+            f"run {run_id} was started under {shown(started)}, not {shown(now)}; resume it "
+            "with the database.type_map it was started with, or start a new run"
+        )
+    for name in progress.segments:
+        seg = run_dir / name
+        if not store.get_file(f"runs/{run_id}/{name}", seg) and not seg.exists():
+            raise ConfigError(f"run {run_id}: findings segment {name} is missing from the store")
+    return progress
+
+
+def _void_later_segments(store: Store, run_dir: Path, run_id: str, keep: list[str]) -> None:
+    """Segments the interrupted attempt wrote after its last checkpoint hold findings of
+    tables that are compared again; emptied in the store so they are not read twice."""
+    empty = run_dir / "empty.partial"
+    empty.write_text("", encoding="utf-8")
+    for key in store.list_keys(f"runs/{run_id}/findings-"):
+        if key.rsplit("/", 1)[-1] not in keep and key.endswith(".jsonl"):
+            store.put_file(key, empty)
+    empty.unlink()
 
 
 def _run_locked(args, mode, project, store, run_id, database, web, files) -> int:
@@ -485,7 +732,46 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     run_dir.mkdir(parents=True, exist_ok=True)
     logs.set_context(run_id=run_id, project=project.name)
     started = _now()
-    writer = FindingWriter(run_dir, run_id)
+    progress = None
+    if getattr(args, "resume", False):
+        progress = _restore_run(store, run_dir, run_id, project)
+        for name in RESUMED_OPTIONS:
+            setattr(args, name, progress.options.get(name))
+        args.baseline = progress.baseline
+        started = progress.started_at
+        progress.resumed_at.append(_now())
+    uploads = ckpt.SegmentUploads(store, run_id, progress.segments if progress else ())
+    writer = FindingWriter(
+        run_dir, run_id, flush_seconds=SEGMENT_SECONDS, on_segment=uploads,
+        keep=progress.segments if progress is not None else None,
+    )  # fmt: skip
+    if progress is not None:
+        _void_later_segments(store, run_dir, run_id, progress.segments)
+    values_shown = bool(
+        getattr(args, "show_values", False)
+        or project.database.show_values
+        or (files and any(c.show_content for c in project.files))
+    )
+    # what the run is, for a report rebuilt after it stopped, on any instance
+    run_info = {"mode": mode, "started_at": started, "invoked_by": who_ran_it(),
+                "values_shown": values_shown}  # fmt: skip
+    if getattr(args, "scheduled", None):
+        run_info["schedule"] = args.scheduled
+    if progress is not None:
+        run_info["resumed_at"] = progress.resumed_at
+    info = run_dir / ckpt.RUN_INFO
+    info.write_text(json.dumps(run_info), encoding="utf-8")
+    ckpt.keep(store, f"runs/{run_id}/{ckpt.RUN_INFO}", info)
+    checkpoint = None
+    if mode == "reconcile":
+        progress = progress or ckpt.RunProgress(
+            run_id,
+            started,
+            {k: getattr(args, k, None) for k in RESUMED_OPTIONS},
+            type_map=_type_map(project),
+        )
+        checkpoint = ckpt.RunCheckpoint(store, run_dir, progress, writer, uploads)
+        ckpt.set_marker(store, workdir / ckpt.RUN_MARKER, ckpt.RUN_MARKER, run_id)
     result: ReconcileResult | None = ReconcileResult() if database else None
     web_result = None
     files_result: FileResult | None = None
@@ -495,7 +781,9 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
     try:
         if database:
             try:
-                result, baseline = _reconcile_into(args, project, store, workdir, writer)
+                result, baseline = _reconcile_into(
+                    args, project, store, workdir, writer, checkpoint
+                )
             except Exception as exc:
                 result = getattr(exc, "partial_result", result)
                 baseline = getattr(exc, "baseline", None)
@@ -505,7 +793,12 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
             files_result = _files_into(args, project, writer)
         if web:
             stage = Comparator.UI
-            web_result = _replay_into(args, project, store, workdir, writer)
+            replay = ckpt.ReplayCheckpoint(store, run_dir, run_id, writer, uploads)
+            try:
+                web_result = _replay_into(args, project, store, workdir, writer, replay)
+            except BaseException as exc:
+                web_result = getattr(exc, "partial_result", None)
+                raise
     except ConfigError:
         raise
     except LiftproofError as exc:
@@ -528,7 +821,7 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
         if result is not None:
             _save_results(run_dir, result)
         if web_result is not None:
-            (run_dir / "web-results.json").write_text(
+            (run_dir / ckpt.WEB_RESULTS).write_text(
                 json.dumps(web_result.to_dict(), indent=2), encoding="utf-8"
             )
         if files_result is not None:
@@ -536,6 +829,15 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
                 json.dumps(files_result.to_dict(), indent=2), encoding="utf-8"
             )
 
+    not_reached: list[dict[str, str]] = []
+    if failure and files and files_result is None:
+        not_reached += [{"object": f"file set {c.name}", "reason": STOPPED} for c in project.files]
+    if failure and web and web_result is None:
+        try:
+            ids = _journey_ids(args, project, workdir, store)
+        except LiftproofError:  # the report still names the failure itself
+            ids = []
+        not_reached += [{"object": f"journey {j}", "reason": STOPPED} for j in ids]
     report = _report(
         project,
         run_id,
@@ -549,10 +851,18 @@ def _run_locked(args, mode, project, store, run_id, database, web, files) -> int
         failure=failure,
         template=args.template,
         scheduled=getattr(args, "scheduled", None),
+        not_reached=not_reached,
+        resumed_at=progress.resumed_at if progress is not None else None,
+        invoked_by=run_info["invoked_by"],
+        values_shown=values_shown,
     )
     for f in sorted(run_dir.iterdir()):
-        store.put_file(f"runs/{run_id}/{f.name}", f)
+        if f.name not in uploads.done:  # segments went up as they closed
+            store.put_file(f"runs/{run_id}/{f.name}", f)
     return _conclude(args, report, store, run_id)
+
+
+STOPPED = "the run stopped before this was compared"
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
@@ -583,33 +893,75 @@ def _journey_dir(workdir: Path) -> Path:
     return workdir / "journeys"
 
 
-def _journey_ids(args: argparse.Namespace, project: Project, workdir: Path) -> list[str]:
+def _journey_ids(
+    args: argparse.Namespace, project: Project, workdir: Path, store: Store
+) -> list[str]:
     if getattr(args, "journeys", None):
         return [j.strip() for j in args.journeys.split(",") if j.strip()]
     web = project.require_web()
     if web.journeys:
         return list(web.journeys)
-    return sorted(p.stem for p in _journey_dir(workdir).glob("*.json"))
+    return journey_index(store, workdir)
+
+
+def journey_index(store: Store, workdir: Path) -> list[str]:
+    """Every journey recorded for the project: those on this instance and those in the
+    store, recorded on another machine or before this instance replaced one (spec 4)."""
+    local = {p.stem for p in _journey_dir(workdir).glob("*.json")}
+    stored = {
+        key.split("/")[1][: -len(".json")]
+        for key in store.list_keys("journeys/")
+        if key.count("/") == 1 and key.endswith(".json")
+    }
+    return sorted(local | stored)
 
 
 def _load_journey(store: Store, workdir: Path, journey_id: str) -> Journey:
+    """The journey as the store holds it: one recorded again, or bound, on another machine
+    replaces this instance's copy, which is used alone only when the store has none."""
     path = _journey_dir(workdir) / f"{journey_id}.json"
-    if not path.exists() and not store.get_file(f"journeys/{journey_id}.json", path):
+    key = f"journeys/{journey_id}.json"
+    written = store.modified(key).get(key)
+    if written is not None:
+        _copy_if_newer(store, key, path, written)
+    elif not path.exists():
         raise ConfigError(f"journey {journey_id} not found; record it with liftproof record")
     journey = Journey.load(path)
+    # what this build cannot replay as recorded refuses to load, not to replay
     for c in journey.correlations:
         try:
             correlate.check_chain(c.transforms, c.encodings)
         except ValueError as exc:
             raise ConfigError(f"journey {journey_id}, correlation {c.name}: {exc}") from None
-    assets = _journey_dir(workdir) / journey_id / "assets"
-    for step in journey.steps:
-        for ex in step.exchanges:
-            if ex.body_asset:
-                local = assets / ex.body_asset.split("/")[-1]
-                if not local.exists():
-                    store.get_file(f"journeys/{journey_id}/{ex.body_asset}", local)
+    try:
+        check_steps(journey)
+    except ValueError as exc:
+        raise ConfigError(f"journey {journey_id}, {exc}") from None
     return journey
+
+
+def _fetch_assets(store: Store, workdir: Path, journeys: list[Journey]) -> None:
+    """The bodies and page snapshots a replay compares with, as the store holds them now.
+    The bucket expires them (spec 5), so every copy this instance holds of one the store
+    no longer has is deleted, for each journey the store holds, replayed now or not: the
+    replay then compares without it, as any instance would. A journey only this instance
+    holds (recorded before the project had a bucket) keeps what it kept."""
+    held = store.modified("journeys/")
+    base = _journey_dir(workdir)
+    for assets in base.glob("*/assets"):
+        jid = assets.parent.name
+        if f"journeys/{jid}.json" in held:
+            for local in assets.iterdir():
+                if local.is_file() and f"journeys/{jid}/assets/{local.name}" not in held:
+                    local.unlink()
+    for journey in journeys:
+        prefix = f"journeys/{journey.journey_id}/"
+        refs = {ex.body_asset for s in journey.steps for ex in s.exchanges}
+        refs |= {s.region_asset for s in journey.steps}
+        for ref in sorted(r for r in refs if r and prefix + r in held):
+            local = base / journey.journey_id / "assets" / ref.split("/")[-1]
+            if not local.exists():
+                store.get_file(prefix + ref, local)
 
 
 def _save_journey(store: Store, workdir: Path, journey: Journey, assets: dict[str, bytes]) -> Path:
@@ -621,6 +973,8 @@ def _save_journey(store: Store, workdir: Path, journey: Journey, assets: dict[st
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(body)
         store.put_file(f"journeys/{journey.journey_id}/assets/{sha}", local)
+        if isinstance(store, S3Store):
+            local.unlink()  # the bucket's copy, which expires, is the only one (spec 5)
     return path
 
 
@@ -637,21 +991,32 @@ def _journey_secrets(journey: Journey) -> dict[str, str]:
 
 
 def _replay_into(
-    args: argparse.Namespace, project: Project, store: Store, workdir: Path, writer: FindingWriter
+    args: argparse.Namespace,
+    project: Project,
+    store: Store,
+    workdir: Path,
+    writer: FindingWriter,
+    checkpoint: ckpt.ReplayCheckpoint | None = None,
 ) -> WebResult:
+    """The replay of a run. Each journey's findings are written as it finishes; with a
+    checkpoint, the finished journeys reach the store as the replay goes."""
     from liftproof.web.compare import WebOptions
     from liftproof.web.run import run_journeys
 
     web = project.require_web()
     if not web.target_url:
         raise ConfigError("web.target_url is required to replay")
-    journeys = [_load_journey(store, workdir, j) for j in _journey_ids(args, project, workdir)]
+    journeys = [
+        _load_journey(store, workdir, j) for j in _journey_ids(args, project, workdir, store)
+    ]
     if not journeys:
         raise ConfigError("no journeys recorded for this project; record one with liftproof record")
+    _fetch_assets(store, workdir, journeys)
     options = WebOptions(
         compare_headers=web.compare_headers,
         ignore_json_paths=web.ignore_json_paths,
         ignore_text=web.ignore_text,
+        ignore_regions=web.ignore_regions,
         show_values=bool(args.show_values or project.database.show_values),
     )
     marks = _replay_watermarks(project, journeys, writer)
@@ -666,6 +1031,7 @@ def _replay_into(
             step_timeout_ms=web.step_timeout_ms,
             executable_path=web.chromium_path,
             workers=web.parallel_journeys,
+            on_journey=checkpoint.journey_done if checkpoint is not None else None,
         )
     finally:
         if marks is not None:
@@ -678,7 +1044,9 @@ def _record_replay_windows(marks, store: Store, workdir: Path, writer: FindingWr
     target, tables, before = marks
     try:
         after = watermark.read(target, tables)
-        new = watermark.windows(tables, before, after, writer.run_id)
+        new, problems = watermark.windows(tables, before, after, writer.run_id)
+        for p in problems:
+            _replay_mark_notice(writer, p)
         if new:
             local = workdir / watermark.STORE_KEY
             store.get_file(watermark.STORE_KEY, local)
@@ -691,7 +1059,7 @@ def _record_replay_windows(marks, store: Store, workdir: Path, writer: FindingWr
 
 
 def cmd_record(args: argparse.Namespace) -> int:
-    from liftproof.web.browser import BodyPolicy
+    from liftproof.web.browser import VOLATILE, BodyPolicy
     from liftproof.web.recorder import Recorder
 
     project = _project(args)
@@ -700,9 +1068,10 @@ def cmd_record(args: argparse.Namespace) -> int:
     store = _store(project, Path(args.workdir))
     recorder = Recorder(
         web.source_url,
-        policy=BodyPolicy(web.capture_bodies),
+        policy=BodyPolicy(web.capture_bodies, web.capture_snapshots),
         headless=False,
         executable_path=web.chromium_path,
+        regions=web.ignore_regions,
     )
     print(
         "Recording. Carry out the journey in the browser window, then close the window.",
@@ -713,6 +1082,15 @@ def cmd_record(args: argparse.Namespace) -> int:
         journey.writes_tables = [t.strip() for t in args.writes.split(",") if t.strip()]
     path = _save_journey(store, workdir, journey, assets)
     unconfirmed = [c.name for c in journey.correlations if not c.confirmed]
+    kept = sum(1 for s in journey.steps if s.region_asset)
+    # the steps each ignore region hid content in on the source, which is read only now: a
+    # selector that matched nothing there is worth knowing before the source is gone
+    hid = {
+        source: sum(source in (*s.region_hidden, s.region_ignored) for s in journey.steps)
+        for r in journey.ignore_regions
+        if (source := r.on("source"))
+    }
+    hid = {s: n for s, n in hid.items() if n or s != VOLATILE.selector}
     _out(
         args,
         {
@@ -722,9 +1100,20 @@ def cmd_record(args: argparse.Namespace) -> int:
             "correlations": [c.name for c in journey.correlations],
             "unconfirmed_correlations": unconfirmed,
             "unbound_tokens": journey.unbound_tokens(),
+            "snapshots_kept": kept,
+            "snapshots_structure_only": len(journey.steps) - kept,
+            "ignore_regions_hid": hid,
+            "warnings": recorder.warnings,
         },
         f"recorded {journey.journey_id}: {len(journey.steps)} steps, "
         f"{len(journey.correlations)} correlations ({len(unconfirmed)} to confirm)\n"
+        f"page snapshots kept for {kept} of {len(journey.steps)} steps (web.capture_snapshots); "
+        "the others are compared by structure\n"
+        + "".join(
+            f"ignore region {s} hid content in {n} of {len(journey.steps)} steps\n"
+            for s, n in hid.items()
+        )
+        + "".join(f"warning: {w}\n" for w in recorder.warnings)
         + "".join(
             f"bind {t} ({journey.secrets[t].field}): liftproof bind --project {args.project} "
             f"--journey {journey.journey_id} --token {t} --secret-arn ARN --key KEY\n"
@@ -777,16 +1166,42 @@ def _report(
     failure=None,
     template=None,
     scheduled=None,
+    not_reached=None,
+    resumed_at=None,
+    invoked_by=None,
+    values_shown=None,
+    finished_at=None,
+    prior=None,
+    regenerated=False,
+    canonical_revision=None,
+    type_map=None,
 ) -> dict[str, Any]:
+    """`prior` is the run's own report when one is regenerated: what the run was (its
+    reference, window, schedule, who ran it, versions) is taken from it as recorded,
+    never restated from today's project file. A run that wrote no report is
+    `regenerated` from what it recorded as it started, with the `canonical_revision` and
+    `type_map` it compared under, from its checkpoint."""
     findings = list(read_findings(run_dir))
     o = project.database
-    range_block: dict[str, Any] = {"run_window": f"{started} to {_now()}"}
+    finished_at = finished_at or _now()
+    if prior:
+        return _rewrite_report(project, run_id, mode, run_dir, findings, result, started,
+                               web_result, files_result, failure, template, prior)  # fmt: skip
+    range_block: dict[str, Any] = {"run_window": f"{started} to {finished_at}"}
     metadata: dict[str, Any] = {
-        "invoked_by": who_ran_it(),
-        "values_shown": o.show_values,
+        "invoked_by": invoked_by or who_ran_it(),
+        "values_shown": bool(o.show_values if values_shown is None else values_shown),
     }
+    if regenerated:
+        metadata["regenerated"] = _regenerated()
     if scheduled:
         metadata["schedule"] = scheduled
+    if canonical_revision is not None:
+        metadata["canonical_revision"] = canonical_revision
+    if resumed_at:
+        # tables finished before a resume were read then; the rest after it
+        metadata["resumed_at"] = list(resumed_at)
+        range_block["resumed_at"] = list(resumed_at)
     if result is not None and project.source is not None:
         range_block.update(
             {
@@ -800,7 +1215,13 @@ def _report(
                     else "live source"
                 ),
                 "consistency_position": baseline.position if baseline else "live read",
+                # spec 9.2: says in plain words when the tables were not read at one point
+                **({"cross_table_consistency": baseline.consistency()} if baseline else {}),
+                # lowest and highest key and dates of the rows compared, per side
+                "data_ranges": {t.table: t.ranges for t in result.tables if t.ranges},
                 "replication": result.replication,
+                # the structure compared before data (spec 9.13)
+                "structure": result.structure,
                 "sampling": None
                 if result.sample_seed is None
                 else {
@@ -815,12 +1236,16 @@ def _report(
                 "tls": {"source": project.source.sslmode, "target": project.target.sslmode},
                 "rows_per_bucket": o.rows_per_bucket,
                 "timestamp_precision": o.precision,
+                "type_map": type_map or _type_map(project),
             }
         )
+        if result.protection:
+            metadata["source_protection"] = result.protection
     if web_result is not None:
         range_block.update(
             {
                 "journeys": [j.journey for j in web_result.journeys],
+                "endpoints": [e["endpoint"] for e in web_result.endpoints],
                 "web_source": project.web.source_url if project.web else None,
                 "web_target": web_result.target_url,
                 "journeys_in_parallel": web_result.parallel,
@@ -841,14 +1266,50 @@ def _report(
         web=web_result,
         files=files_result,
         started_at=started,
-        finished_at=_now(),
+        finished_at=finished_at,
         metadata=metadata,
         range_block=range_block,
         run_failed=failure is not None,
         failure=failure,
+        not_reached=not_reached,
     )
     write_reports(report, run_dir, Path(template) if template else None)
     return report
+
+
+def _rewrite_report(project, run_id, mode, run_dir, findings, result, started, web_result,
+                    files_result, failure, template, prior) -> dict[str, Any]:  # fmt: skip
+    run = dict(prior.get("run", {}))
+    run.setdefault("canonical_revision", 0)  # a run from before canonical revisions
+    finished = run.pop("finished_at", None) or _now()
+    run.pop("started_at", None)
+    run["regenerated"] = _regenerated()
+    not_reached = [
+        c for c in prior.get("coverage", {}).get("not_covered", [])
+        if c.get("reason") == STOPPED
+    ]  # fmt: skip
+    report = build_report(
+        run_id=run_id,
+        project=project.name,
+        mode=mode,
+        findings=findings,
+        db=result,
+        web=web_result,
+        files=files_result,
+        started_at=started,
+        finished_at=finished,
+        metadata=run,
+        range_block=dict(prior.get("range", {})),
+        run_failed=failure is not None,
+        failure=failure,
+        not_reached=not_reached,
+    )
+    write_reports(report, run_dir, Path(template) if template else None)
+    return report
+
+
+def _regenerated() -> dict[str, str]:
+    return {"at": _now(), "by": who_ran_it(), "product_version": __version__}
 
 
 def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
@@ -872,6 +1333,9 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
             f"different, {c['files_missing']} missing)"
         )
     lines.append(f"differences: {c['differences']}, not checked: {c['not_checked']}")
+    consistency = report["range"].get("cross_table_consistency")
+    if consistency and not consistency["held"]:
+        lines.append(consistency["summary"])
     lines.append(f"report: {html}")
     _out(
         args,
@@ -880,6 +1344,7 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
             "verdict": report["verdict"],
             "counts": c,
             "coverage": {k: v for k, v in cov.items() if k.endswith("_pct")},
+            **({"cross_table_consistency": consistency} if consistency else {}),
             "report_html": html,
             "report_json": store.location(f"runs/{run_id}/report.json"),
         },
@@ -895,9 +1360,11 @@ def _conclude(args, report: dict[str, Any], store: Store, run_id: str) -> int:
 
 
 def cmd_runs(args: argparse.Namespace) -> int:
-    """Run history from the reports on this instance (spec 14)."""
+    """Run history (spec 14): every report in the store, whichever instance ran it."""
     project = _project(args)
-    rows = run_history(Path(args.workdir) / project.name / "runs")[: args.limit]
+    runs_dir = Path(args.workdir) / project.name / "runs"
+    sync_reports(_store(project, Path(args.workdir)), runs_dir)
+    rows = run_history(runs_dir)[: args.limit]
     text = "\n".join(
         f"{x['started_at']}  {x['run_id']:<34} {x['mode'] or '':<10} {x['verdict'] or '':<16} "
         f"{x['schedule'] or 'by hand'}"
@@ -905,6 +1372,15 @@ def cmd_runs(args: argparse.Namespace) -> int:
     )
     _out(args, {"runs": rows}, text or "no runs yet")
     return EXIT_OK
+
+
+def sync_reports(store: Store, runs_dir: Path) -> None:
+    """Copy the reports of runs this instance does not hold (another instance's, or a
+    replaced one's), or holds an older copy of, from the store."""
+    for key, written in store.modified("runs/").items():
+        parts = key.split("/")
+        if len(parts) == 3 and parts[2] == "report.json":
+            _copy_if_newer(store, key, runs_dir / parts[1] / "report.json", written)
 
 
 def run_history(runs_dir: Path) -> list[dict[str, Any]]:
@@ -995,28 +1471,57 @@ def cmd_ui_login(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+UNFINISHED = "the run stopped before writing its report; this one is rebuilt from what it left"
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     project = _project(args)
     workdir = Path(args.workdir) / project.name
     run_dir = workdir / "runs" / args.run
+    store = _store(project, Path(args.workdir))
+    holder = store.run_lock(args.run, "report").holder()
+    if holder and holder.get("run_id") == args.run:
+        raise RunFailed(
+            f"run {args.run} is in progress on {holder.get('host', '?')} since "
+            f"{holder.get('acquired_at', '?')} and writes its report as it ends; a run whose "
+            f"instance was lost is reported once its lock expires ({holder.get('expires_at')})"
+        )
+    _fetch_run(store, run_dir, args.run)
     if not run_dir.exists():
-        raise ConfigError(f"run {args.run} not found under {workdir / 'runs'}")
+        raise ConfigError(f"run {args.run} not found under {workdir / 'runs'} or in the store")
     prior = (
         json.loads((run_dir / "report.json").read_text())
         if (run_dir / "report.json").exists()
         else {}
     )
-    started = prior.get("run", {}).get("started_at", _now())
-    web_file = run_dir / "web-results.json"
+    info_file = run_dir / ckpt.RUN_INFO
+    info = json.loads(info_file.read_text(encoding="utf-8")) if info_file.exists() else {}
+    baseline = None
+    revision = type_map = None
+    progress_file = run_dir / ckpt.PROGRESS
+    if not prior and progress_file.exists():
+        # no report was written (the run stopped): its checkpoint names the reference
+        # and the rules it hashed under
+        progress = ckpt.RunProgress.load(progress_file)
+        started = progress.started_at
+        revision = progress.canonical_revision
+        type_map = progress.type_map or _type_map(project, legacy=True)
+        if progress.baseline:
+            baseline = _baseline_by_id(store, workdir, progress.baseline)
+    else:
+        started = prior.get("run", {}).get("started_at") or info.get("started_at") or _now()
+    web_file = run_dir / ckpt.WEB_RESULTS
     files_file = run_dir / "files-results.json"
     report = _report(
         project,
         args.run,
-        prior.get("mode", "reconcile"),
+        prior.get("mode") or info.get("mode", "reconcile"),
         run_dir,
         _load_results(run_dir) if (run_dir / "db-results.json").exists() else None,
         started,
-        None,
+        baseline,
+        finished_at=None if prior else _last_activity(run_dir),
+        prior=prior or None,
         web_result=(
             WebResult.from_dict(json.loads(web_file.read_text(encoding="utf-8")))
             if web_file.exists()
@@ -1027,13 +1532,50 @@ def cmd_report(args: argparse.Namespace) -> int:
             if files_file.exists()
             else None
         ),
-        failure=prior.get("failure"),
+        failure=prior.get("failure") if prior else UNFINISHED,
         template=args.template,
+        # what a run that wrote no report recorded as it started
+        scheduled=info.get("schedule"),
+        resumed_at=info.get("resumed_at"),
+        invoked_by=info.get("invoked_by"),
+        values_shown=info.get("values_shown"),
+        regenerated=not prior,
+        canonical_revision=revision,
+        type_map=type_map,
     )
-    store = _store(project, Path(args.workdir))
     for name in ("report.html", "report.json"):
         store.put_file(f"runs/{args.run}/{name}", run_dir / name)
     return _conclude(args, report, store, args.run)
+
+
+def _fetch_run(store: Store, run_dir: Path, run_id: str) -> None:
+    """The run's files this instance does not hold, or holds an older copy of, from the
+    store: the run may have stopped, or been resumed, on another instance."""
+    for key, written in store.modified(f"runs/{run_id}/").items():
+        parts = key.split("/")
+        if len(parts) == 3:
+            _copy_if_newer(store, key, run_dir / parts[2], written)
+
+
+def _copy_if_newer(store: Store, key: str, local: Path, written: float) -> None:
+    """A copy from the store takes the object's time, so it is copied again only once
+    the object has been written since."""
+    if not local.exists() or local.stat().st_mtime < written:
+        store.get_file(key, local)
+
+
+def _last_activity(run_dir: Path) -> str:
+    """When a run that wrote no report last wrote anything: the end of its window."""
+    times = [f.stat().st_mtime for f in run_dir.iterdir() if not f.name.startswith("report.")]
+    when = dt.datetime.fromtimestamp(max(times), dt.UTC) if times else dt.datetime.now(dt.UTC)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _baseline_by_id(store: Store, workdir: Path, bid: str) -> Baseline | None:
+    path = workdir / "baselines" / bid / "manifest.json"
+    if not path.exists() and not store.get_file(f"baselines/{bid}/manifest.json", path):
+        return None
+    return Baseline.load(path)
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1090,7 +1632,7 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                         "snapshot isolation is off: a baseline of a live source is not "
                         "consistent (ALTER DATABASE ... SET ALLOW_SNAPSHOT_ISOLATION ON)",
                     )
-                return f"connected to {c.describe()}"
+                return f"connected to {c.describe()}: {a.product} {a.version}"
 
         check(
             f"{role} database connection" + (" and read only user" if role == "source" else ""),
@@ -1143,13 +1685,37 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                 "the pg_monitor role (or pg_read_all_stats)",
             ),
         )
-    if project.web is not None:
+    try:
+        store: Store | None = _store(project, Path(args.workdir))
+    except ConfigError:
+        raise  # instance settings this user cannot read stop the command (decision 67)
+    except Exception as exc:  # an SDK set up wrongly (a missing AWS_PROFILE): one failure
+        store = None
+        checks.append(
+            {"check": "results storage", "result": "fail",
+             "detail": logs.scrub(f"{type(exc).__name__}: {exc}"),
+             "remedy": "fix the AWS profile (AWS_PROFILE, ~/.aws/config) or unset it to "
+                       "use the instance role"}
+        )  # fmt: skip
+    if project.web is not None and store is not None:
         workdir = Path(args.workdir) / project.name
-        store = _store(project, Path(args.workdir))
-        for jid in _journey_ids(args, project, workdir):
+        for jid in _journey_ids(args, project, workdir, store):
+            loaded: list[Journey] = []
 
-            def _tokens(j=jid):
-                journey = _load_journey(store, workdir, j)
+            def _loads(j=jid, into=loaded):
+                into.append(_load_journey(store, workdir, j))
+                return f"{len(into[0].steps)} steps"
+
+            check(
+                f"journey {jid} loads",
+                _loads,
+                "record the journey with liftproof record; one recorded by a newer version of "
+                "liftproof needs that version here",
+            )
+            if not loaded:
+                continue
+
+            def _tokens(journey=loaded[0]):
                 values = _journey_secrets(journey)
                 return f"{len(values)} secret(s) resolve" if values else "no secrets needed"
 
@@ -1172,6 +1738,20 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
             return f"chromium {version}"
 
         check("browser starts", _browser, "the AMI ships Chromium; set web.chromium_path")
+        if project.web.ignore_regions:
+
+            def _regions():
+                from liftproof.web.browser import check_regions
+
+                check_regions(project.web.ignore_regions, project.web.chromium_path)
+                return f"{len(project.web.ignore_regions)} ignore region(s)"
+
+            check(
+                "web.ignore_regions are CSS selectors",
+                _regions,
+                "write each as document.querySelector takes it; Playwright's text= and >> "
+                "are not CSS",
+            )
     for fs in project.files:
         for which in ("source", "target"):
 
@@ -1196,25 +1776,69 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                 "mount the share on the instance read only, or grant s3:ListBucket and "
                 "s3:GetObject on the prefix to the instance role",
             )
-    if project.store.s3_bucket:
+    if isinstance(store, S3Store):  # the project's bucket, or the deployment's
 
-        def _s3():
+        def _s3(st=store):
             import tempfile
 
-            store = S3Store(
-                project.store.s3_bucket, project.store.s3_prefix, project.store.kms_key_id
-            )
-            with tempfile.NamedTemporaryFile() as tmp:
-                tmp.write(b"liftproof doctor probe")
-                tmp.flush()
-                store.put_file("doctor/probe.txt", Path(tmp.name))
-            return store.location("doctor/probe.txt")
+            probe = f"liftproof doctor probe {dt.datetime.now(dt.UTC).isoformat()}".encode()
+            with tempfile.TemporaryDirectory() as tmp:
+                sent, back = Path(tmp) / "sent", Path(tmp) / "back"
+                sent.write_bytes(probe)
+                st.put_file("doctor/probe.txt", sent)
+                # reading it back decrypts it: the key allows Decrypt as well as
+                # GenerateDataKey, which a resume and the report history need
+                _assert(st.get_file("doctor/probe.txt", back), "the probe was not found again")
+                _assert(back.read_bytes() == probe, "the probe read back differs")
+            key = st.kms_key_id or "the bucket's default key"
+            return f"{st.location('doctor/probe.txt')} written and read back, encrypted with {key}"
 
         check(
-            "S3 bucket writable with KMS encryption",
+            "S3 bucket writable and readable with KMS encryption",
             _s3,
-            "grant s3:PutObject on the bucket and kms:GenerateDataKey on the key; for a "
-            "customer managed key the key policy must also allow the instance role",
+            "grant s3:PutObject and s3:GetObject on the bucket, and kms:GenerateDataKey and "
+            "kms:Decrypt on the key; for a customer managed key the key policy must also "
+            "allow the instance role",
+        )
+    elif store is not None:
+        where = store.location("")
+        checks.append(
+            {"check": "results storage", "result": "pass",
+             "detail": f"no S3 bucket set: results stay in {where}"}
+        )  # fmt: skip
+    inst = _instance_config()
+    if inst.get("region"):
+        vpc_cidrs = (str(inst["vpc_cidr"]),) if inst.get("vpc_cidr") else ()
+
+        def _endpoints(r=inst["region"], cidrs=vpc_cidrs):
+            routes, failed = {}, []
+            for svc in aws.ENDPOINT_SERVICES:
+                try:
+                    routes[svc] = aws.reach(svc, r, vpc_cidrs=cidrs)
+                except OSError as exc:
+                    failed.append(f"{svc} ({exc.strerror or type(exc).__name__})")
+            if failed:
+                raise ConfigError(f"not reachable in {r}: " + ", ".join(failed))
+            detail = f"all {len(routes)} services answer in {r}"
+            public = [svc for svc, how in routes.items() if how == "public address"]
+            if public:
+                # works through a NAT gateway, but that traffic leaves the VPC
+                detail += f"; through a public address, not a VPC endpoint: {', '.join(public)}"
+            gateways = [svc for svc, how in routes.items() if how == "gateway"]
+            if gateways:
+                detail += (
+                    f"; {', '.join(gateways)} keeps public addresses through a gateway "
+                    "endpoint, so its route is not checked here: the private route tables "
+                    "need that endpoint"
+                )
+            return detail
+
+        check(
+            "AWS service endpoints reachable",
+            _endpoints,
+            "create the VPC endpoints (CreateVpcEndpoints, or create_vpc_endpoints in "
+            "Terraform), turn on private DNS for them, and allow HTTPS from the instance's "
+            "security group to the endpoints' security group",
         )
     return checks
 
@@ -1258,17 +1882,36 @@ def _assert(cond: bool, message: str) -> None:
 
 
 # ----------------------------------------------------------------------- parser
-def build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--format", choices=["text", "json"], default="text")
-    common.add_argument("--log-level", default="info")
-    common.add_argument("--workdir", default=str(DEFAULT_WORKDIR))
-    common.add_argument(
-        "--fail-on", choices=["differences", "errors", "never"], default="differences"
-    )
+LOG_LEVELS = ("debug", "info", "warning", "error")
 
+
+def _common_flags(*, defaults: bool) -> argparse.ArgumentParser:
+    """The flags every command takes, before or after the command name. Only the top
+    level parser sets their defaults: a subcommand's default would otherwise overwrite
+    a flag given before the command (`liftproof --format json reconcile ...`)."""
+
+    def default(value: str) -> str:
+        return value if defaults else argparse.SUPPRESS
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--format", choices=["text", "json"], default=default("text"))
+    common.add_argument(
+        "--log-level", type=str.lower, choices=LOG_LEVELS, default=default("info"),
+        help="debug also logs each SQL statement (never its values) and each locator used",
+    )  # fmt: skip
+    common.add_argument("--workdir", default=default(str(DEFAULT_WORKDIR)))
+    common.add_argument(
+        "--fail-on", choices=["differences", "errors", "never"], default=default("differences")
+    )
+    return common
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = _common_flags(defaults=False)
     p = argparse.ArgumentParser(
-        prog="liftproof", description="Liftproof migration validation", parents=[common]
+        prog="liftproof",
+        description="Liftproof migration validation",
+        parents=[_common_flags(defaults=True)],
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1322,6 +1965,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--template", help="directory holding a custom report.html.j2")
     s.add_argument("--scheduled", metavar="SCHEDULE", help=argparse.SUPPRESS)
     s.add_argument("--include-replay-rows", action="store_true", help=REPLAY_ROWS_HELP)
+    s.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an interrupted reconciliation (the latest one, or --run-id), "
+        "on this instance or a replacement",
+    )
     s.set_defaults(fn=cmd_reconcile)
 
     def run_flags(s, database: bool) -> None:
@@ -1394,6 +2043,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=float, default=30.0, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_scheduler)
 
+    s = sub.add_parser("restore", parents=[common], help="bring project files back from S3")
+    s.add_argument("--projects-dir", default=str(DEFAULT_WORKDIR))
+    s.add_argument("--bucket", help="default: this deployment's bucket")
+    s.set_defaults(fn=cmd_restore)
+
     s = sub.add_parser("ui", parents=[common], help="the local web UI (127.0.0.1 only)")
     s.add_argument("--projects-dir", default=str(DEFAULT_WORKDIR))
     s.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
@@ -1425,6 +2079,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         _refuse_env_credentials()
+        _configure_aws()
         return args.fn(args)
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
