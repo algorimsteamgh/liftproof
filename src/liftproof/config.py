@@ -416,8 +416,9 @@ source:
   secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/source   # username, password
   sslmode: verify-full          # full certificate verification; lowering it is reported
                                 # Oracle: TLS is TCPS, usually on port 2484
-                                # SQL Server: verify-ca or verify-full (needs sslrootcert)
-  # sslrootcert: /opt/liftproof/certs/private-ca.pem
+                                # SQL Server: verify-ca or verify-full
+  # sslrootcert: /var/lib/mvt/certs/private-ca.pem   # only for a private CA; the AMI
+                                # already trusts Amazon RDS and public certificate authorities
   statement_timeout_ms: 600000
   rows_per_second: 0            # application side hashing only; 0 = unlimited
 
@@ -427,8 +428,7 @@ target:
   port: 5432
   database: app
   secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/target
-  sslmode: verify-full
-  sslrootcert: /opt/liftproof/certs/rds-global-bundle.pem
+  sslmode: verify-full          # RDS certificates verify against the bundle on the AMI
 
 web:                            # record and replay; omit for database only projects
   source_url: https://app.example.internal

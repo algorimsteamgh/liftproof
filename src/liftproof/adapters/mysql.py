@@ -217,18 +217,13 @@ def _ssl_args(sslmode: str, sslrootcert: str | None) -> dict[str, Any]:
             return {"ssl_disabled": True}
         case "require" | "prefer":
             return {"ssl": {"check_hostname": False, "verify_mode": ssl.CERT_NONE}}
-        case "verify-ca":
-            return {
-                "ssl": {
-                    "ca": sslrootcert,
-                    "check_hostname": False,
-                    "verify_mode": ssl.CERT_REQUIRED,
-                }
-            }
-        case "verify-full":
-            return {
-                "ssl": {"ca": sslrootcert, "check_hostname": True, "verify_mode": ssl.CERT_REQUIRED}
-            }
+        case "verify-ca" | "verify-full":
+            # A context, not PyMySQL's dict: given a dict with no "ca", PyMySQL turns
+            # certificate and host name checks off. With no sslrootcert this context
+            # trusts the system CAs, as Oracle and SQL Server do.
+            ctx = ssl.create_default_context(cafile=sslrootcert)
+            ctx.check_hostname = sslmode == "verify-full"
+            return {"ssl": ctx}
     raise ConfigError(f"sslmode {sslmode!r} is not one of disable, require, verify-ca, verify-full")
 
 

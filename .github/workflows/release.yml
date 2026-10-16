@@ -13,6 +13,12 @@ permissions:
 env:
   AWS_REGION: ap-south-1
 
+# Every run step is bash with pipefail, so a piped command (pip-audit | tee) fails the
+# step when the first command fails, not only when the last one does.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   performance:
     # PRD N9: the KPI suite gates every release; its numbers are kept with the evidence
@@ -21,20 +27,24 @@ jobs:
   ami:
     needs: performance
     runs-on: ubuntu-24.04
-    environment: release
+    # No `environment:` here. A job in an environment gets the OIDC subject
+    # repo:<repo>:environment:<name>, which the release role's trust policy does not
+    # accept: it trusts only the tag refs (infra/modules/build-account). The variables
+    # below are repository variables.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install build pip-audit
-      - name: Dependency gate (ATS-009)
-        run: pip-audit --strict . | tee pip-audit.log
-      - run: python -m build --wheel
+      # Credentials first, so the evidence step can keep the log of a blocked release
       - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.LIFTPROOF_RELEASE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      - run: pip install build pip-audit
+      - name: Dependency gate (ATS-009)
+        run: pip-audit --strict . | tee pip-audit.log
+      - run: python -m build --wheel
       - uses: hashicorp/setup-packer@main
         with:
           version: "1.16.1"

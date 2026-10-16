@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Every run step is bash with pipefail, so a piped command (pip-audit | tee) fails the
+# step when the first command fails, not only when the last one does.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     runs-on: ubuntu-24.04

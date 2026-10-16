@@ -828,7 +828,7 @@ Resources:
               write_files:
                 - path: /etc/mvt/config.yaml
                   permissions: "0640"
-                  owner: root:root
+                  owner: root:mvt
                   content: |
                     deployment: ${DeploymentName}
                     region: ${AWS::Region}

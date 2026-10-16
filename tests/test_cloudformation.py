@@ -121,6 +121,12 @@ def test_instance_settings_match(template):
     user_data = template["Resources"]["Instance"]["Properties"]["UserData"]["Fn::Base64"]
     cfn_keys = re.findall(r"^\s+(\w+): \$\{", user_data["Fn::Sub"][0], re.M)
     assert sorted(cfn_keys) == sorted(tf_keys)
+    # every product process runs as mvt, so the file must be readable by that group
+    for user_data_text in (user_data["Fn::Sub"][0], tf("compute.tf")):
+        written = re.search(
+            r'path: /etc/mvt/config\.yaml\s+permissions: "(\d+)"\s+owner: (\S+)', user_data_text
+        )
+        assert written.groups() == ("0640", "root:mvt")
     lt = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]
     assert lt["MetadataOptions"]["HttpTokens"] == "required"
     assert lt["BlockDeviceMappings"][0]["Ebs"]["Encrypted"] is True
