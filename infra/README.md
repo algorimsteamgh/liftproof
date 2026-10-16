@@ -73,7 +73,17 @@ terraform apply -var ami_id=ami-... -var source_database_cidr=10.1.2.0/24 \
 
 Then store the database logins in Secrets Manager under `liftproof/acme-prod/`
 (`{"username": ..., "password": ...}`), open the UI with the `connect_ui` output, and
-run `liftproof doctor`.
+run `liftproof doctor`. On the instance, doctor also connects to every AWS service
+endpoint the product needs, and names any interface endpoint service (Systems Manager,
+Secrets Manager, KMS, CloudWatch) reached through a public address rather than a VPC
+endpoint. S3 keeps public addresses through its gateway endpoint, so doctor cannot see
+its route: check that the private route tables carry the S3 gateway endpoint
+(`private_route_table_ids` / `PrivateRouteTableIds`).
+
+Each Liftproof process (a run, doctor, the UI, the scheduler) limits its own AWS calls to
+20 requests a second unless `aws_requests_per_second` (CloudFormation:
+`AwsRequestsPerSecond`) says otherwise; runs going at once each have that limit. Lower it
+in an account whose API quotas other workloads already use heavily.
 
 ### Bring your own KMS key
 

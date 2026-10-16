@@ -9,11 +9,13 @@ from __future__ import annotations
 import abc
 import datetime as dt
 import decimal
+import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from liftproof.canonical import CanonicalType
+from liftproof.errors import ConfigError
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,23 @@ def in_list(expr: str, values: Sequence[int], chunk: int | None = None) -> str:
 class Adapter(abc.ABC):
     engine: str = "abstract"
     hash_probe: str = "SELECT md5('liftproof')"  # doctor: MD5 is usable on this server
+    product: str = "the database"
+    minimum_version: tuple[int, ...] = ()  # the oldest server the adapter supports
+    minimum_shown: str = ""
+    version: str = ""
+
+    def require_version(self, found: str) -> None:
+        """Refuse a server older than the oldest supported when connecting, rather than
+        fail halfway through a baseline on a function it lacks."""
+        self.version = found
+        n = len(self.minimum_version)
+        parts = tuple(int(x) for x in re.findall(r"\d+", found)[:n])
+        if parts and parts + (0,) * (n - len(parts)) < self.minimum_version:
+            self.close()
+            raise ConfigError(
+                f"{self.product} {found} is not supported; Liftproof needs "
+                f"{self.minimum_shown} or later"
+            )
 
     @abc.abstractmethod
     def close(self) -> None: ...

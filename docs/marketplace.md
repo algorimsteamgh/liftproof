@@ -23,8 +23,8 @@ your AWS account on one private EC2 instance with no inbound access, and compare
 and target on three fronts:
 
 - **Databases:** every row of every table, by hashing inside each database and narrowing
-  any difference down to the rows involved. PostgreSQL, MySQL, MariaDB, Oracle and SQL
-  Server, in any pairing, including the Amazon RDS and Aurora versions.
+  any difference down to the rows involved. PostgreSQL 13+, MySQL 8.0+, Oracle 19c+ and SQL
+  Server 2016+, in any pairing, including the Amazon RDS and Aurora versions.
 - **Files:** local folders, network shares or Amazon S3 on either side, matched by size
   and SHA-256, with text aware comparison of PDF, CSV and JSON so a regenerated document
   is not reported as a lost one.

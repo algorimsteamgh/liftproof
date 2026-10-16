@@ -260,8 +260,15 @@ def _tls_args(host: str, sslmode: str, sslrootcert: str | None) -> dict[str, Any
     raise ConfigError(f"sslmode {sslmode!r} is not one of disable, verify-ca, verify-full")
 
 
+# SERVERPROPERTY('EngineEdition') of the Azure services, which report ProductVersion 12.0
+AZURE_EDITIONS = {5: "Azure SQL Database", 8: "Azure SQL Managed Instance"}
+
+
 class SQLServerAdapter(Adapter):
     engine = "sqlserver"
+    product = "SQL Server"
+    minimum_version = (13,)  # HASHBYTES without an input limit
+    minimum_shown = "SQL Server 2016 (13.x)"
     hash_probe = "SELECT HASHBYTES('MD5', 'liftproof')"
     supports_row_filters = True
     supports_sampling = True
@@ -316,18 +323,25 @@ class SQLServerAdapter(Adapter):
         self.conn = sqllog.wrap(self.conn, self.engine)
         self.read_only = read_only
         self.rows_per_second = rows_per_second
+        self._natives: dict[TableRef, dict[str, str]] = {}
+        self._in_snapshot = False  # before anything that can close() the adapter
         with self.conn.cursor() as cur:
             for stmt in SESSION:
                 cur.execute(stmt)
-        (self.version,) = self._query("SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar)")[0]
+        version, edition = self._query(
+            "SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar), "
+            "CAST(SERVERPROPERTY('EngineEdition') AS int)"
+        )[0]
+        if edition in AZURE_EDITIONS:  # always the current engine, whatever 12.0 says
+            self.version = f"{version} ({AZURE_EDITIONS[edition]})"
+        else:
+            self.require_version(version)
         self._settings = {
             s.removeprefix("SET ").split(" ", 1)[0]: s.split(" ")[-1] for s in SESSION
         }
         self._settings["statement_timeout_ms"] = str(statement_timeout_ms)
         # SQL Server has no read only session. The adapter only ever reads, and doctor
         # checks the login holds no write permission.
-        self._natives: dict[TableRef, dict[str, str]] = {}
-        self._in_snapshot = False
 
     def close(self) -> None:
         try:

@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from liftproof import aws
+
 ROOT = Path(__file__).resolve().parents[1]
 CFN = ROOT / "infra/cloudformation/liftproof.yaml"
 MODULE = ROOT / "infra/modules/liftproof"
@@ -41,6 +43,7 @@ INPUTS = {
     "log_retention_days": ["LogRetentionDays"],
     "operator_principal_arns": ["OperatorPrincipalArns"],
     "alarm_topic_arn": ["AlarmTopicArn"],
+    "aws_requests_per_second": ["AwsRequestsPerSecond"],
     "tags": [],  # stack tags propagate in CloudFormation
 }
 
@@ -142,6 +145,15 @@ def test_endpoints_match(template):
         and r["Properties"]["VpcEndpointType"] == "Interface"
     }
     assert cfn == tf_endpoints
+    gateways = {
+        r["Properties"]["ServiceName"]["Fn::Sub"].rsplit(".", 1)[1]
+        for r in template["Resources"].values()
+        if r["Type"] == "AWS::EC2::VPCEndpoint"
+        and r["Properties"]["VpcEndpointType"] == "Gateway"
+    }
+    # what doctor checks is what the deployment creates
+    assert set(aws.GATEWAY_SERVICES) == gateways
+    assert sorted(aws.ENDPOINT_SERVICES) == sorted(tf_endpoints | gateways)
 
 
 def test_no_inbound_and_no_public_address(template):

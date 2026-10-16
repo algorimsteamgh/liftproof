@@ -271,6 +271,9 @@ def _ssl_args(sslmode: str, sslrootcert: str | None) -> dict[str, Any]:
 
 class OracleAdapter(Adapter):
     engine = "oracle"
+    product = "Oracle Database"
+    minimum_version = (19,)
+    minimum_shown = "Oracle Database 19c"
     hash_probe = "SELECT STANDARD_HASH('liftproof', 'MD5') FROM DUAL"
     supports_row_filters = True
     supports_sampling = True
@@ -317,7 +320,7 @@ class OracleAdapter(Adapter):
         with self.conn.cursor() as cur:
             for name, value in SESSION.items():
                 cur.execute(f"ALTER SESSION SET {name} = {value}")
-        self.version = self.conn.version
+        self.require_version(self.conn.version)
         self._settings = {k: v.strip("'") for k, v in SESSION.items()}
         self._settings["call_timeout_ms"] = str(statement_timeout_ms)
         # Oracle has no read only session. The adapter only ever reads, a snapshot is a

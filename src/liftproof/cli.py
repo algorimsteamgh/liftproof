@@ -140,6 +140,22 @@ def _instance_config() -> dict[str, Any]:
         ) from None
 
 
+def _configure_aws() -> None:
+    """The deployment's region, and its ceiling on AWS calls per second (AWSAPI-002)."""
+    try:
+        inst = _instance_config()
+    except ConfigError:
+        inst = {}  # a command that needs the settings says so itself
+    aws.configure_region(inst.get("region"))
+    rate = inst.get("aws_requests_per_second")
+    try:
+        aws.configure_rate_limit(float(rate) if rate else aws.DEFAULT_RATE)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"aws_requests_per_second in {INSTANCE_CONFIG} is not a number: {rate!r}"
+        ) from None
+
+
 def _store(project: Project, workdir: Path) -> Store:
     inst = _instance_config()
     bucket = project.store.s3_bucket or inst.get("bucket")
@@ -1409,7 +1425,7 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                         "snapshot isolation is off: a baseline of a live source is not "
                         "consistent (ALTER DATABASE ... SET ALLOW_SNAPSHOT_ISOLATION ON)",
                     )
-                return f"connected to {c.describe()}"
+                return f"connected to {c.describe()}: {a.product} {a.version}"
 
         check(
             f"{role} database connection" + (" and read only user" if role == "source" else ""),
@@ -1462,9 +1478,20 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                 "the pg_monitor role (or pg_read_all_stats)",
             ),
         )
-    if project.web is not None:
+    try:
+        store: Store | None = _store(project, Path(args.workdir))
+    except ConfigError:
+        raise  # instance settings this user cannot read stop the command (decision 67)
+    except Exception as exc:  # an SDK set up wrongly (a missing AWS_PROFILE): one failure
+        store = None
+        checks.append(
+            {"check": "results storage", "result": "fail",
+             "detail": logs.scrub(f"{type(exc).__name__}: {exc}"),
+             "remedy": "fix the AWS profile (AWS_PROFILE, ~/.aws/config) or unset it to "
+                       "use the instance role"}
+        )  # fmt: skip
+    if project.web is not None and store is not None:
         workdir = Path(args.workdir) / project.name
-        store = _store(project, Path(args.workdir))
         for jid in _journey_ids(args, project, workdir, store):
 
             def _tokens(j=jid):
@@ -1515,25 +1542,69 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                 "mount the share on the instance read only, or grant s3:ListBucket and "
                 "s3:GetObject on the prefix to the instance role",
             )
-    if project.store.s3_bucket:
+    if isinstance(store, S3Store):  # the project's bucket, or the deployment's
 
-        def _s3():
+        def _s3(st=store):
             import tempfile
 
-            store = S3Store(
-                project.store.s3_bucket, project.store.s3_prefix, project.store.kms_key_id
-            )
-            with tempfile.NamedTemporaryFile() as tmp:
-                tmp.write(b"liftproof doctor probe")
-                tmp.flush()
-                store.put_file("doctor/probe.txt", Path(tmp.name))
-            return store.location("doctor/probe.txt")
+            probe = f"liftproof doctor probe {dt.datetime.now(dt.UTC).isoformat()}".encode()
+            with tempfile.TemporaryDirectory() as tmp:
+                sent, back = Path(tmp) / "sent", Path(tmp) / "back"
+                sent.write_bytes(probe)
+                st.put_file("doctor/probe.txt", sent)
+                # reading it back decrypts it: the key allows Decrypt as well as
+                # GenerateDataKey, which a resume and the report history need
+                _assert(st.get_file("doctor/probe.txt", back), "the probe was not found again")
+                _assert(back.read_bytes() == probe, "the probe read back differs")
+            key = st.kms_key_id or "the bucket's default key"
+            return f"{st.location('doctor/probe.txt')} written and read back, encrypted with {key}"
 
         check(
-            "S3 bucket writable with KMS encryption",
+            "S3 bucket writable and readable with KMS encryption",
             _s3,
-            "grant s3:PutObject on the bucket and kms:GenerateDataKey on the key; for a "
-            "customer managed key the key policy must also allow the instance role",
+            "grant s3:PutObject and s3:GetObject on the bucket, and kms:GenerateDataKey and "
+            "kms:Decrypt on the key; for a customer managed key the key policy must also "
+            "allow the instance role",
+        )
+    elif store is not None:
+        where = store.location("")
+        checks.append(
+            {"check": "results storage", "result": "pass",
+             "detail": f"no S3 bucket set: results stay in {where}"}
+        )  # fmt: skip
+    inst = _instance_config()
+    if inst.get("region"):
+        vpc_cidrs = (str(inst["vpc_cidr"]),) if inst.get("vpc_cidr") else ()
+
+        def _endpoints(r=inst["region"], cidrs=vpc_cidrs):
+            routes, failed = {}, []
+            for svc in aws.ENDPOINT_SERVICES:
+                try:
+                    routes[svc] = aws.reach(svc, r, vpc_cidrs=cidrs)
+                except OSError as exc:
+                    failed.append(f"{svc} ({exc.strerror or type(exc).__name__})")
+            if failed:
+                raise ConfigError(f"not reachable in {r}: " + ", ".join(failed))
+            detail = f"all {len(routes)} services answer in {r}"
+            public = [svc for svc, how in routes.items() if how == "public address"]
+            if public:
+                # works through a NAT gateway, but that traffic leaves the VPC
+                detail += f"; through a public address, not a VPC endpoint: {', '.join(public)}"
+            gateways = [svc for svc, how in routes.items() if how == "gateway"]
+            if gateways:
+                detail += (
+                    f"; {', '.join(gateways)} keeps public addresses through a gateway "
+                    "endpoint, so its route is not checked here: the private route tables "
+                    "need that endpoint"
+                )
+            return detail
+
+        check(
+            "AWS service endpoints reachable",
+            _endpoints,
+            "create the VPC endpoints (CreateVpcEndpoints, or create_vpc_endpoints in "
+            "Terraform), turn on private DNS for them, and allow HTTPS from the instance's "
+            "security group to the endpoints' security group",
         )
     return checks
 
@@ -1774,6 +1845,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         _refuse_env_credentials()
+        _configure_aws()
         return args.fn(args)
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)

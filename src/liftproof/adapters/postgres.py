@@ -142,8 +142,19 @@ def _excluding(predicate: str | None) -> sql.Composable:
     return sql.SQL(" WHERE ({}) IS NOT TRUE").format(sql.SQL(predicate))  # noqa: S608
 
 
+def _shown_version(v: int) -> str:
+    """psycopg's server_version as PostgreSQL writes it: 160004 is 16.4, and before
+    version 10 the minor release had its own two digits (90624 is 9.6.24)."""
+    if v >= 100000:
+        return f"{v // 10000}.{v % 10000}"
+    return f"{v // 10000}.{v // 100 % 100}.{v % 100}"
+
+
 class PostgresAdapter(Adapter):
     engine = "postgresql"
+    product = "PostgreSQL"
+    minimum_version = (13,)  # trim_scale(), used to render exact numbers
+    minimum_shown = "PostgreSQL 13"
     supports_row_filters = True
     supports_sampling = True
 
@@ -198,6 +209,7 @@ class PostgresAdapter(Adapter):
                 )
         self._settings = settings
         self._in_snapshot = False
+        self.require_version(_shown_version(self.conn.info.server_version))
 
     def close(self) -> None:
         if not self.conn.closed:
