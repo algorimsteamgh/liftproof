@@ -301,6 +301,9 @@ def test_xmltype_hashes_like_its_canonical_text(make_oracle_db, oracle_adapter_f
         "CREATE TABLE docs (id NUMBER(9) PRIMARY KEY, doc XMLTYPE, pretty XMLTYPE, "
         "canon VARCHAR2(400))"
     )
+    cur.execute("SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'")
+    # a single-byte database (charset.yml) cannot hold the combining accent
+    e = "e\u0301" if cur.fetchone()[0] == "AL32UTF8" else "\u00e9"
     cur.executemany(
         "INSERT INTO docs VALUES (:i, CASE WHEN :d IS NULL THEN NULL ELSE XMLTYPE(:d) END, "
         "CASE WHEN :p IS NULL THEN NULL ELSE XMLTYPE(:p) END, :c)",
@@ -310,7 +313,7 @@ def test_xmltype_hashes_like_its_canonical_text(make_oracle_db, oracle_adapter_f
              "c": '<a a="1" b="2"><x></x><y>t</y></a>'},
             {"i": 2, "d": None, "p": None, "c": None},
             {"i": 3, "d": "<?xml version='1.0'?><a><!-- c --><b>caf\u00e9</b></a>",
-             "p": "<a>\n  <b>cafe\u0301</b>\n</a>", "c": "<a><b>caf\u00e9</b></a>"},
+             "p": f"<a>\n  <b>caf{e}</b>\n</a>", "c": "<a><b>caf\u00e9</b></a>"},
             {"i": 4, "d": '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>',
              "p": '<p:a xmlns:p="urn:p">\n<p:b xml:space="preserve">  </p:b></p:a>',
              "c": '<p:a xmlns:p="urn:p"><p:b xml:space="preserve">  </p:b></p:a>'},
