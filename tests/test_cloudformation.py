@@ -158,3 +158,14 @@ def test_alarm_dimension_is_what_the_cli_publishes(template):
     dims = template["Resources"]["SkippedRunsAlarm"]["Properties"]["Dimensions"]
     assert [d["Name"] for d in dims] == ["Deployment"]
     assert "dimensions          = { Deployment = var.name }" in tf("monitoring.tf")
+
+
+def test_customer_key_statements_are_published(template):
+    """With the customer's own key the log group fails to create until its policy allows
+    CloudWatch Logs; the statements are an output and in the deployment guide."""
+    assert 'output "customer_key_policy_statements"' in tf("outputs.tf")
+    guide = (ROOT / "infra/README.md").read_text(encoding="utf-8")
+    for sid in re.findall(r'sid\s*=\s*"(\w+)"', tf("kms.tf")):
+        if sid != "AccountAdministration":
+            assert f'"Sid": "{sid}"' in guide, sid
+    assert "Bring your own KMS key" in template["Parameters"]["KmsKeyArn"]["Description"]

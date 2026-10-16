@@ -40,3 +40,8 @@ output "start_run" {
   description = "What a pipeline calls at cutover."
   value       = "aws ssm send-command --instance-ids ${aws_instance.this.id} --document-name ${aws_ssm_document.run.name} --parameters project=PROJECT,mode=reconcile"
 }
+
+output "customer_key_policy_statements" {
+  description = "With your own kms_key_arn: add these statements to that key's policy before the first apply (CloudWatch Logs cannot use the key without one). Null when the module creates the key."
+  value       = var.kms_key_arn == null ? null : jsonencode(local.customer_key_statements)
+}

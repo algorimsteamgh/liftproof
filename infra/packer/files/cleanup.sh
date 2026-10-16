@@ -2,7 +2,7 @@
 # Leave nothing build specific or secret in the image (Marketplace AMI requirements).
 set -euo pipefail
 rm -f /tmp/liftproof-*.whl
-rm -rf /tmp/liftproof-files
+rm -rf /tmp/liftproof-files /var/tmp/ami-dependency-audit.txt
 apt-get -y autoremove --purge
 apt-get clean
 rm -rf /var/lib/apt/lists/*

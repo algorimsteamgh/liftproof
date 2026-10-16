@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_call: # release.yml runs the whole suite again on the tagged commit (OPE-004)
 
 permissions:
   contents: read
