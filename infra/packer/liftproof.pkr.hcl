@@ -19,9 +19,11 @@ packer {
   }
 }
 
+# AWS Marketplace takes source AMIs only from us-east-1 and copies them to every Region
+# the listing enables.
 variable "region" {
   type    = string
-  default = "ap-south-1"
+  default = "us-east-1"
 }
 
 variable "version" {
@@ -128,7 +130,7 @@ build {
 
   provisioner "shell" {
     execute_command  = "sudo -E bash -euo pipefail '{{ .Path }}'"
-    environment_vars = ["LIFTPROOF_VERSION=${var.version}"]
+    environment_vars = ["LIFTPROOF_VERSION=${var.version}", "AWS_REGION=${var.region}"]
     scripts          = ["${path.root}/files/provision.sh", "${path.root}/files/scheduler.sh", "${path.root}/files/harden.sh"]
   }
 

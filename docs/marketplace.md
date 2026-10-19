@@ -44,7 +44,7 @@ your data. Nothing is sent to Algorims.
 
 1. Row level proof across PostgreSQL, MySQL, Oracle and SQL Server without copying data
    out of either database.
-2. Deploys into a private subnet with no inbound rule, no SSH and no public address;
+2. Deploys into a private subnet with no inbound rule, no key pair and no public address;
    operators connect through Session Manager.
 3. Reports are KMS encrypted and kept under S3 Object Lock for the retention you choose.
 
@@ -74,6 +74,12 @@ your data. Nothing is sent to Algorims.
    output and call the command in the **StartRun** output.
 
 Deleting the stack keeps the S3 bucket and its locked reports (DeletionPolicy Retain).
+
+## Image requirements
+
+The source AMI is built in us-east-1, the only Region AWS Marketplace takes a new version
+from, and keeps a key only SSH daemon for the Marketplace security scan (decisions 134
+and 135).
 
 ## Still needed before submission
 

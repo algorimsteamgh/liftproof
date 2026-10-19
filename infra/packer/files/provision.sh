@@ -22,7 +22,7 @@ systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
 # CloudWatch agent: not in the Ubuntu archive. The package is checked against the
 # AWS signing key, pinned by fingerprint, before it is installed.
 CW_KEY_FPR="937616F3450B7D806CBD9725D58167303B789C72"
-cw=https://amazoncloudwatch-agent-ap-south-1.s3.ap-south-1.amazonaws.com
+cw=https://amazoncloudwatch-agent-${AWS_REGION}.s3.${AWS_REGION}.amazonaws.com
 work=$(mktemp -d)
 curl -fsSL -o "$work/agent.deb" "$cw/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb"
 curl -fsSL -o "$work/agent.deb.sig" "$cw/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb.sig"

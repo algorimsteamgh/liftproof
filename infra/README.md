@@ -15,7 +15,7 @@ infra/
   modules/build-account     GitHub OIDC release role, AMI builder, evidence store, Marketplace ingestion
   envs/customer-example     example customer root: network + liftproof
   envs/algorims-build       Algorims build account root: baseline + network + build
-  packer/                   the product AMI (Ubuntu 24.04 LTS, IMDSv2, no SSH, hardened)
+  packer/                   the product AMI (Ubuntu 24.04 LTS, IMDSv2, key only SSH for the Marketplace scan, hardened)
   scripts/scan-ami.sh       Amazon Inspector release gate for the AMI's OS layer
 ```
 
@@ -54,7 +54,7 @@ path to the host at all.
 |---|---|---|
 | Identity | Instance role with least privilege; separate operator policy/role; no IAM users, no access keys | IAM-002, N1 |
 | Metadata | IMDSv2 required, hop limit 1 | AWSAPI-004, N2 |
-| Access | No inbound security group rules, no public IP, no SSH in the image; Session Manager port forwarding for the UI | spec 3 |
+| Access | No inbound security group rules, no public IP, no key pair (the image keeps a key only sshd for the Marketplace scan, decision 135); Session Manager port forwarding for the UI | spec 3 |
 | Pipelines | SSM Command document with validated parameters; the run executes in its own systemd unit and returns the product's exit code | ATS-005, F11 |
 | Encryption | One customer managed KMS key (rotation on) for S3, logs and the root volume; bucket denies non-TLS, TLS < 1.2 and any other key | SECOPS-004, N7 |
 | Storage | Versioning, block public access, bucket-owner-enforced, Object Lock (governance) on reports, lifecycle expiry for recorded bodies and snapshots, noncurrent version expiry, multipart cleanup | F15 |
