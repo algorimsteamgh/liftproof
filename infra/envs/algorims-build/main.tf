@@ -12,7 +12,7 @@ terraform {
   # backend "s3" {
   #   bucket       = "REPLACE-algorims-terraform-state"
   #   key          = "liftproof/build-account.tfstate"
-  #   region       = "ap-south-1"
+  #   region       = "us-east-1"
   #   encrypt      = true
   #   use_lockfile = true
   # }
@@ -25,9 +25,10 @@ provider "aws" {
   }
 }
 
+# AWS Marketplace takes source AMIs only from us-east-1 (see the release workflow).
 variable "region" {
   type    = string
-  default = "ap-south-1"
+  default = "us-east-1"
 }
 
 variable "github_repository" {

@@ -10,8 +10,9 @@ permissions:
   contents: read
   id-token: write
 
+# AWS Marketplace takes source AMIs only from us-east-1, so the build account lives there.
 env:
-  AWS_REGION: ap-south-1
+  AWS_REGION: us-east-1
 
 # Every run step is bash with pipefail, so a piped command (pip-audit | tee) fails the
 # step when the first command fails, not only when the last one does.

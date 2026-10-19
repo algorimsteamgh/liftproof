@@ -26,10 +26,18 @@ net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.log_martians = 1
 CONF
 
-# Session Manager is the only way in: no SSH daemon in the shipped image.
-# Ubuntu 24.04 starts sshd from a socket unit, so both are disabled and masked.
-systemctl disable ssh.socket ssh.service 2>/dev/null || true
-systemctl mask ssh.socket ssh.service
+# AWS Marketplace scans every AMI version over SSH, so sshd stays in the image, key only.
+# No key is baked in, the templates launch with no key pair and no inbound rule, so in a
+# deployment Session Manager is still the only way in. This file sorts before
+# 50-cloud-init.conf, and sshd keeps the first value it reads.
+cat > /etc/ssh/sshd_config.d/10-liftproof.conf <<'CONF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+CONF
+chmod 0644 /etc/ssh/sshd_config.d/10-liftproof.conf
+passwd -l root
 
 # Session Manager sessions time out; long runs go under systemd, never in a shell.
 cat > /etc/profile.d/liftproof.sh <<'CONF'

@@ -83,3 +83,32 @@ def test_a_replacement_instance_restores_its_projects_before_anything_runs():
     install = _text("scheduler.sh")
     assert "mvt-restore.service /etc/systemd/system/" in install
     assert "systemctl enable mvt-restore.service" in install
+
+
+def test_the_marketplace_scan_can_reach_a_key_only_sshd():
+    """Decision 135: the scan logs in over SSH; nobody else can, and never by password."""
+    harden = _text("harden.sh")
+    assert "systemctl mask ssh" not in harden
+    for line in ("PasswordAuthentication no", "KbdInteractiveAuthentication no",
+                 "PermitEmptyPasswords no", "PermitRootLogin no"):  # fmt: skip
+        assert line in harden
+    assert "/etc/ssh/sshd_config.d/10-liftproof.conf" in harden
+    assert "find /home /root -name authorized_keys -delete" in _text("cleanup.sh")
+    cfn = (ROOT / "infra/cloudformation/liftproof.yaml").read_text(encoding="utf-8")
+    module = "".join(p.read_text(encoding="utf-8")
+                     for p in (ROOT / "infra/modules/liftproof").glob("*.tf"))  # fmt: skip
+    # the only inbound rule in either is HTTPS to the endpoints, never to the instance
+    assert "KeyName" not in cfn and cfn.count("SecurityGroupIngress") == 1
+    assert "key_name" not in module
+    assert module.count('resource "aws_vpc_security_group_ingress_rule"') == 1
+    assert 'resource "aws_vpc_security_group_ingress_rule" "endpoints"' in module
+
+
+def test_the_source_ami_is_built_in_us_east_1():
+    """Decision 134: AWS Marketplace takes a new AMI version only from us-east-1."""
+    release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    assert "AWS_REGION: us-east-1" in release
+    packer = (ROOT / "infra/packer/liftproof.pkr.hcl").read_text(encoding="utf-8")
+    assert re.search(r'variable "region" \{[^}]*default = "us-east-1"', packer)
+    assert '"AWS_REGION=${var.region}"' in packer
+    assert "${AWS_REGION}" in _text("provision.sh") and "ap-south-1" not in _text("provision.sh")
