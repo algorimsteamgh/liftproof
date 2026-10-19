@@ -1,5 +1,6 @@
-output "instance_id" {
-  value = aws_instance.this.id
+output "autoscaling_group_name" {
+  description = "The group of one that runs the instance; it replaces a failed instance."
+  value       = aws_autoscaling_group.this.name
 }
 
 output "bucket_name" {
@@ -33,12 +34,12 @@ output "log_group_name" {
 
 output "connect_ui" {
   description = "Open the web UI on localhost:8080 over Session Manager."
-  value       = "aws ssm start-session --target ${aws_instance.this.id} --document-name AWS-StartPortForwardingSession --parameters portNumber=8080,localPortNumber=8080"
+  value       = "aws ssm start-session --target $(aws ec2 describe-instances --filters Name=tag:aws:autoscaling:groupName,Values=${aws_autoscaling_group.this.name} Name=instance-state-name,Values=running --query Reservations[0].Instances[0].InstanceId --output text) --document-name AWS-StartPortForwardingSession --parameters portNumber=8080,localPortNumber=8080"
 }
 
 output "start_run" {
   description = "What a pipeline calls at cutover."
-  value       = "aws ssm send-command --instance-ids ${aws_instance.this.id} --document-name ${aws_ssm_document.run.name} --parameters project=PROJECT,mode=reconcile"
+  value       = "aws ssm send-command --targets Key=tag:aws:autoscaling:groupName,Values=${aws_autoscaling_group.this.name} --document-name ${aws_ssm_document.run.name} --parameters project=PROJECT,mode=reconcile"
 }
 
 output "customer_key_policy_statements" {

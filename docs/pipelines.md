@@ -42,8 +42,14 @@ Both examples below call this script. Keep it in your pipeline repository.
 #!/usr/bin/env bash
 # liftproof-run.sh MODE [extra SSM parameters as JSON, e.g. '"journeys":["login"]']
 set -euo pipefail
-: "${LIFTPROOF_INSTANCE:?}" "${LIFTPROOF_DOCUMENT:?}" "${LIFTPROOF_PROJECT:?}"
+: "${LIFTPROOF_GROUP:?}" "${LIFTPROOF_DOCUMENT:?}" "${LIFTPROOF_PROJECT:?}"
 mode="$1"; extra="${2:-}"
+
+# The deployment's Auto Scaling group replaces a failed instance, so look the instance up
+LIFTPROOF_INSTANCE=$(aws ec2 describe-instances \
+  --filters "Name=tag:aws:autoscaling:groupName,Values=$LIFTPROOF_GROUP" \
+    Name=instance-state-name,Values=running \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text)
 
 params="{\"project\":[\"$LIFTPROOF_PROJECT\"],\"mode\":[\"$mode\"]${extra:+,$extra}}"
 id=$(aws ssm send-command \
@@ -87,7 +93,7 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     env:
-      LIFTPROOF_INSTANCE: i-0123456789abcdef0
+      LIFTPROOF_GROUP: liftproof-acme-prod  # the autoscaling_group_name output
       LIFTPROOF_DOCUMENT: Algorims-MVT-Run-acme
       LIFTPROOF_PROJECT: acme
       CI_RUN: ${{ github.run_id }}
@@ -115,7 +121,7 @@ operator policy.
 version: 0.2
 env:
   variables:
-    LIFTPROOF_INSTANCE: i-0123456789abcdef0
+    LIFTPROOF_GROUP: liftproof-acme-prod  # the autoscaling_group_name output
     LIFTPROOF_DOCUMENT: Algorims-MVT-Run-acme
     LIFTPROOF_PROJECT: acme
 phases:

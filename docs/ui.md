@@ -12,7 +12,8 @@ port forwarding, with the operator policy the deployment creates (`operator_poli
 ## Open it
 
 1. Forward the port (the deployment's `connect_ui` output, `ConnectUi` in CloudFormation,
-   prints this for your instance):
+   prints this with a lookup of the instance in the deployment's Auto Scaling group, which
+   replaces a failed instance, so its ID can change):
 
    ```sh
    aws ssm start-session --target i-0123456789abcdef0 \

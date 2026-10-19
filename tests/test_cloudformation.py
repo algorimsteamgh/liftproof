@@ -121,7 +121,8 @@ def test_instance_settings_match(template):
         tf("compute.tf").split("instance_config = yamlencode({")[1].split("})")[0],
         re.M,
     )
-    user_data = template["Resources"]["Instance"]["Properties"]["UserData"]["Fn::Base64"]
+    lt = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]
+    user_data = lt["UserData"]["Fn::Base64"]
     cfn_keys = re.findall(r"^\s+(\w+): \$\{", user_data["Fn::Sub"][0], re.M)
     assert sorted(cfn_keys) == sorted(tf_keys)
     # every product process runs as mvt, so the file must be readable by that group
@@ -130,7 +131,6 @@ def test_instance_settings_match(template):
             r'path: /etc/mvt/config\.yaml\s+permissions: "(\d+)"\s+owner: (\S+)', user_data_text
         )
         assert written.groups() == ("0640", "root:mvt")
-    lt = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]
     assert lt["MetadataOptions"]["HttpTokens"] == "required"
     assert lt["BlockDeviceMappings"][0]["Ebs"]["Encrypted"] is True
 
@@ -160,7 +160,7 @@ def test_no_inbound_and_no_public_address(template):
     r = template["Resources"]
     assert "SecurityGroupIngress" not in r["InstanceSecurityGroup"]["Properties"]
     assert not [x for x in r.values() if x["Type"] == "AWS::EC2::SecurityGroupIngress"]
-    [nic] = r["Instance"]["Properties"]["NetworkInterfaces"]
+    [nic] = r["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["NetworkInterfaces"]
     assert nic["AssociatePublicIpAddress"] is False
     assert not [x for x in r.values() if x["Type"] in ("AWS::IAM::User", "AWS::IAM::AccessKey")]
 
@@ -181,3 +181,35 @@ def test_customer_key_statements_are_published(template):
         if sid != "AccountAdministration":
             assert f'"Sid": "{sid}"' in guide, sid
     assert "Bring your own KMS key" in template["Parameters"]["KmsKeyArn"]["Description"]
+
+
+def test_one_instance_in_an_auto_scaling_group(template):
+    """Decision 136: AWS Marketplace asks for a group even for one node. Operators reach
+    whichever instance the group runs through the group's own tag, which only Auto
+    Scaling can set; the KMS key lets the group's role encrypt the root volume."""
+    r = template["Resources"]
+    assert not [x for x in r.values() if x["Type"] == "AWS::EC2::Instance"]
+    group = r["AutoScalingGroup"]["Properties"]
+    assert (group["MinSize"], group["MaxSize"], group["DesiredCapacity"]) == ("1", "1", "1")
+    assert group["AutoScalingGroupName"] == {"Fn::Sub": "liftproof-${DeploymentName}"}
+    compute = tf("compute.tf")
+    assert 'resource "aws_autoscaling_group" "this"' in compute and "aws_instance" not in compute
+    assert "min_size                  = 1" in compute and "max_size                  = 1" in compute
+    tag = "ssm:resourceTag/aws:autoscaling:groupName"
+    policy = r["OperatorPolicy"]["Properties"]["PolicyDocument"]
+    operator = {s["Sid"]: s for s in policy["Statement"]}
+    for sid in ("PortForwardToUi", "RunValidation"):
+        assert operator[sid]["Condition"]["StringEquals"] == {
+            tag: {"Fn::Sub": "liftproof-${DeploymentName}"}
+        }
+    assert tf("iam.tf").count(f'variable = "{tag}"') == 2
+    key = {s["Sid"]: s for s in r["Key"]["Properties"]["KeyPolicy"]["Statement"]}
+    kms = tf("kms.tf")
+    for sid in ("AutoScalingVolumes", "AutoScalingVolumeGrants"):
+        arn = key[sid]["Condition"]["StringEquals"]["aws:PrincipalArn"]["Fn::Sub"]
+        assert arn.endswith("autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling")
+        assert f'sid       = "{sid}"' in kms or f'sid = "{sid}"' in kms
+    assert "AWSServiceRoleForAutoScaling" in kms
+    outputs = template["Outputs"]
+    assert "InstanceId" not in outputs and "AutoScalingGroupName" in outputs
+    assert "--targets Key=tag:aws:autoscaling:groupName" in outputs["StartRun"]["Value"]["Fn::Sub"]

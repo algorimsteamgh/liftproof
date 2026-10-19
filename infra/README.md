@@ -25,7 +25,7 @@ infra/
 flowchart LR
   subgraph Customer AWS account
     subgraph VPC["VPC (private subnets, 2 AZs, no internet gateway)"]
-      EC2["Liftproof EC2 instance<br/>IMDSv2 only, no inbound rule<br/>encrypted gp3 (customer KMS key)"]
+      EC2["Liftproof EC2 instance<br/>(Auto Scaling group of one)<br/>IMDSv2 only, no inbound rule<br/>encrypted gp3 (customer KMS key)"]
       EP["Interface endpoints<br/>ssm, ssmmessages, ec2messages,<br/>secretsmanager, kms, logs, monitoring"]
       S3GW["S3 gateway endpoint"]
       VGW["Virtual private gateway"]
@@ -59,7 +59,7 @@ path to the host at all.
 | Encryption | One customer managed KMS key (rotation on) for S3, logs and the root volume; bucket denies non-TLS, TLS < 1.2 and any other key | SECOPS-004, N7 |
 | Storage | Versioning, block public access, bucket-owner-enforced, Object Lock (governance) on reports, lifecycle expiry for recorded bodies and snapshots, noncurrent version expiry, multipart cleanup | F15 |
 | Network | Private subnets, VPC endpoints, egress limited to endpoints, S3 prefix list and the declared databases and applications, VPC Flow Logs, default security group locked | spec 3 |
-| Resilience | EC2 auto recovery, status check alarm with the recover action, nothing irreplaceable on the instance | PS-001 |
+| Resilience | An Auto Scaling group of one replaces a failed instance (notifications to the alarm topic); nothing irreplaceable on the instance, which restores its projects from S3 at first boot | PS-001 |
 | Operations | Encrypted log group with retention; alarm when a scheduled run is skipped | spec 14, 16 |
 
 ### Deploy (customer)
@@ -99,10 +99,13 @@ in an account whose API quotas other workloads already use heavily.
 ### Bring your own KMS key
 
 With `kms_key_arn` (Terraform) or `KmsKeyArn` (CloudFormation), the key's policy is
-yours, so add two statements to it before deploying. CloudWatch Logs cannot encrypt
-the log group without the first, and the deployment stops there. The second is
-needed only when the policy does not delegate to IAM (no statement for the account
-root). Terraform prints both, filled in, as `customer_key_policy_statements` in
+yours, so add these statements to it before deploying. CloudWatch Logs cannot encrypt
+the log group without the first, and the deployment stops there. Auto Scaling cannot
+launch the instance with its encrypted root volume without the next two, which name
+the account's Auto Scaling service-linked role by condition, so they can be added
+before that role exists. The last is needed only when the policy does not delegate to
+IAM (no statement for the account root). Terraform prints them, filled in, as
+`customer_key_policy_statements` in
 `terraform plan`. Replace REGION, ACCOUNT and NAME (the deployment name):
 
 ```json
@@ -116,6 +119,22 @@ root). Terraform prints both, filled in, as `customer_key_policy_statements` in
     "Condition": {"ArnLike": {"kms:EncryptionContext:aws:logs:arn": "arn:aws:logs:REGION:ACCOUNT:log-group:/liftproof/NAME*"}}
   },
   {
+    "Sid": "AutoScalingVolumes",
+    "Effect": "Allow",
+    "Principal": {"AWS": "*"},
+    "Action": ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
+    "Resource": "*",
+    "Condition": {"StringEquals": {"aws:PrincipalArn": "arn:aws:iam::ACCOUNT:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling", "kms:CallerAccount": "ACCOUNT"}}
+  },
+  {
+    "Sid": "AutoScalingVolumeGrants",
+    "Effect": "Allow",
+    "Principal": {"AWS": "*"},
+    "Action": "kms:CreateGrant",
+    "Resource": "*",
+    "Condition": {"StringEquals": {"aws:PrincipalArn": "arn:aws:iam::ACCOUNT:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling", "kms:CallerAccount": "ACCOUNT"}, "Bool": {"kms:GrantIsForAWSResource": "true"}}
+  },
+  {
     "Sid": "LiftproofInstanceRole",
     "Effect": "Allow",
     "Principal": {"AWS": "arn:aws:iam::ACCOUNT:role/liftproof-NAME-instance"},
@@ -126,7 +145,7 @@ root). Terraform prints both, filled in, as `customer_key_policy_statements` in
 ```
 
 Keys that encrypt the database secrets (`secret_kms_key_arns`, `SecretKmsKeyArns`)
-need the second statement, with only `kms:Decrypt`, under the same condition.
+need the last statement, with only `kms:Decrypt`, under the same condition.
 
 ## Algorims build account
 

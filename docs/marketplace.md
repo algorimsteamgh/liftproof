@@ -61,8 +61,9 @@ your data. Nothing is sent to Algorims.
    Fill a database slot (CIDR and port) for each database the instance must reach.
 3. Leave **Create VPC endpoints** on unless the VPC already has endpoints for SSM,
    Secrets Manager, KMS, CloudWatch Logs and CloudWatch, and an S3 gateway endpoint.
-4. When the stack finishes, connect to the instance with Session Manager
-   (`aws ssm start-session --target` and the **InstanceId** output), or call the
+4. When the stack finishes, connect to the instance with Session Manager (the
+   **ConnectUi** output shows how to find the instance in the **AutoScalingGroupName**
+   group), or call the
    **RunDocument** output with mode `doctor`, to check network paths, credentials and
    permissions before the first comparison. The **ConnectUi** output opens the web
    interface (see `docs/ui.md`).

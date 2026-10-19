@@ -109,18 +109,39 @@ resource "aws_iam_instance_profile" "instance" {
 # --- operator -----------------------------------------------------------------------
 
 data "aws_iam_policy_document" "operator" {
+  # The group replaces its instance, so instances are matched by the group's tag, which
+  # only Auto Scaling can set (aws: prefix)
   statement {
-    sid     = "PortForwardToUi"
-    actions = ["ssm:StartSession"]
-    resources = [
-      aws_instance.this.arn,
-      "arn:${local.partition}:ssm:${local.region}::document/AWS-StartPortForwardingSession",
-    ]
+    sid       = "PortForwardToUi"
+    actions   = ["ssm:StartSession"]
+    resources = ["arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/aws:autoscaling:groupName"
+      values   = [local.name]
+    }
     condition {
       test     = "BoolIfExists"
       variable = "ssm:SessionDocumentAccessCheck"
       values   = ["true"]
     }
+  }
+
+  statement {
+    sid       = "PortForwardDocument"
+    actions   = ["ssm:StartSession"]
+    resources = ["arn:${local.partition}:ssm:${local.region}::document/AWS-StartPortForwardingSession"]
+    condition {
+      test     = "BoolIfExists"
+      variable = "ssm:SessionDocumentAccessCheck"
+      values   = ["true"]
+    }
+  }
+
+  statement {
+    sid       = "FindInstance"
+    actions   = ["ec2:DescribeInstances"]
+    resources = ["*"] # does not support resource level permissions
   }
 
   statement {
@@ -130,12 +151,20 @@ data "aws_iam_policy_document" "operator" {
   }
 
   statement {
-    sid     = "RunValidation"
-    actions = ["ssm:SendCommand"]
-    resources = [
-      aws_instance.this.arn,
-      aws_ssm_document.run.arn,
-    ]
+    sid       = "RunValidation"
+    actions   = ["ssm:SendCommand"]
+    resources = ["arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/aws:autoscaling:groupName"
+      values   = [local.name]
+    }
+  }
+
+  statement {
+    sid       = "RunValidationDocument"
+    actions   = ["ssm:SendCommand"]
+    resources = [aws_ssm_document.run.arn]
   }
 
   statement {
