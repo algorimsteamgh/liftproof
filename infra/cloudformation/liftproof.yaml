@@ -228,6 +228,11 @@ Resources:
     Condition: CreateKey
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_33
+            comment: Principal "*" is narrowed to this account's Auto Scaling service-linked role by aws:PrincipalArn
     Properties:
       Description: { "Fn::Sub": "Liftproof ${DeploymentName}: recordings, baselines, reports, logs and volumes" }
       EnableKeyRotation: true
@@ -249,6 +254,27 @@ Resources:
             Condition:
               ArnLike:
                 kms:EncryptionContext:aws:logs:arn: { "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/liftproof/${DeploymentName}*" }
+          # Auto Scaling launches the instance, so its service-linked role encrypts the
+          # root volume. Named by condition: the role may not exist until the group does.
+          - Sid: AutoScalingVolumes
+            Effect: Allow
+            Principal: { AWS: "*" }
+            Action: [kms:Encrypt, kms:Decrypt, kms:ReEncrypt*, kms:GenerateDataKey*, kms:DescribeKey]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalArn: { "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling" }
+                kms:CallerAccount: { Ref: AWS::AccountId }
+          - Sid: AutoScalingVolumeGrants
+            Effect: Allow
+            Principal: { AWS: "*" }
+            Action: kms:CreateGrant
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalArn: { "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling" }
+                kms:CallerAccount: { Ref: AWS::AccountId }
+              Bool: { kms:GrantIsForAWSResource: "true" }
       Tags:
         - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
         - { Key: liftproof:managed-by, Value: cloudformation }
@@ -739,13 +765,24 @@ Resources:
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
+          # The group replaces its instance, so instances are matched by the group's tag,
+          # which only Auto Scaling can set (aws: prefix)
           - Sid: PortForwardToUi
             Effect: Allow
             Action: ssm:StartSession
-            Resource:
-              - { "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}" }
-              - { "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartPortForwardingSession" }
+            Resource: { "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*" }
+            Condition:
+              StringEquals: { ssm:resourceTag/aws:autoscaling:groupName: { "Fn::Sub": "liftproof-${DeploymentName}" } }
+              BoolIfExists: { ssm:SessionDocumentAccessCheck: "true" }
+          - Sid: PortForwardDocument
+            Effect: Allow
+            Action: ssm:StartSession
+            Resource: { "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartPortForwardingSession" }
             Condition: { BoolIfExists: { ssm:SessionDocumentAccessCheck: "true" } }
+          - Sid: FindInstance
+            Effect: Allow
+            Action: ec2:DescribeInstances
+            Resource: "*" # does not support resource level permissions
           - Sid: ManageOwnSessions
             Effect: Allow
             Action: [ssm:TerminateSession, ssm:ResumeSession]
@@ -753,9 +790,13 @@ Resources:
           - Sid: RunValidation
             Effect: Allow
             Action: ssm:SendCommand
-            Resource:
-              - { "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}" }
-              - { "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${RunDocument}" }
+            Resource: { "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*" }
+            Condition:
+              StringEquals: { ssm:resourceTag/aws:autoscaling:groupName: { "Fn::Sub": "liftproof-${DeploymentName}" } }
+          - Sid: RunValidationDocument
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource: { "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${RunDocument}" }
           - Sid: ReadCommandResults
             Effect: Allow
             Action: [ssm:GetCommandInvocation, ssm:ListCommandInvocations]
@@ -784,12 +825,24 @@ Resources:
             Action: [sts:AssumeRole, sts:TagSession]
       ManagedPolicyArns: [{ Ref: OperatorPolicy }]
 
-  # --- compute: one disposable instance ------------------------------------------------
+  # --- compute: one disposable instance in a group of one ------------------------------
+  # Projects, baselines and reports are in S3 and a fresh instance restores them at first
+  # boot, so the group replaces a failed instance instead of recovering it.
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateName: { "Fn::Sub": "liftproof-${DeploymentName}" }
       LaunchTemplateData:
+        ImageId: { Ref: ImageId }
+        InstanceType: { Ref: InstanceType }
+        IamInstanceProfile: { Arn: { "Fn::GetAtt": [InstanceProfile, Arn] } }
+        Monitoring: { Enabled: true }
+        EbsOptimized: true
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            Groups: [{ Ref: InstanceSecurityGroup }]
+            AssociatePublicIpAddress: false
+            DeleteOnTermination: true
         MetadataOptions:
           HttpEndpoint: enabled
           HttpTokens: required # IMDSv2 only (AWSAPI-004)
@@ -804,52 +857,63 @@ Resources:
               KmsKeyId: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
               DeleteOnTermination: true
         TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}" } }
+              - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
+              - { Key: liftproof:managed-by, Value: cloudformation }
           - ResourceType: volume
             Tags:
               - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}" } }
               - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
+        # Instance level settings only; no credentials. Nothing for the customer to run.
+        UserData:
+          "Fn::Base64":
+            "Fn::Sub":
+              - |
+                #cloud-config
+                write_files:
+                  - path: /etc/mvt/config.yaml
+                    permissions: "0640"
+                    owner: root:mvt
+                    content: |
+                      deployment: ${DeploymentName}
+                      region: ${AWS::Region}
+                      vpc_cidr: ${VpcCidr}
+                      bucket: ${Bucket}
+                      kms_key: ${KeyArn}
+                      log_group: ${LogGroup}
+                      report_lock_days: ${ReportLockDays}
+                      aws_requests_per_second: ${AwsRequestsPerSecond}
+              - KeyArn: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
+                VpcCidr: { "Fn::GetAtt": [VpcInfo, CidrBlock] }
 
-  Instance:
-    Type: AWS::EC2::Instance
+  # A new launch template version (a new AMI) reaches the running instance only when it
+  # is replaced: upgrades stay deliberate, as with Terraform.
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      ImageId: { Ref: ImageId }
-      InstanceType: { Ref: InstanceType }
+      AutoScalingGroupName: { "Fn::Sub": "liftproof-${DeploymentName}" }
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier: [{ Ref: SubnetId }]
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
       LaunchTemplate:
         LaunchTemplateId: { Ref: LaunchTemplate }
         Version: { "Fn::GetAtt": [LaunchTemplate, LatestVersionNumber] }
-      IamInstanceProfile: { Ref: InstanceProfile }
-      Monitoring: true
-      EbsOptimized: true
-      NetworkInterfaces:
-        - DeviceIndex: "0"
-          SubnetId: { Ref: SubnetId }
-          GroupSet: [{ Ref: InstanceSecurityGroup }]
-          AssociatePublicIpAddress: false
-      # Instance level settings only; no credentials. Nothing for the customer to run.
-      UserData:
-        "Fn::Base64":
-          "Fn::Sub":
-            - |
-              #cloud-config
-              write_files:
-                - path: /etc/mvt/config.yaml
-                  permissions: "0640"
-                  owner: root:mvt
-                  content: |
-                    deployment: ${DeploymentName}
-                    region: ${AWS::Region}
-                    vpc_cidr: ${VpcCidr}
-                    bucket: ${Bucket}
-                    kms_key: ${KeyArn}
-                    log_group: ${LogGroup}
-                    report_lock_days: ${ReportLockDays}
-                    aws_requests_per_second: ${AwsRequestsPerSecond}
-            - KeyArn: { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
-              VpcCidr: { "Fn::GetAtt": [VpcInfo, CidrBlock] }
+      NotificationConfigurations:
+        "Fn::If":
+          - AlarmNotifications
+          - - TopicARN: { Ref: AlarmTopicArn }
+              NotificationTypes:
+                - autoscaling:EC2_INSTANCE_TERMINATE
+                - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+          - { Ref: AWS::NoValue }
       Tags:
-        - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}" } }
-        - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
-        - { Key: liftproof:managed-by, Value: cloudformation }
+        - { Key: liftproof:deployment, Value: { Ref: DeploymentName }, PropagateAtLaunch: true }
+        - { Key: liftproof:managed-by, Value: cloudformation, PropagateAtLaunch: true }
 
   # --- pipelines (F11, ATS-005): Run Command, no inbound path --------------------------
   RunDocument:
@@ -915,25 +979,6 @@ Resources:
                 - "systemd-run --unit=liftproof-{{ project }}-$(date +%s) --wait --pipe --collect --quiet -p User=mvt -E LIFTPROOF_INVOKED_BY=ssm-run-command /opt/mvt/bin/liftproof {{ mode }} \"${args[@]}\""
 
   # --- alarms ---------------------------------------------------------------------------
-  SystemStatusAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: { "Fn::Sub": "liftproof-${DeploymentName}-system-status" }
-      AlarmDescription: Underlying host failed; EC2 recovers the instance onto new hardware
-      Namespace: AWS/EC2
-      MetricName: StatusCheckFailed_System
-      Dimensions: [{ Name: InstanceId, Value: { Ref: Instance } }]
-      Statistic: Maximum
-      Period: 60
-      EvaluationPeriods: 2
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      AlarmActions:
-        "Fn::If":
-          - AlarmNotifications
-          - [{ "Fn::Sub": "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover" }, { Ref: AlarmTopicArn }]
-          - [{ "Fn::Sub": "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover" }]
-
   SkippedRunsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -953,8 +998,9 @@ Resources:
       AlarmActions: { "Fn::If": [AlarmNotifications, [{ Ref: AlarmTopicArn }], { Ref: AWS::NoValue }] }
 
 Outputs:
-  InstanceId:
-    Value: { Ref: Instance }
+  AutoScalingGroupName:
+    Description: The group of one that runs the instance; it replaces a failed instance.
+    Value: { Ref: AutoScalingGroup }
   BucketName:
     Value: { Ref: Bucket }
   KmsKeyArn:
@@ -973,7 +1019,7 @@ Outputs:
     Value: { Ref: LogGroup }
   ConnectUi:
     Description: Open the web UI on localhost:8080 over Session Manager.
-    Value: { "Fn::Sub": "aws ssm start-session --target ${Instance} --document-name AWS-StartPortForwardingSession --parameters portNumber=8080,localPortNumber=8080" }
+    Value: { "Fn::Sub": "aws ssm start-session --target $(aws ec2 describe-instances --filters Name=tag:aws:autoscaling:groupName,Values=${AutoScalingGroup} Name=instance-state-name,Values=running --query Reservations[0].Instances[0].InstanceId --output text) --document-name AWS-StartPortForwardingSession --parameters portNumber=8080,localPortNumber=8080" }
   StartRun:
     Description: What a pipeline calls at cutover.
-    Value: { "Fn::Sub": "aws ssm send-command --instance-ids ${Instance} --document-name ${RunDocument} --parameters project=PROJECT,mode=reconcile" }
+    Value: { "Fn::Sub": "aws ssm send-command --targets Key=tag:aws:autoscaling:groupName,Values=${AutoScalingGroup} --document-name ${RunDocument} --parameters project=PROJECT,mode=reconcile" }
