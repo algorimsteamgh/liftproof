@@ -88,7 +88,7 @@ data "aws_caller_identity" "current" {}
 
 output "liftproof" {
   value = {
-    instance_id   = module.liftproof.instance_id
+    group         = module.liftproof.autoscaling_group_name
     bucket        = module.liftproof.bucket_name
     run_document  = module.liftproof.run_document_name
     connect_ui    = module.liftproof.connect_ui
