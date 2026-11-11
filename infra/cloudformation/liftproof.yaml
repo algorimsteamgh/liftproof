@@ -952,6 +952,67 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: { "Fn::If": [AlarmNotifications, [{ Ref: AlarmTopicArn }], { Ref: AWS::NoValue }] }
 
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: { "Fn::Sub": "liftproof-${DeploymentName}-instance-status" }
+      AlarmDescription: >-
+        The operating system stopped answering (instance status check); EC2 reboots it. A
+        run under way stops and is resumed or rerun (liftproof reconcile --resume).
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_Instance
+      Dimensions: [{ Name: InstanceId, Value: { Ref: Instance } }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        "Fn::If":
+          - AlarmNotifications
+          - [{ "Fn::Sub": "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:reboot" }, { Ref: AlarmTopicArn }]
+          - [{ "Fn::Sub": "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:reboot" }]
+
+  RunFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: { "Fn::Sub": "liftproof-${DeploymentName}-run-failed" }
+      AlarmDescription: >-
+        A Liftproof run ended without a verdict (exit code 2 or 3): read its report or log.
+        Scheduled validation gave no answer.
+      Namespace: Liftproof
+      MetricName: RunFailed
+      Dimensions: [{ Name: Deployment, Value: { Ref: DeploymentName } }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: { "Fn::If": [AlarmNotifications, [{ Ref: AlarmTopicArn }], { Ref: AWS::NoValue }] }
+
+  # Published by the CloudWatch agent (infra/packer/files/mvt-cwagent-config).
+  RootVolumeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: { "Fn::Sub": "liftproof-${DeploymentName}-root-volume" }
+      AlarmDescription: >-
+        The instance's root volume is over 85% full; runs will start failing. Grow the
+        volume or clear the working directory.
+      Namespace: Liftproof
+      MetricName: disk_used_percent
+      Dimensions:
+        - { Name: Deployment, Value: { Ref: DeploymentName } }
+        - { Name: path, Value: / }
+        - { Name: fstype, Value: ext4 }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching # a stopped instance publishes nothing
+      AlarmActions: { "Fn::If": [AlarmNotifications, [{ Ref: AlarmTopicArn }], { Ref: AWS::NoValue }] }
+
 Outputs:
   InstanceId:
     Value: { Ref: Instance }

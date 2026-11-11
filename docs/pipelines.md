@@ -154,6 +154,14 @@ twice: with the `Deployment` dimension, which the deployment's
 stopped are not caught up; the latest missed one fires once when the scheduler starts
 again.
 
+Every run (`baseline`, `rebaseline`, `reconcile`, `files`, `replay`, `smoke`,
+`validate`), scheduled or not, also publishes how it ended, with the `Deployment`
+dimension: `RunFailed` is 1 when it gave no verdict (exit code 2 or 3) and 0 otherwise,
+and `RunDifferences` is 1 when it found differences (exit code 10). The deployment's
+`liftproof-NAME-run-failed` alarm watches `RunFailed`. Differences before cutover are
+expected, so no alarm watches `RunDifferences` by default; after cutover, when the
+nightly regression should be clean, add one (Maximum of `RunDifferences` at least 1).
+
 ## After cutover: regression against the target itself
 
 Before cutover, runs compare the target with the source (live, or a source baseline).

@@ -221,14 +221,21 @@ def test_overlapping_runs(project, tmp_path, capsys, monkeypatch):
     [finding] = [f for f in report["findings"] if f["comparator"] == "run"]
     assert finding["kind"] == "error" and "r-busy" in finding["summary"]
     # one data point for the deployment's alarm, one naming the project
-    assert metrics == [
+    assert [m for m in metrics if m[0][0] == "ScheduledRunSkipped"] == [
         (("ScheduledRunSkipped", 1, {"Deployment": "acme-prod"}), {}),
         (("ScheduledRunSkipped", 1, {"Deployment": "acme-prod", "Project": "docs"}), {}),
     ]
+    # every run says how it ended: refused, configuration error, skipped (decision 136)
+    dep = {"Deployment": "acme-prod"}
+    outcome = [((n, 1, dep), {}) if n == "RunFailed" else ((n, 0, dep), {})
+               for _ in range(3) for n in ("RunFailed", "RunDifferences")]  # fmt: skip
+    assert [m for m in metrics if m[0][0] != "ScheduledRunSkipped"] == outcome
+    metrics.clear()
 
     # the lock is free again: the run goes ahead and the history shows both
     assert cli.main(["files", *base, "--run-id", "r-ok", "--scheduled", "nightly"]) == 0
     capsys.readouterr()
+    assert metrics == [(("RunFailed", 0, dep), {}), (("RunDifferences", 0, dep), {})]
     assert cli.main(["runs", *base]) == 0
     runs = json.loads(capsys.readouterr().out)["runs"]
     assert {r["run_id"]: r["verdict"] for r in runs}["r-ok"] == "passed"
@@ -290,3 +297,32 @@ def test_rebaseline_can_be_scheduled_and_takes_no_run_id(tmp_path):
     cmd = command_line(Due("docs", tmp_path / "docs.yaml", s, at("2026-10-11 03:00+00:00")),
                        tmp_path)  # fmt: skip
     assert cmd[3] == "rebaseline" and "--run-id" not in cmd
+
+
+def test_run_outcome_metrics(monkeypatch):
+    """A nightly run that fails or finds differences is a CloudWatch data point the
+    deployment's alarm can watch; commands that are not runs publish nothing, and a
+    failure to publish never changes the exit code."""
+    metrics = []
+    monkeypatch.setattr(aws, "put_metric", lambda *a, **k: metrics.append(a))
+    monkeypatch.setattr(cli, "_instance_config", lambda: {"deployment": "acme-prod"})
+    dep = {"Deployment": "acme-prod"}
+    for code, failed, differences in ((0, 0, 0), (10, 0, 1), (2, 1, 0), (3, 1, 0)):
+        metrics.clear()
+        cli._publish_outcome("validate", code)
+        assert metrics == [("RunFailed", failed, dep), ("RunDifferences", differences, dep)]
+    metrics.clear()
+    cli._publish_outcome("doctor", 2)
+    cli._publish_outcome("runs", 0)
+    assert metrics == []
+    # off an instance (no deployment), nothing is published
+    monkeypatch.setattr(cli, "_instance_config", lambda: {})
+    cli._publish_outcome("reconcile", 2)
+    assert metrics == []
+
+    def broken(*a, **k):
+        raise RuntimeError("no route to monitoring")
+
+    monkeypatch.setattr(cli, "_instance_config", lambda: {"deployment": "acme-prod"})
+    monkeypatch.setattr(aws, "put_metric", broken)
+    cli._publish_outcome("reconcile", 10)  # logged, not raised

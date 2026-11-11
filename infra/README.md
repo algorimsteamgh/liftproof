@@ -59,8 +59,9 @@ path to the host at all.
 | Encryption | One customer managed KMS key (rotation on) for S3, logs and the root volume; bucket denies non-TLS, TLS < 1.2 and any other key | SECOPS-004, N7 |
 | Storage | Versioning, block public access, bucket-owner-enforced, Object Lock (governance) on reports, lifecycle expiry for recorded bodies and snapshots, noncurrent version expiry, multipart cleanup | F15 |
 | Network | Private subnets, VPC endpoints, egress limited to endpoints, S3 prefix list and the declared databases and applications, VPC Flow Logs, default security group locked | spec 3 |
-| Resilience | EC2 auto recovery, status check alarm with the recover action, nothing irreplaceable on the instance | PS-001 |
-| Operations | Encrypted log group with retention; alarm when a scheduled run is skipped | spec 14, 16 |
+| Resilience | EC2 auto recovery (system status alarm, recover action), reboot on a failed instance status check, nothing irreplaceable on the instance | PS-001 |
+| Operations | Encrypted log group with retention; root volume and memory use from the CloudWatch agent; alarms when a run fails, a scheduled run is skipped or the root volume passes 85% | spec 14, 16 |
+| Patching | The image does not patch itself; each Marketplace version is built from a fully upgraded Ubuntu and passes an Inspector scan before release (decision 138) | ATS-009 |
 
 ### Deploy (customer)
 
