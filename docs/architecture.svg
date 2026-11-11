@@ -1,0 +1,166 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 800" width="1240" height="800" font-family="Helvetica, Arial, sans-serif" font-size="13">
+  <title>Liftproof deployment architecture</title>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#232f3e"/>
+    </marker>
+    <marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7a8696"/>
+    </marker>
+    <style>
+      .t { font-weight: bold; font-size: 14px; fill: #232f3e; }
+      .s { font-size: 12px; fill: #3d4a5a; }
+      .l { font-size: 12px; fill: #232f3e; }
+      .box { fill: #ffffff; stroke: #232f3e; stroke-width: 1.4; }
+      .svc { fill: #ffffff; stroke-width: 1.6; }
+      .ln { stroke: #232f3e; stroke-width: 1.5; fill: none; marker-end: url(#a); }
+      .trunk { stroke: #232f3e; stroke-width: 1.5; fill: none; }
+      .dash { stroke: #7a8696; stroke-width: 1.5; fill: none; stroke-dasharray: 6 4; marker-end: url(#g); }
+    </style>
+  </defs>
+  <rect width="1240" height="800" fill="#ffffff"/>
+
+  <!-- operators: one lane across the top, into Systems Manager, never to the instance -->
+  <text x="300" y="26" class="l">start-session (UI port forwarding) and send-command go to Systems Manager, never to the instance</text>
+  <path class="trunk" d="M230 190 H242 V40 H1030"/>
+  <path class="trunk" d="M230 306 H242 V190"/>
+
+  <!-- Customer AWS account -->
+  <rect x="254" y="60" width="966" height="726" fill="#fafbfc" stroke="#232f3e" stroke-width="1.6" rx="10"/>
+  <text x="270" y="86" class="t">Customer AWS account (one Region)</text>
+
+  <!-- VPC -->
+  <rect x="270" y="104" width="560" height="520" fill="#f2f8ee" stroke="#3f8624" stroke-width="1.6" rx="10"/>
+  <text x="290" y="130" class="t" fill="#3f8624">VPC: private subnets, no internet gateway needed</text>
+
+  <!-- private subnet with instance -->
+  <rect x="290" y="148" width="300" height="250" fill="#e6f2fb" stroke="#147eba" stroke-width="1.4" rx="8"/>
+  <text x="306" y="170" class="s">Private subnet</text>
+  <rect x="312" y="184" width="256" height="196" rx="8" class="svc" stroke="#ed7100"/>
+  <text x="328" y="210" class="t">Liftproof EC2 instance</text>
+  <text x="328" y="232" class="s">Ubuntu 24.04 AMI from AWS Marketplace</text>
+  <text x="328" y="252" class="s">IMDSv2 only, no inbound rule,</text>
+  <text x="328" y="268" class="s">no public address, no key pair</text>
+  <text x="328" y="288" class="s">gp3 root volume, KMS encrypted</text>
+  <text x="328" y="308" class="s">CLI, scheduler, web UI on 127.0.0.1,</text>
+  <text x="328" y="324" class="s">headless Chromium for replay</text>
+  <text x="328" y="344" class="s">CloudWatch and SSM agents</text>
+  <text x="328" y="364" class="s">Disposable: all state is in S3</text>
+
+  <!-- Endpoints -->
+  <rect x="620" y="148" width="190" height="150" rx="8" class="box"/>
+  <text x="636" y="172" class="t">Interface endpoints</text>
+  <text x="636" y="194" class="s">ssm, ssmmessages,</text>
+  <text x="636" y="210" class="s">ec2messages,</text>
+  <text x="636" y="226" class="s">secretsmanager, kms,</text>
+  <text x="636" y="242" class="s">logs, monitoring</text>
+  <text x="636" y="266" class="s">HTTPS from the instance's</text>
+  <text x="636" y="282" class="s">security group only</text>
+  <rect x="620" y="320" width="190" height="56" rx="8" class="box"/>
+  <text x="636" y="344" class="t">S3 gateway endpoint</text>
+  <text x="636" y="362" class="s">on the private route tables</text>
+
+  <!-- VGW / TGW (left) and target database (right) -->
+  <rect x="360" y="430" width="250" height="80" rx="8" class="svc" stroke="#3334b9"/>
+  <text x="376" y="456" class="t">Target database and app</text>
+  <text x="376" y="476" class="s">RDS, Aurora or EC2 (PostgreSQL,</text>
+  <text x="376" y="492" class="s">MySQL, Oracle, SQL Server), TLS</text>
+
+  <rect x="290" y="540" width="320" height="64" rx="8" class="box"/>
+  <text x="306" y="566" class="t">Virtual private gateway / TGW</text>
+  <text x="306" y="586" class="s">Site-to-Site VPN or Direct Connect</text>
+
+  <!-- AWS services reached through the interface endpoints -->
+  <rect x="846" y="104" width="362" height="374" fill="none" stroke="#7a8696" stroke-width="1.2" stroke-dasharray="5 4" rx="10"/>
+  <text x="862" y="126" class="s">Reached through the interface endpoints</text>
+
+  <rect x="862" y="144" width="330" height="72" rx="8" class="svc" stroke="#e7157b"/>
+  <text x="878" y="168" class="t">AWS Systems Manager</text>
+  <text x="878" y="186" class="s">Session Manager (UI port forwarding)</text>
+  <text x="878" y="202" class="s">Run Command document Algorims-MVT-Run</text>
+
+  <rect x="862" y="226" width="330" height="56" rx="8" class="svc" stroke="#dd344c"/>
+  <text x="878" y="250" class="t">AWS KMS customer managed key</text>
+  <text x="878" y="268" class="s">bucket, logs, volume; yearly rotation</text>
+
+  <rect x="862" y="292" width="330" height="56" rx="8" class="svc" stroke="#dd344c"/>
+  <text x="878" y="316" class="t">AWS Secrets Manager</text>
+  <text x="878" y="334" class="s">database and application logins (listed ARNs only)</text>
+
+  <rect x="862" y="358" width="330" height="108" rx="8" class="svc" stroke="#e7157b"/>
+  <text x="878" y="382" class="t">Amazon CloudWatch</text>
+  <text x="878" y="402" class="s">log group /liftproof/NAME</text>
+  <text x="878" y="418" class="s">metrics: RunFailed, RunDifferences, disk, memory</text>
+  <text x="878" y="434" class="s">alarms: host recover, OS reboot, run failed,</text>
+  <text x="878" y="450" class="s">scheduled run skipped, root volume 85%</text>
+
+  <rect x="862" y="496" width="330" height="56" rx="8" class="svc" stroke="#e7157b"/>
+  <text x="878" y="520" class="t">Amazon SNS topic (optional)</text>
+  <text x="878" y="538" class="s">alarm notifications to your team</text>
+
+  <rect x="862" y="566" width="330" height="88" rx="8" class="svc" stroke="#7aa116"/>
+  <text x="878" y="590" class="t">Amazon S3 bucket</text>
+  <text x="878" y="610" class="s">projects, baselines, checkpoints, reports</text>
+  <text x="878" y="626" class="s">SSE-KMS, versioned, TLS only, public access</text>
+  <text x="878" y="642" class="s">blocked, Object Lock on reports, retained</text>
+
+  <rect x="862" y="668" width="160" height="100" rx="8" class="svc" stroke="#dd344c"/>
+  <text x="878" y="692" class="t">AWS IAM</text>
+  <text x="878" y="712" class="s">instance role;</text>
+  <text x="878" y="728" class="s">operator policy</text>
+  <text x="878" y="744" class="s">and role</text>
+
+  <rect x="1032" y="668" width="160" height="100" rx="8" class="svc" stroke="#e7157b"/>
+  <text x="1048" y="692" class="t">AWS CloudTrail</text>
+  <text x="1048" y="712" class="s">records sessions,</text>
+  <text x="1048" y="728" class="s">run commands and</text>
+  <text x="1048" y="744" class="s">API calls</text>
+
+  <!-- People and source, outside the account -->
+  <rect x="20" y="144" width="210" height="96" rx="8" class="box"/>
+  <text x="36" y="170" class="t">Migration engineer</text>
+  <text x="36" y="190" class="s">AWS CLI + Session Manager</text>
+  <text x="36" y="206" class="s">plugin; browser on</text>
+  <text x="36" y="222" class="s">localhost:8080</text>
+
+  <rect x="20" y="266" width="210" height="80" rx="8" class="box"/>
+  <text x="36" y="292" class="t">CI/CD pipeline</text>
+  <text x="36" y="312" class="s">GitHub Actions, CodePipeline;</text>
+  <text x="36" y="328" class="s">operator role</text>
+
+  <rect x="20" y="520" width="210" height="110" fill="#f4f4f4" stroke="#232f3e" stroke-width="1.4" rx="8"/>
+  <text x="36" y="546" class="t">Source environment</text>
+  <text x="36" y="566" class="s">on premises or another cloud:</text>
+  <text x="36" y="582" class="s">source database (read only</text>
+  <text x="36" y="598" class="s">login, ideally a replica)</text>
+  <text x="36" y="614" class="s">and source application</text>
+
+  <!-- instance to endpoints -->
+  <path class="ln" d="M568 230 H620"/>
+  <path class="ln" d="M568 348 H620"/>
+  <!-- interface endpoints to the services they reach -->
+  <path class="ln" d="M810 260 H846"/>
+  <!-- SSM agent channel, opened outbound by the instance -->
+  <path class="dash" d="M810 180 H862"/>
+  <!-- S3 gateway to the bucket -->
+  <path class="ln" d="M810 348 H834 V610 H862"/>
+  <!-- alarms to SNS -->
+  <path class="ln" d="M1027 466 V496"/>
+
+  <!-- instance to target and to the gateway -->
+  <path class="ln" d="M480 380 V430"/>
+  <path class="ln" d="M330 380 V540"/>
+  <!-- gateway to the source -->
+  <path class="ln" d="M290 572 H230"/>
+  <text x="234" y="562" class="l">VPN / DX</text>
+
+  <!-- operators' lane into Systems Manager -->
+  <path class="ln" d="M1030 40 V144"/>
+
+  <!-- legend -->
+  <rect x="270" y="644" width="560" height="66" fill="#ffffff" stroke="#c9d1db" rx="6"/>
+  <line x1="286" y1="668" x2="330" y2="668" stroke="#232f3e" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="340" y="672" class="s">HTTPS or database TLS, opened by the instance or the operator</text>
+  <line x1="286" y1="692" x2="330" y2="692" stroke="#7a8696" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#g)"/>
+  <text x="340" y="696" class="s">SSM agent channel, opened outbound by the instance</text>
+</svg>

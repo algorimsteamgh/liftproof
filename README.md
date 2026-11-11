@@ -13,6 +13,9 @@ F11 (CLI and exit codes), F14 (credentials) and F15 (storage); and record and re
 F1 (record), F3 (replay), F4 (user interface comparison), F5 (API comparison) and F16
 (response times).
 
+To deploy Liftproof in an AWS account, follow the deployment guide
+(docs/deployment-guide.md); docs/architecture.png shows what it creates.
+
 ## Quick start (development)
 
 ```bash

@@ -170,9 +170,11 @@ Calculator for your region.
 | KMS key, Secrets Manager (2 to 4 secrets), CloudWatch Logs, S3 | ~$10 to $30 |
 | Site-to-Site VPN, if used | ~$36 plus data transfer |
 
-Stopping the instance between migration windows removes most of the compute cost. The
-endpoints can be shared with other workloads in the same VPC by setting
-`create_vpc_endpoints = false`.
+In a VPC that already has these endpoints, reuse them (`create_vpc_endpoints = false`,
+CloudFormation `CreateVpcEndpoints = false`): the endpoints cost about as much as the
+instance. Stopping the instance between migration windows removes most of the compute
+cost; nothing is lost, and the alarms ignore a stopped instance. Sizing, monitoring,
+recovery and upgrades are in the deployment guide (docs/deployment-guide.md).
 
 ## What is still to do
 

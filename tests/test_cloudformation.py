@@ -229,3 +229,24 @@ def test_raising_the_generation_replaces_the_instance(template):
     assert {"Key": "liftproof:generation", "Value": {"Ref": "InstanceGeneration"}} in volume["Tags"]
     version = r["Instance"]["Properties"]["LaunchTemplate"]["Version"]
     assert version == {"Fn::GetAtt": ["LaunchTemplate", "LatestVersionNumber"]}
+
+
+def test_the_deployment_guide_names_every_alarm_and_input_it_relies_on(template):
+    """The deployment guide is what a customer (and the Foundational Technical Review)
+    reads: every alarm the templates create is in its alarm table, and the inputs it
+    tells people to change exist in both templates."""
+    guide = (ROOT / "docs/deployment-guide.md").read_text(encoding="utf-8")
+    for res in template["Resources"].values():
+        if res["Type"] == "AWS::CloudWatch::Alarm":
+            suffix = res["Properties"]["AlarmName"]["Fn::Sub"].split("${DeploymentName}")[1]
+            assert f"`liftproof-NAME{suffix}`" in guide
+    for variable, params in INPUTS.items():
+        if f"`{variable}`" in guide:
+            assert all(f"`{p}`" in guide or f"**{p}**" in guide for p in params), variable
+    for param in ("InstanceGeneration", "ImageId", "AlarmTopicArn"):
+        assert param in template["Parameters"] and param in guide
+    for heading in ("Prerequisites", "Costs", "Credentials", "Backup and recovery",
+                    "Routine maintenance", "Troubleshooting and support"):  # fmt: skip
+        assert re.search(rf"^## \d+\. {heading}", guide, re.M), heading
+    assert (ROOT / "docs/architecture.png").stat().st_size > 0
+    assert "architecture.svg" in guide
