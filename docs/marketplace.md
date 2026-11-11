@@ -83,8 +83,10 @@ and 135).
 
 ## Still needed before submission
 
-- The architecture diagram (AWS Marketplace asks for one per delivery option). The
-  Mermaid diagram in `infra/README.md` is the starting point.
+- The architecture diagram is `docs/architecture.png` (source `docs/architecture.svg`).
+  Redraw it with the official AWS architecture icons if the listing review asks for them.
+- The deployment guide is `docs/deployment-guide.md`. Fill in the support contact (section
+  11) and confirm the recovery times (section 9) at the first test launch.
 - The AMI's Marketplace product ID. `ImageId` defaults to the SSM parameter
   `/aws/service/marketplace/prod-REPLACE-AT-LISTING/latest`; the product ID replaces
   `prod-REPLACE-AT-LISTING` once AWS Marketplace issues it.
