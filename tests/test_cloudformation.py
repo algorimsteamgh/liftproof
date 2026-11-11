@@ -24,6 +24,7 @@ INPUTS = {
     "ami_id": ["ImageId"],
     "instance_type": ["InstanceType"],
     "root_volume_gib": ["RootVolumeGiB"],
+    "instance_generation": ["InstanceGeneration"],
     "vpc_id": ["VpcId"],
     "subnet_id": ["SubnetId"],
     "create_vpc_endpoints": ["CreateVpcEndpoints"],
@@ -172,6 +173,41 @@ def test_alarm_dimension_is_what_the_cli_publishes(template):
     assert "dimensions          = { Deployment = var.name }" in tf("monitoring.tf")
 
 
+def test_alarms_match(template):
+    """The same alarms in both templates: metric, dimensions, threshold and action, and
+    the product's metrics are the ones the CLI and the CloudWatch agent publish."""
+    cfn = {}
+    for res in template["Resources"].values():
+        if res["Type"] != "AWS::CloudWatch::Alarm":
+            continue
+        p = res["Properties"]
+        dims = {d["Name"]: d["Value"] if isinstance(d["Value"], str) else "<name>"
+                for d in p["Dimensions"]}  # fmt: skip
+        actions = json.dumps(p.get("AlarmActions"))
+        action = next((a for a in ("recover", "reboot") if f"ec2:{a}" in actions), None)
+        cfn[p["MetricName"]] = (p["Namespace"], dims, float(p["Threshold"]), action)
+    tfm = {}
+    for block in tf("monitoring.tf").split('resource "aws_cloudwatch_metric_alarm"')[1:]:
+        metric = re.search(r'metric_name\s*=\s*"(\w+)"', block).group(1)
+        namespace = re.search(r'namespace\s*=\s*"([\w/]+)"', block).group(1)
+        raw = re.search(r"dimensions\s*=\s*\{(.*?)\}", block).group(1)
+        dims = {}
+        for k, v in re.findall(r'(\w+)\s*=\s*("[^"]*"|[\w.]+)', raw):
+            dims[k] = v.strip('"') if v.startswith('"') else "<name>"
+        threshold = float(re.search(r"threshold\s*=\s*(\d+)", block).group(1))
+        action = next((a for a in ("recover", "reboot") if f"ec2:{a}" in block), None)
+        tfm[metric] = (namespace, dims, threshold, action)
+    assert cfn == tfm
+    assert set(cfn) == {
+        "StatusCheckFailed_System", "StatusCheckFailed_Instance", "ScheduledRunSkipped",
+        "RunFailed", "disk_used_percent",
+    }  # fmt: skip
+    cli_src = (ROOT / "src/liftproof/cli.py").read_text(encoding="utf-8")
+    assert '"RunFailed"' in cli_src and '"ScheduledRunSkipped"' in cli_src
+    agent = (ROOT / "infra/packer/files/mvt-cwagent-config").read_text(encoding="utf-8")
+    assert '"used_percent"' in agent and '"resources": ["/"]' in agent
+
+
 def test_customer_key_statements_are_published(template):
     """With the customer's own key the log group fails to create until its policy allows
     CloudWatch Logs; the statements are an output and in the deployment guide."""
@@ -181,3 +217,15 @@ def test_customer_key_statements_are_published(template):
         if sid != "AccountAdministration":
             assert f'"Sid": "{sid}"' in guide, sid
     assert "Bring your own KMS key" in template["Parameters"]["KmsKeyArn"]["Description"]
+
+
+def test_raising_the_generation_replaces_the_instance(template):
+    """A lost instance is replaced at the same image version in either template
+    (decision 139): Terraform through replace_triggered_by, CloudFormation through a new
+    launch template version, which an instance can only take by being replaced."""
+    assert "replace_triggered_by = [terraform_data.instance_generation]" in tf("compute.tf")
+    r = template["Resources"]
+    [volume] = r["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["TagSpecifications"]
+    assert {"Key": "liftproof:generation", "Value": {"Ref": "InstanceGeneration"}} in volume["Tags"]
+    version = r["Instance"]["Properties"]["LaunchTemplate"]["Version"]
+    assert version == {"Fn::GetAtt": ["LaunchTemplate", "LatestVersionNumber"]}

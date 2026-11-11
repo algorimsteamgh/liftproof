@@ -39,7 +39,21 @@ CONF
 chmod 0644 /etc/ssh/sshd_config.d/10-liftproof.conf
 passwd -l root
 
+# Patches arrive as a new image version, not in place (decision 138). The instance has no
+# route to the Ubuntu archive (egress is the VPC endpoints, S3 and the declared systems),
+# so unattended-upgrades and the apt timers could only fail every day, and an image that
+# changes itself would no longer be the one the release's Inspector scan passed. Every
+# release is built from a fully upgraded base (provision.sh dist-upgrade) and scanned.
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'CONF'
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+CONF
+systemctl disable apt-daily.timer apt-daily-upgrade.timer
+systemctl disable unattended-upgrades.service 2>/dev/null || true
+date -u +%Y-%m-%d > /etc/mvt/image-built
+
 # Session Manager sessions time out; long runs go under systemd, never in a shell.
 cat > /etc/profile.d/liftproof.sh <<'CONF'
-echo "Liftproof $(cat /etc/mvt/version). Run long commands with: sudo systemd-run --unit=liftproof-job --collect -p User=mvt liftproof ..."
+echo "Liftproof $(cat /etc/mvt/version), image built $(cat /etc/mvt/image-built); OS patches arrive as new AWS Marketplace versions."
+echo "Run long commands with: sudo systemd-run --unit=liftproof-job --collect -p User=mvt liftproof ..."
 CONF

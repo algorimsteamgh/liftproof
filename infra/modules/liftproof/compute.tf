@@ -23,6 +23,11 @@ locals {
   })
 }
 
+# Raising var.instance_generation replaces the instance (decision 139).
+resource "terraform_data" "instance_generation" {
+  input = var.instance_generation
+}
+
 resource "aws_instance" "this" {
   ami                         = var.ami_id
   instance_type               = var.instance_type
@@ -69,6 +74,7 @@ resource "aws_instance" "this" {
   volume_tags = merge(local.tags, { Name = local.name })
 
   lifecycle {
-    ignore_changes = [ami] # upgrade by launching the new Marketplace version deliberately
+    ignore_changes       = [ami] # upgrade by launching the new Marketplace version deliberately
+    replace_triggered_by = [terraform_data.instance_generation]
   }
 }

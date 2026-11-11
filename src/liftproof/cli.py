@@ -2077,6 +2077,12 @@ def main(argv: list[str] | None = None) -> int:
     logs.setup(
         args.log_level, str(log_dir / "liftproof.log") if os.access(log_dir, os.W_OK) else None
     )
+    code = _main(args)
+    _publish_outcome(args.command, code)
+    return code
+
+
+def _main(args: argparse.Namespace) -> int:
     try:
         _refuse_env_credentials()
         _configure_aws()
@@ -2097,6 +2103,29 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(logs.scrub(traceback.format_exc()), file=sys.stderr)
         return EXIT_RUN_FAILED
+
+
+# The commands that are runs: each publishes how it ended, so a nightly run that fails is
+# an alarm, not a report nobody opened (decision 136).
+RUN_COMMANDS = ("baseline", "rebaseline", "reconcile", "files", "replay", "smoke", "validate")
+
+
+def _publish_outcome(command: str, code: int) -> None:
+    """RunFailed (1 when the run gave no verdict: exit 2 or 3) and RunDifferences (1 when
+    it found differences: exit 10), every run, so an alarm can tell a run that passed from
+    one that never ran. Only on an instance of a deployment; a failure to publish costs
+    nothing but the data point."""
+    if command not in RUN_COMMANDS:
+        return
+    try:
+        deployment = _instance_config().get("deployment")
+        if not deployment:
+            return
+        dims = {"Deployment": str(deployment)}
+        aws.put_metric("RunFailed", 1 if code in (EXIT_RUN_FAILED, EXIT_CONFIG) else 0, dims)
+        aws.put_metric("RunDifferences", 1 if code == EXIT_DIFFERENCES else 0, dims)
+    except Exception as e:  # noqa: BLE001 - the run's own exit code and report stand
+        log.warning("could not publish the run's outcome metrics: %s", e)
 
 
 if __name__ == "__main__":

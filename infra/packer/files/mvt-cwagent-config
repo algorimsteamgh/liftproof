@@ -1,20 +1,34 @@
 #!/usr/bin/env bash
-# Point the CloudWatch agent at the log group named in /etc/mvt/config.yaml.
+# Configure the CloudWatch agent from /etc/mvt/config.yaml: the product log to the
+# deployment's log group, and root volume and memory use to the Liftproof namespace (the
+# only one the instance role may publish to) with the Deployment dimension, which the
+# deployment's root volume alarm watches (decision 137).
 set -euo pipefail
+conf=/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 # A YAML parser, not a pattern: Terraform's yamlencode quotes the keys, CloudFormation
 # does not.
-group=$(/opt/mvt/bin/python -c '
-import yaml
-print((yaml.safe_load(open("/etc/mvt/config.yaml")) or {}).get("log_group") or "")')
-[ -n "$group" ] || exit 0
-cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<JSON
-{
-  "agent": {"run_as_user": "cwagent"},
-  "logs": {"logs_collected": {"files": {"collect_list": [
-    {"file_path": "/var/log/mvt/*.log", "log_group_name": "$group",
-     "log_stream_name": "{instance_id}/liftproof", "retention_in_days": -1}
-  ]}}}
-}
-JSON
+/opt/mvt/bin/python -c '
+import json, sys, yaml
+c = yaml.safe_load(open("/etc/mvt/config.yaml")) or {}
+group, deployment = c.get("log_group"), c.get("deployment")
+if not group:
+    sys.exit(0)
+agent = {"run_as_user": "cwagent", "metrics_collection_interval": 60, "omit_hostname": True}
+config = {"agent": agent, "logs": {"logs_collected": {"files": {"collect_list": [
+    {"file_path": "/var/log/mvt/*.log", "log_group_name": group,
+     "log_stream_name": "{instance_id}/liftproof", "retention_in_days": -1}]}}}}
+if deployment:
+    dims = {"Deployment": str(deployment)}
+    config["metrics"] = {"namespace": "Liftproof", "metrics_collected": {
+        # dimensions: Deployment, path and fstype (the device name varies by instance type)
+        "disk": {"resources": ["/"], "measurement": ["used_percent"], "drop_device": True,
+                 "append_dimensions": dims},
+        "mem": {"measurement": ["mem_used_percent"], "append_dimensions": dims}}}
+print(json.dumps(config, indent=2))' > "$conf.new"
+if [ ! -s "$conf.new" ]; then
+  rm -f "$conf.new"
+  exit 0
+fi
+mv "$conf.new" "$conf"
 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s \
-  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+  -c "file:$conf"

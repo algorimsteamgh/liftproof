@@ -23,15 +23,39 @@ def _text(name: str) -> str:
     return (FILES / name).read_text(encoding="utf-8")
 
 
+def _cwagent_config(tmp_path, written: str) -> dict | None:
+    code = re.search(r"python -c '\n(.*?)' >", _text("mvt-cwagent-config"), re.S).group(1)
+    code = code.replace("/etc/mvt/config.yaml", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text(written)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout) if out.stdout.strip() else None
+
+
 def test_cloudwatch_agent_finds_the_log_group_in_either_template(tmp_path):
     """Terraform's yamlencode quotes the keys; CloudFormation writes them bare."""
-    code = re.search(r"python -c '\n(.*?)'\)", _text("mvt-cwagent-config"), re.S).group(1)
-    code = code.replace("/etc/mvt/config.yaml", str(tmp_path / "config.yaml"))
     for written in ('"deployment": "x"\n"log_group": "/liftproof/x"\n',
                     "deployment: x\nlog_group: /liftproof/x\n"):  # fmt: skip
-        (tmp_path / "config.yaml").write_text(written)
-        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-        assert out.stdout.strip() == "/liftproof/x"
+        config = _cwagent_config(tmp_path, written)
+        [files] = config["logs"]["logs_collected"]["files"]["collect_list"]
+        assert files["log_group_name"] == "/liftproof/x"
+    assert _cwagent_config(tmp_path, "region: ap-south-1\n") is None  # not a deployment
+
+
+def test_cloudwatch_agent_publishes_what_the_alarms_watch(tmp_path):
+    """Root volume and memory use go to the one namespace the instance role may publish
+    to, with the Deployment dimension the templates' root volume alarm names."""
+    config = _cwagent_config(tmp_path, "deployment: x\nlog_group: /liftproof/x\n")
+    metrics = config["metrics"]
+    assert metrics["namespace"] == "Liftproof"
+    disk, mem = metrics["metrics_collected"]["disk"], metrics["metrics_collected"]["mem"]
+    assert disk["resources"] == ["/"] and disk["measurement"] == ["used_percent"]
+    assert disk["drop_device"] is True  # leaves path and fstype, which the alarm names
+    assert disk["append_dimensions"] == mem["append_dimensions"] == {"Deployment": "x"}
+    assert mem["measurement"] == ["mem_used_percent"]
+    assert config["agent"]["omit_hostname"] is True
+    iam = (ROOT / "infra/modules/liftproof/iam.tf").read_text(encoding="utf-8")
+    assert 'values   = ["Liftproof"]' in iam  # the PutMetricData condition
 
 
 def test_cloudwatch_agent_can_read_the_product_log():
@@ -112,3 +136,14 @@ def test_the_source_ami_is_built_in_us_east_1():
     assert re.search(r'variable "region" \{[^}]*default = "us-east-1"', packer)
     assert '"AWS_REGION=${var.region}"' in packer
     assert "${AWS_REGION}" in _text("provision.sh") and "ap-south-1" not in _text("provision.sh")
+
+
+def test_the_image_does_not_patch_itself():
+    """Patches arrive as new Marketplace versions (decision 138): the instance has no
+    route to the archive, and the image must stay the one the release scan passed."""
+    harden = _text("harden.sh")
+    assert 'APT::Periodic::Unattended-Upgrade "0";' in harden
+    assert "systemctl disable apt-daily.timer apt-daily-upgrade.timer" in harden
+    assert "/etc/mvt/image-built" in harden
+    assert "dist-upgrade" in _text("provision.sh")
+    assert "## Patching" in (ROOT / "SECURITY.md").read_text(encoding="utf-8")
