@@ -9,7 +9,7 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: Deployment }
-        Parameters: [DeploymentName, ImageId, InstanceType, RootVolumeGiB]
+        Parameters: [DeploymentName, ImageId, InstanceType, RootVolumeGiB, InstanceGeneration]
       - Label: { default: Network (the instance gets no inbound rule and no public address) }
         Parameters:
           - VpcId
@@ -69,6 +69,11 @@ Parameters:
     Default: 100
     MinValue: 30
     MaxValue: 4096
+  InstanceGeneration:
+    Type: Number
+    Description: Raise by one to replace the instance with a new one at the same image version (a lost or broken instance). The bucket, key and log group stay; the new instance restores its projects from the bucket.
+    Default: 1
+    MinValue: 1
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: VPC to deploy into.
@@ -808,6 +813,9 @@ Resources:
             Tags:
               - { Key: Name, Value: { "Fn::Sub": "liftproof-${DeploymentName}" } }
               - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
+              # a new value is a new launch template version, which replaces the instance
+              # (decision 139)
+              - { Key: liftproof:generation, Value: { Ref: InstanceGeneration } }
 
   Instance:
     Type: AWS::EC2::Instance

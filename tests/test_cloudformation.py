@@ -24,6 +24,7 @@ INPUTS = {
     "ami_id": ["ImageId"],
     "instance_type": ["InstanceType"],
     "root_volume_gib": ["RootVolumeGiB"],
+    "instance_generation": ["InstanceGeneration"],
     "vpc_id": ["VpcId"],
     "subnet_id": ["SubnetId"],
     "create_vpc_endpoints": ["CreateVpcEndpoints"],
@@ -216,3 +217,15 @@ def test_customer_key_statements_are_published(template):
         if sid != "AccountAdministration":
             assert f'"Sid": "{sid}"' in guide, sid
     assert "Bring your own KMS key" in template["Parameters"]["KmsKeyArn"]["Description"]
+
+
+def test_raising_the_generation_replaces_the_instance(template):
+    """A lost instance is replaced at the same image version in either template
+    (decision 139): Terraform through replace_triggered_by, CloudFormation through a new
+    launch template version, which an instance can only take by being replaced."""
+    assert "replace_triggered_by = [terraform_data.instance_generation]" in tf("compute.tf")
+    r = template["Resources"]
+    [volume] = r["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["TagSpecifications"]
+    assert {"Key": "liftproof:generation", "Value": {"Ref": "InstanceGeneration"}} in volume["Tags"]
+    version = r["Instance"]["Properties"]["LaunchTemplate"]["Version"]
+    assert version == {"Fn::GetAtt": ["LaunchTemplate", "LatestVersionNumber"]}

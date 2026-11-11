@@ -18,6 +18,12 @@ variable "instance_type" {
   default     = "m7i.xlarge"
 }
 
+variable "instance_generation" {
+  description = "Raise by one to replace the instance with a new one at the same image version (a lost or broken instance). The bucket, key and log group stay; the new instance restores its projects from the bucket."
+  type        = number
+  default     = 1
+}
+
 variable "root_volume_gib" {
   description = "Root volume size. Holds working copies and transient chunk hashes only."
   type        = number
