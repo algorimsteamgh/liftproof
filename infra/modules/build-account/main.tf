@@ -302,6 +302,18 @@ resource "aws_vpc_security_group_egress_rule" "builder_https" {
   cidr_ipv4         = "0.0.0.0/0"
 }
 
+# The Ubuntu archive (the EC2 regional mirror and security.ubuntu.com) is served over
+# plain HTTP; apt checks every package against the archive's signed Release files. Without
+# this, apt-get update times out and the build stops at the first install (v0.1.0rc2).
+resource "aws_vpc_security_group_egress_rule" "builder_http" {
+  security_group_id = aws_security_group.builder.id
+  description       = "Ubuntu archive (HTTP; packages verified by apt signatures)"
+  ip_protocol       = "tcp"
+  from_port         = 80
+  to_port           = 80
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
 # --- what the release role may do ------------------------------------------------------
 
 data "aws_iam_policy_document" "release" {
