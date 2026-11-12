@@ -156,3 +156,11 @@ def test_files_folder_exists_before_its_contents_are_uploaded():
     assert hcl.index("mkdir -p /tmp/liftproof-files") < hcl.index(
         'source      = "${path.root}/files/"'
     )
+
+
+def test_builder_reaches_the_ubuntu_archive():
+    """The image build runs apt against the Ubuntu archive, which is plain HTTP; the
+    builder's security group allowed only 443 and apt-get update timed out (v0.1.0rc2)."""
+    tf = (ROOT / "infra/modules/build-account/main.tf").read_text(encoding="utf-8")
+    rule = tf.split('resource "aws_vpc_security_group_egress_rule" "builder_http"')[1]
+    assert "from_port         = 80" in rule.split("}")[0]
