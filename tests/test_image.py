@@ -147,3 +147,12 @@ def test_the_image_does_not_patch_itself():
     assert "/etc/mvt/image-built" in harden
     assert "dist-upgrade" in _text("provision.sh")
     assert "## Patching" in (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+
+
+def test_files_folder_exists_before_its_contents_are_uploaded():
+    """A file provisioner whose source ends in "/" copies into an existing folder; the
+    first release build failed with scp "Not a directory" without the mkdir before it."""
+    hcl = (ROOT / "infra/packer/liftproof.pkr.hcl").read_text(encoding="utf-8")
+    assert hcl.index("mkdir -p /tmp/liftproof-files") < hcl.index(
+        'source      = "${path.root}/files/"'
+    )
