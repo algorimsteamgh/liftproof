@@ -203,3 +203,17 @@ def test_scan_waits_for_a_finished_scan():
     scan = (ROOT / "infra/scripts/scan-ami.sh").read_text(encoding="utf-8")
     assert "lastScannedAt" in scan and "PENDING_INITIAL_SCAN" in scan
     assert 'select(.fixAvailable != \\"NO\\")' in scan
+
+
+def test_the_image_drops_the_venv_bootstrap_wheels():
+    """Inspector flagged the pip and urllib3 copies in python3-pip-whl (v0.1.0rc3); they
+    serve only `python -m venv`, which nothing on the instance runs after the build."""
+    cleanup = _text("cleanup.sh")
+    purge = "apt-get -y purge python3.12-venv python3-pip-whl python3-setuptools-whl"
+    assert purge in cleanup and cleanup.index(purge) < cleanup.index("apt-get -y autoremove")
+    assert cleanup.index("apt-mark manual python3.12") < cleanup.index(purge)
+    import liftproof
+
+    src = Path(liftproof.__file__).parent
+    assert not any("ensurepip" in f.read_text(encoding="utf-8") or "-m venv" in f.read_text(
+        encoding="utf-8") for f in src.rglob("*.py"))

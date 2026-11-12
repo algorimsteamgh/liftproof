@@ -21,6 +21,13 @@ if [ -n "$newest" ]; then
     apt-get -y purge $old
   fi
 fi
+# python3.12-venv was needed only to create /opt/mvt and the build's audit venv. Its
+# python3-pip-whl and python3-setuptools-whl carry pip and urllib3 copies that Inspector
+# flags (v0.1.0rc3: CVE-2025-66418, CVE-2025-66471), and nothing on the instance creates a
+# venv. /opt/mvt keeps its own upgraded pip, which the in-image pip-audit checked.
+# python3.12 runs /opt/mvt: keep it manual so the autoremove below never takes it
+apt-mark manual python3.12
+apt-get -y purge python3.12-venv python3-pip-whl python3-setuptools-whl
 apt-get -y autoremove --purge
 apt-get clean
 rm -rf /var/lib/apt/lists/*
