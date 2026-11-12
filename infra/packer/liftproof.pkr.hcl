@@ -123,6 +123,12 @@ build {
     destination = "/tmp/"
   }
 
+  # A source ending in "/" uploads the folder's contents into the destination, which
+  # must already exist: scp refuses otherwise ("Not a directory", first release run).
+  provisioner "shell" {
+    inline = ["mkdir -p /tmp/liftproof-files"]
+  }
+
   provisioner "file" {
     source      = "${path.root}/files/"
     destination = "/tmp/liftproof-files"
