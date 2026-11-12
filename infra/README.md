@@ -151,8 +151,8 @@ need the second statement, with only `kms:Decrypt`, under the same condition.
   before building. The image's own installed packages are audited again during the
   build, and that audit is kept with the evidence.
 - **AMI:** Packer builds over Session Manager in a private subnet. Amazon Inspector then
-  scans an instance of the new AMI, and any HIGH or CRITICAL finding fails the release
-  (ATS-009). Build logs, the dependency audit and scan findings go to an evidence bucket
+  scans an instance of the new AMI, and any HIGH or CRITICAL finding with a fix available
+  fails the release (ATS-009; findings with no fix yet are kept as evidence). Build logs, the dependency audit and scan findings go to an evidence bucket
   under Object Lock compliance mode for 400 days.
 - **Marketplace:** an ingestion role lets AWS Marketplace scan and copy each AMI version.
 

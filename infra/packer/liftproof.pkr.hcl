@@ -134,8 +134,11 @@ build {
     destination = "/tmp/liftproof-files"
   }
 
+  # A custom execute_command must place {{ .Vars }} itself, or environment_vars never
+  # reach the script (v0.1.0rc2: "AWS_REGION: unbound variable"). `sudo env` sets them
+  # for the root shell explicitly instead of relying on sudo -E keeping them.
   provisioner "shell" {
-    execute_command  = "sudo -E bash -euo pipefail '{{ .Path }}'"
+    execute_command  = "sudo env {{ .Vars }} bash -euo pipefail '{{ .Path }}'"
     environment_vars = ["LIFTPROOF_VERSION=${var.version}", "AWS_REGION=${var.region}"]
     scripts          = ["${path.root}/files/provision.sh", "${path.root}/files/scheduler.sh", "${path.root}/files/harden.sh"]
   }
@@ -148,7 +151,7 @@ build {
   }
 
   provisioner "shell" {
-    execute_command = "sudo -E bash -euo pipefail '{{ .Path }}'"
+    execute_command = "sudo env {{ .Vars }} bash -euo pipefail '{{ .Path }}'"
     scripts         = ["${path.root}/files/cleanup.sh"]
   }
 

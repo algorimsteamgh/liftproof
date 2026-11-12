@@ -378,6 +378,10 @@ data "aws_iam_policy_document" "release" {
     }
   }
 
+  # CreateImage is authorized on the instance and on the new image and snapshot. The
+  # instance carries the build tag; the image and snapshot do not exist yet and have no
+  # tags, so they are allowed by PublishImages below. With CreateImage only here, the
+  # image and snapshot fail the tag condition and the build stops at "Creating AMI".
   statement {
     sid = "ManageOwnBuilders"
     actions = [
@@ -394,8 +398,8 @@ data "aws_iam_policy_document" "release" {
   statement {
     sid = "PublishImages"
     actions = [
-      "ec2:RegisterImage", "ec2:CopyImage", "ec2:ModifyImageAttribute", "ec2:DeregisterImage",
-      "ec2:ModifySnapshotAttribute", "ec2:DeleteSnapshot", "ec2:CreateTags",
+      "ec2:CreateImage", "ec2:RegisterImage", "ec2:CopyImage", "ec2:ModifyImageAttribute",
+      "ec2:DeregisterImage", "ec2:ModifySnapshotAttribute", "ec2:DeleteSnapshot", "ec2:CreateTags",
     ]
     resources = [
       "arn:${local.partition}:ec2:*::image/*",
