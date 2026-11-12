@@ -36,6 +36,11 @@ def test_release_job_presents_a_subject_the_role_trusts():
     trust = (ROOT / "infra/modules/build-account/main.tf").read_text(encoding="utf-8")
     subjects = re.search(r'"repo:\$\{var\.github_repository\}:(\w+):', trust).group(1)
     assert subjects == "ref"
+    # GitHub's immutable subjects (repo:OWNER@ID/REPO@ID:ref:...) are trusted too; the
+    # first release run presented that form and was refused without it.
+    assert 'repo:${local.github_immutable}:ref:${r}' in trust
+    build_env = (ROOT / "infra/envs/algorims-build/main.tf").read_text(encoding="utf-8")
+    assert "github_repository_ids = var.github_repository_ids" in build_env
     for job in _load(ROOT / ".github/workflows/release.yml")["jobs"].values():
         uses = [s.get("uses", "") for s in job.get("steps", [])]
         if any(u.startswith("aws-actions/configure-aws-credentials") for u in uses):

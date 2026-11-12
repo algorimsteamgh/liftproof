@@ -24,6 +24,20 @@ variable "release_refs" {
   default     = ["refs/heads/main", "refs/tags/v*"]
 }
 
+variable "github_repository_ids" {
+  description = <<-EOT
+    Numeric ids of the repository's owner and of the repository. GitHub issues OIDC
+    subjects in the immutable form repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:REF for newer
+    repositories and organizations, so the release role trusts that form as well as
+    repo:OWNER/REPO:ref:REF. Null trusts only the name form.
+  EOT
+  type = object({
+    owner      = number
+    repository = number
+  })
+  default = null
+}
+
 variable "create_oidc_provider" {
   description = "False when the account already has the GitHub OIDC provider."
   type        = bool
@@ -64,6 +78,10 @@ locals {
   partition  = data.aws_partition.current.partition
   region     = data.aws_region.current.region
   tags       = merge(var.tags, { "liftproof:managed-by" = "terraform", "liftproof:scope" = "build" })
+  # owner@owner_id/repo@repo_id, the subject GitHub's immutable claims carry
+  github_immutable = var.github_repository_ids == null ? null : format("%s@%d/%s@%d",
+    split("/", var.github_repository)[0], var.github_repository_ids.owner,
+  split("/", var.github_repository)[1], var.github_repository_ids.repository)
   oidc_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : (
     "arn:${local.partition}:iam::${local.account_id}:oidc-provider/token.actions.githubusercontent.com"
   )
@@ -93,7 +111,10 @@ data "aws_iam_policy_document" "release_trust" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = [for r in var.release_refs : "repo:${var.github_repository}:ref:${r}"]
+      values = concat(
+        [for r in var.release_refs : "repo:${var.github_repository}:ref:${r}"],
+        [for r in(var.github_repository_ids == null ? [] : var.release_refs) : "repo:${local.github_immutable}:ref:${r}"],
+      )
     }
   }
 }
