@@ -138,7 +138,8 @@ need the second statement, with only `kms:Decrypt`, under the same condition.
   logging and a monthly budget alert. EBS encryption by default is on in every account
   except the build account, where it would encrypt the AMI (see below).
 - **Release path:** GitHub Actions assumes `liftproof-github-release` through OIDC, only
-  from `main` and `v*` tags. No stored keys (the second half of IAM-002). The release
+  from `main` and `v*` tags. No stored keys (the second half of IAM-002). The role trusts both subject forms GitHub issues: `repo:OWNER/REPO:ref:REF` and the
+  immutable `repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:REF` (`github_repository_ids`). The release
   job runs without a GitHub environment, because a job in one presents an
   environment subject that the role does not trust. Its settings are repository
   variables: `LIFTPROOF_RELEASE_ROLE_ARN`, `LIFTPROOF_BUILD_SUBNET`,

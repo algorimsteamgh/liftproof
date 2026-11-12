@@ -36,6 +36,17 @@ variable "github_repository" {
   default = "algorimsteamgh/liftproof"
 }
 
+# GitHub presents OIDC subjects for this repository in the immutable form
+# repo:algorimsteamgh@187379989/liftproof@1405471971:ref:... (seen on the first
+# release run, v0.1.0rc1), so the release role trusts it by these ids.
+variable "github_repository_ids" {
+  type = object({
+    owner      = number
+    repository = number
+  })
+  default = { owner = 187379989, repository = 1405471971 }
+}
+
 variable "budget_emails" {
   type = list(string)
 }
@@ -58,11 +69,12 @@ module "network" {
 }
 
 module "build" {
-  source            = "../../modules/build-account"
-  github_repository = var.github_repository
-  build_vpc_id      = module.network.vpc_id
-  build_subnet_id   = module.network.private_subnet_ids[0]
-  access_log_bucket = module.baseline.access_log_bucket
+  source                = "../../modules/build-account"
+  github_repository     = var.github_repository
+  github_repository_ids = var.github_repository_ids
+  build_vpc_id          = module.network.vpc_id
+  build_subnet_id       = module.network.private_subnet_ids[0]
+  access_log_bucket     = module.baseline.access_log_bucket
 }
 
 output "release_role_arn" {
