@@ -6,7 +6,8 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
 apt-get -y -o Dpkg::Options::=--force-confold dist-upgrade
-apt-get -y install python3.12 python3.12-venv chrony gnupg curl ca-certificates
+# libatomic1: Playwright's bundled Node driver needs it, and minimal bases leave it out
+apt-get -y install python3.12 python3.12-venv chrony gnupg curl ca-certificates libatomic1
 
 # Amazon Time Sync Service over the link-local address
 cat > /etc/chrony/sources.d/aws.sources <<'CONF'
@@ -30,7 +31,8 @@ curl -fsSL -o "$work/agent.gpg" https://amazoncloudwatch-agent.s3.amazonaws.com/
 export GNUPGHOME="$work/gnupg"
 install -d -m 0700 "$GNUPGHOME"
 gpg --batch --import "$work/agent.gpg"
-gpg --batch --with-colons --fingerprint | awk -F: '$1=="fpr"{print $10}' | grep -qx "$CW_KEY_FPR"
+# grep without -q reads all its input, so pipefail never sees awk killed by SIGPIPE
+gpg --batch --with-colons --fingerprint | awk -F: '$1=="fpr"{print $10}' | grep -x "$CW_KEY_FPR" >/dev/null
 gpg --batch --verify "$work/agent.deb.sig" "$work/agent.deb"
 apt-get -y install "$work/agent.deb"
 unset GNUPGHOME

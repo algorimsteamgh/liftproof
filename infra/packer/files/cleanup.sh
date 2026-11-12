@@ -3,6 +3,24 @@
 set -euo pipefail
 rm -f /tmp/liftproof-*.whl
 rm -rf /tmp/liftproof-files /var/tmp/ami-dependency-audit.txt
+export DEBIAN_FRONTEND=noninteractive
+# provision.sh's dist-upgrade installs a newer kernel, but the builder keeps running the
+# base image's, which autoremove never removes. Left in the image, its packages carry the
+# CVEs the new kernel fixed and fail the Inspector gate. Purge every kernel package not
+# of the newest installed version (with DEBIAN_FRONTEND=noninteractive, removing the
+# running kernel does not prompt; the image boots the newest).
+newest=$( { dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-[0-9]*' 2>/dev/null || true; } \
+  | awk '$1 == "ii" {print $2}' | sed -e 's/^linux-image-//' -e 's/-[a-z]*$//' | sort -V | tail -n 1 || true)
+if [ -n "$newest" ]; then
+  old=$( { dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-*' 2>/dev/null || true; } \
+    | awk '$1 == "ii" {print $2}' | grep -E -- '-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' \
+    | grep -vF -- "$newest" || true)
+  if [ -n "$old" ]; then
+    echo "removing old kernel packages: $old"
+    # shellcheck disable=SC2086 # one package name per word
+    apt-get -y purge $old
+  fi
+fi
 apt-get -y autoremove --purge
 apt-get clean
 rm -rf /var/lib/apt/lists/*

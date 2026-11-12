@@ -164,3 +164,42 @@ def test_builder_reaches_the_ubuntu_archive():
     tf = (ROOT / "infra/modules/build-account/main.tf").read_text(encoding="utf-8")
     rule = tf.split('resource "aws_vpc_security_group_egress_rule" "builder_http"')[1]
     assert "from_port         = 80" in rule.split("}")[0]
+
+
+def test_provisioner_scripts_receive_their_environment():
+    """A custom execute_command must place {{ .Vars }} itself, or environment_vars never
+    reach the script: v0.1.0rc2 stopped at "AWS_REGION: unbound variable"."""
+    hcl = (ROOT / "infra/packer/liftproof.pkr.hcl").read_text(encoding="utf-8")
+    commands = re.findall(r'execute_command\s*=\s*"([^"]*)"', hcl)
+    assert commands and all("{{ .Vars }}" in c for c in commands), commands
+
+
+def test_playwright_driver_has_its_libraries():
+    """Playwright's bundled Node driver links libatomic.so.1, which minimal Ubuntu bases
+    leave out; without it `playwright install` fails before downloading anything."""
+    assert re.search(r"apt-get -y install [^\n]*\blibatomic1\b", _text("provision.sh"))
+
+
+def test_the_image_keeps_only_the_newest_kernel():
+    """The builder runs the base image's kernel while dist-upgrade installs a newer one,
+    and autoremove keeps the running kernel; its packages would fail the Inspector gate."""
+    cleanup = _text("cleanup.sh")
+    assert "apt-get -y purge $old" in cleanup
+    assert cleanup.index("apt-get -y purge $old") < cleanup.index("apt-get -y autoremove")
+    assert "DEBIAN_FRONTEND=noninteractive" in cleanup  # no prompt for the running kernel
+
+
+def test_release_role_may_create_the_image():
+    """CreateImage is authorized on the new image and snapshot too, which carry no build
+    tag yet, so the tag-conditioned statement alone refuses it."""
+    tf = (ROOT / "infra/modules/build-account/main.tf").read_text(encoding="utf-8")
+    publish = tf.split('sid = "PublishImages"')[1].split("statement {")[0]
+    assert '"ec2:CreateImage"' in publish and "image/*" in publish and "snapshot/*" in publish
+
+
+def test_scan_waits_for_a_finished_scan():
+    """Inspector coverage turns ACTIVE with reason PENDING_INITIAL_SCAN before anything
+    is scanned; reading findings then would pass an unscanned image."""
+    scan = (ROOT / "infra/scripts/scan-ami.sh").read_text(encoding="utf-8")
+    assert "lastScannedAt" in scan and "PENDING_INITIAL_SCAN" in scan
+    assert 'select(.fixAvailable != \\"NO\\")' in scan

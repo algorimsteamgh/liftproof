@@ -81,3 +81,14 @@ def test_the_character_set_fixture_gates_releases():
     assert re.fullmatch(r"container-registry\.oracle\.com/database/free:23\.\d+\.\d+\.\d+", image)
     assert job["env"]["LIFTPROOF_TEST_ORACLE_CHARSET"] == "WE8MSWIN1252"
     assert image in (ROOT / "tests/test_charset_oracle.py").read_text(encoding="utf-8")
+
+
+def test_release_credentials_outlast_the_build_and_scan():
+    """Packer plus the Inspector wait can pass the default one hour session."""
+    job = _load(ROOT / ".github/workflows/release.yml")["jobs"]["ami"]
+    creds = next(s for s in job["steps"] if s.get("uses", "").startswith(
+        "aws-actions/configure-aws-credentials"))
+    duration = int(creds["with"]["role-duration-seconds"])
+    tf = (ROOT / "infra/modules/build-account/main.tf").read_text(encoding="utf-8")
+    allowed = int(re.search(r"max_session_duration\s*=\s*(\d+)", tf).group(1))
+    assert 3600 < duration <= allowed

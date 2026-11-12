@@ -69,6 +69,9 @@ jobs:
         with:
           role-to-assume: ${{ vars.LIFTPROOF_RELEASE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          # Packer build plus the Inspector wait can pass the default one hour; the
+          # release role allows two (max_session_duration in infra/modules/build-account)
+          role-duration-seconds: 7200
       - run: pip install build pip-audit
       - name: Dependency gate (ATS-009)
         run: pip-audit --strict . | tee pip-audit.log
