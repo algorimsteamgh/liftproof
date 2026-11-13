@@ -20,4 +20,4 @@ PrivateTmp=true
 ReadWritePaths=/var/lib/mvt /var/log/mvt
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=cloud-init.target

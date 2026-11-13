@@ -240,3 +240,16 @@ def test_image_ships_no_root_owned_log_file():
     assert runs
     assert all(r.startswith("LIFTPROOF_LOG_DIR=/var/tmp ") for r in runs), runs
     assert "rm -f /var/log/mvt/*.log" in cleanup
+
+
+def test_services_start_after_cloud_init_without_an_ordering_cycle():
+    """Ubuntu orders cloud-final after multi-user.target. A unit that is After=cloud-final
+    and WantedBy=multi-user.target makes a cycle, and systemd drops its start job at boot:
+    on the rc5 image the UI, scheduler, restore and log shipping never started."""
+    units = sorted((Path(__file__).parents[1] / "infra/packer/files").glob("*.service"))
+    assert units
+    for unit in units:
+        text = unit.read_text()
+        if re.search(r"^After=.*\bcloud-final\.service", text, re.M):
+            assert "WantedBy=multi-user.target" not in text, unit.name
+            assert "WantedBy=cloud-init.target" in text, unit.name
