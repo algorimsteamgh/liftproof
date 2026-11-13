@@ -217,3 +217,15 @@ def test_the_image_drops_the_venv_bootstrap_wheels():
     src = Path(liftproof.__file__).parent
     assert not any("ensurepip" in f.read_text(encoding="utf-8") or "-m venv" in f.read_text(
         encoding="utf-8") for f in src.rglob("*.py"))
+
+
+def test_build_waits_for_the_instance_own_apt_jobs():
+    """Ubuntu's background apt run held the dpkg lock during Playwright's install-deps and
+    stopped v0.1.0rc4. Every apt call in the build waits for the lock; the image does not
+    keep that setting."""
+    provision, cleanup = _text("provision.sh"), _text("cleanup.sh")
+    lock = "/etc/apt/apt.conf.d/90-liftproof-build-lock"
+    assert 'DPkg::Lock::Timeout "900";' in provision
+    assert provision.index(lock) < provision.index("apt-get update")
+    assert provision.index("cloud-init status --wait") < provision.index("apt-get update")
+    assert f"rm -f {lock}" in cleanup

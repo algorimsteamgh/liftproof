@@ -1,3 +1,3 @@
 """Liftproof: migration validation for workloads moving to AWS."""
 
-__version__ = "0.1.0rc4"
+__version__ = "0.1.0rc5"
