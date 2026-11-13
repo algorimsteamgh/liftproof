@@ -58,7 +58,11 @@ def test_nullability_skips_ignored_missing_unknown_and_lost_key_columns():
 def test_primary_key_lost_or_changed_is_medium_and_names_both():
     [lost] = compare_structure(_t("id", "a"), _t("id", "a", pk=()))
     assert (lost.issue, lost.severity, lost.expected, lost.actual) == (
-        "key_missing_in_target", MEDIUM, "primary key (id)", "none")
+        "key_missing_in_target",
+        MEDIUM,
+        "primary key (id)",
+        "none",
+    )
     assert lost.summary == "primary key (id) is not enforced on the target"
     # a partitioned target: the key must include the partition column
     [changed] = compare_structure(_t("id", "at"), _t("id", "at", pk=("id", "at")))
@@ -167,7 +171,10 @@ def test_an_index_only_on_the_target_is_a_notice():
     make every run pass with differences."""
     [extra] = compare_structure(_t("id", "a"), _t("id", "a", indexes=[Index("fk1", ("a",), False)]))
     assert (extra.issue, extra.kind, extra.summary) == (
-        "index_added_in_target", NOTE, "index fk1 (a) is on the target only")
+        "index_added_in_target",
+        NOTE,
+        "index fk1 (a) is on the target only",
+    )
 
 
 def test_other_kinds_of_index_are_named_not_compared():
@@ -203,7 +210,9 @@ def test_foreign_keys_match_on_column_pairs_and_the_mapped_table():
     # unmapped, the referenced table is another one: lost on one side, added on the other
     found = compare_structure(source, target)
     assert [(i.issue, i.severity) for i in found] == [
-        ("foreign_key_missing_in_target", MEDIUM), ("foreign_key_added_in_target", LOW)]
+        ("foreign_key_missing_in_target", MEDIUM),
+        ("foreign_key_added_in_target", LOW),
+    ]
     assert found[0].summary == ("foreign key fk2 (pcode, pid) to shop.parent (code, id) is not "
                                 "on the target")  # fmt: skip
     assert found[0].detail["references"] == "shop.parent"
@@ -235,7 +244,8 @@ def test_switches_and_structure_rules():
             if i.issue == "key_missing_in_target"] == ["primary key"]  # fmt: skip
     rule = IgnoreRule("t", "relaxed on purpose", "a", structure="nullability")
     assert ("nullability_changed", "a") not in [
-        (i.issue, i.column) for i in compare_structure(source, target, rules=[rule])]
+        (i.issue, i.column) for i in compare_structure(source, target, rules=[rule])
+    ]
     # a column ignore rule leaves out every object holding the column
     found = compare_structure(source, target, rules=[IgnoreRule("t", "ETL", "b")])
     assert [i.issue for i in found] == every[:3]
@@ -300,9 +310,11 @@ def test_structure_switches_in_the_project_file(tmp_path):
 
     assert _project(tmp_path, {}).structure == StructureChecks()
     assert _project(tmp_path, {"structure": False}).structure == StructureChecks(
-        False, False, False, False)
+        False, False, False, False
+    )
     assert _project(tmp_path, {"structure": {"indexes": False}}).structure == StructureChecks(
-        indexes=False)
+        indexes=False
+    )
     for bad in ({"index": False}, 3, {"keys": "no"}):
         with pytest.raises(ConfigError, match="database.structure is true, false or a map"):
             _project(tmp_path, {"structure": bad})

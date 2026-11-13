@@ -173,8 +173,16 @@ def test_the_classification_follows_show_values_for_files(tmp_path):
     (tmp_path / "a" / "x.csv").write_text("id,v\n1,2\n")
     (tmp_path / "b" / "x.csv").write_text("id,v\n1,3\n")
     path = tmp_path / "f.yaml"
-    path.write_text(yaml.safe_dump({"project": "acme", "files": [
-        {"name": "docs", "source": str(tmp_path / "a"), "target": str(tmp_path / "b")}]}))
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "project": "acme",
+                "files": [
+                    {"name": "docs", "source": str(tmp_path / "a"), "target": str(tmp_path / "b")}
+                ],
+            }
+        )
+    )
     work = ["--workdir", str(tmp_path / "w"), "--format", "json"]
     cli.main(["files", "--project", str(path), "--run-id", "f1", *work])
     assert _report(tmp_path, "f1")["classification"].startswith("hashes")

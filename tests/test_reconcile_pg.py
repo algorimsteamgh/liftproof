@@ -57,32 +57,42 @@ def pair(make_db, adapter_for):
     s, sc = make_db("src")
     t, tc = make_db("tgt")
     sc.execute(SCHEMA)
-    tc.execute(SCHEMA.replace("last_synced_at timestamp", "last_synced_at timestamp, "
-                              "tenant_id int DEFAULT 1"))
+    tc.execute(
+        SCHEMA.replace(
+            "last_synced_at timestamp", "last_synced_at timestamp, tenant_id int DEFAULT 1"
+        )
+    )
     return adapter_for(s), adapter_for(t), sc, tc
 
 
 def test_identical_databases_match(tmp_path, pair):
     src, tgt, _, tc = pair
     tc.execute("ALTER TABLE orders DROP COLUMN tenant_id")
-    result, findings = _run(tmp_path, src, tgt, ignore=[
-        IgnoreRule("orders", "rewritten by ETL", "last_synced_at")])
+    result, findings = _run(
+        tmp_path, src, tgt, ignore=[IgnoreRule("orders", "rewritten by ETL", "last_synced_at")]
+    )
     assert {t.status for t in result.tables} == {"matched"}
     assert not [f for f in findings if f.kind == Kind.DIFFERENCE]
     assert any(f.column == "unit_price" and f.kind == Kind.NOTICE for f in findings)
-    assert any(f.column == "last_synced_at" and "rewritten by ETL" in f.summary
-               for f in findings)
+    assert any(f.column == "last_synced_at" and "rewritten by ETL" in f.summary for f in findings)
 
 
 def test_ten_row_injected_difference(tmp_path, pair):
     src, tgt, _, tc = pair
-    tc.execute("DELETE FROM orders WHERE id IN (88, 213, 214, 219, 3000, 3001, 7777, 12000, "
-               "15000, 19999)")
+    tc.execute(
+        "DELETE FROM orders WHERE id IN (88, 213, 214, 219, 3000, 3001, 7777, 12000, 15000, 19999)"
+    )
     tc.execute("UPDATE orders SET status = 'dispatched' WHERE id = 4002")
     tc.execute("INSERT INTO audit_log VALUES ('2030-01-01', 'extra')")
-    result, findings = _run(tmp_path, src, tgt, ignore=[
-        IgnoreRule("orders", "rewritten by ETL", "last_synced_at"),
-        IgnoreRule("sessions", "session tokens are not migrated")])
+    result, findings = _run(
+        tmp_path,
+        src,
+        tgt,
+        ignore=[
+            IgnoreRule("orders", "rewritten by ETL", "last_synced_at"),
+            IgnoreRule("sessions", "session tokens are not migrated"),
+        ],
+    )
 
     by_table = {t.table: t for t in result.tables}
     orders = by_table["public.orders"]
@@ -90,15 +100,21 @@ def test_ten_row_injected_difference(tmp_path, pair):
     assert (orders.source_rows, orders.target_rows) == (20000, 19990)
     assert orders.missing_rows == 10 and orders.changed_rows == 1 and orders.extra_rows == 0
 
-    missing = sorted(int(f.detail["key"][0]) for f in findings
-                     if f.object == "public.orders" and f.summary == "row missing in target")
+    missing = sorted(
+        int(f.detail["key"][0])
+        for f in findings
+        if f.object == "public.orders" and f.summary == "row missing in target"
+    )
     assert missing == [88, 213, 214, 219, 3000, 3001, 7777, 12000, 15000, 19999]
     [changed] = [f for f in findings if f.summary == "value differs in column status"]
     assert changed.locator == "id = 4002"
     assert changed.expected.startswith("md5:")  # values hidden by default
 
-    count = [f for f in findings
-             if f.object == "public.orders" and f.summary.startswith("row count differs")]
+    count = [
+        f
+        for f in findings
+        if f.object == "public.orders" and f.summary.startswith("row count differs")
+    ]
     assert count and count[0].detail["difference"] == -10
 
     audit = by_table["public.audit_log"]
@@ -141,8 +157,9 @@ def test_circuit_breaker_on_systemic_change(tmp_path, pair):
 def test_diff_row_limit_states_true_total(tmp_path, pair):
     src, tgt, _, tc = pair
     tc.execute("DELETE FROM orders WHERE id % 1000 = 0")  # 20 rows across buckets
-    _, findings = _run(tmp_path, src, tgt, tables=["orders"], diff_row_limit=5,
-                       breaker_bucket_ratio=1.0)
+    _, findings = _run(
+        tmp_path, src, tgt, tables=["orders"], diff_row_limit=5, breaker_bucket_ratio=1.0
+    )
     listed = [f for f in findings if f.summary == "row missing in target"]
     assert len(listed) == 5
     [summary] = [f for f in findings if f.detail.get("limit") == 5]
@@ -153,17 +170,26 @@ def test_baseline_then_reconcile(tmp_path, make_db, adapter_for, pair):
     src, tgt, sc, tc = pair
     tc.execute("ALTER TABLE orders DROP COLUMN tenant_id")
     manifest = tmp_path / "baseline" / "manifest.json"
-    take_baseline(src, manifest, baseline_id="b1", schemas=["public"], tables=None,
-                  ignore=[IgnoreRule("orders", "rewritten by ETL", "last_synced_at")],
-                  business_keys={}, rows_per_bucket=1000, precision=6)
+    take_baseline(
+        src,
+        manifest,
+        baseline_id="b1",
+        schemas=["public"],
+        tables=None,
+        ignore=[IgnoreRule("orders", "rewritten by ETL", "last_synced_at")],
+        business_keys={},
+        rows_per_bucket=1000,
+        precision=6,
+    )
     b = Baseline.load(manifest)
     assert b.complete and b.tables["public.orders"].row_count == 20000
     assert b.position["type"] == "lsn" and b.position["position"]
 
     tc.execute("DELETE FROM customers WHERE id = 7")
     writer = FindingWriter(tmp_path / "f2", "r2")
-    opts = ReconcileOptions(rows_per_bucket=1000, ignore=[
-        IgnoreRule("orders", "rewritten by ETL", "last_synced_at")])
+    opts = ReconcileOptions(
+        rows_per_bucket=1000, ignore=[IgnoreRule("orders", "rewritten by ETL", "last_synced_at")]
+    )
     # without a live source: bucket level only, and it says so
     result = Reconciler(tgt, writer, opts, baseline=b).run()
     writer.close()
@@ -212,17 +238,25 @@ def test_structure_differences_reported(tmp_path, pair):
     tables = {t.table: t for t in result.tables}
     assert {t.status for t in tables.values()} == {"matched"}  # the data still matches
     assert {q: t.structure_differences for q, t in tables.items()} == {
-        "public.customers": 2, "public.orders": 2, "public.audit_log": 0, "public.sessions": 1}
+        "public.customers": 2,
+        "public.orders": 2,
+        "public.audit_log": 0,
+        "public.sessions": 1,
+    }
     assert verdict(findings) == "failed"
     assert result.structure == {"nullability": True, "keys": True, "foreign_keys": True,
                                 "indexes": True}  # fmt: skip
 
     # accepted with a reason: named in the exclusions, compared no more
-    rules = [ETL, IgnoreRule("sessions", "rebuilt after the load", structure="keys"),
-             IgnoreRule("customers", "relaxed on purpose", "name", structure="nullability")]
+    rules = [
+        ETL,
+        IgnoreRule("sessions", "rebuilt after the load", structure="keys"),
+        IgnoreRule("customers", "relaxed on purpose", "name", structure="nullability"),
+    ]
     result, findings = _run(tmp_path / "b", src, tgt, ignore=rules)
     assert [t for t in _structure(findings) if t[0] != "public.orders"] == [
-        ("public.customers", "key_missing_in_target", Severity.MEDIUM)]
+        ("public.customers", "key_missing_in_target", Severity.MEDIUM)
+    ]
     accepted = sorted((f.object, f.column, f.detail["structure"]) for f in findings
                       if f.detail.get("reason") and f.detail.get("structure"))  # fmt: skip
     assert accepted == [("public.customers", "name", "nullability"),
@@ -237,8 +271,9 @@ def test_structure_can_be_switched_off(tmp_path, pair):
     assert _structure(findings) == []
     assert not any(t.structure_differences for t in result.tables)
     assert set(result.structure.values()) == {False}
-    _, findings = _run(tmp_path / "b", src, tgt, structure=StructureChecks(indexes=False,
-                                                                           foreign_keys=False))
+    _, findings = _run(
+        tmp_path / "b", src, tgt, structure=StructureChecks(indexes=False, foreign_keys=False)
+    )
     assert [i for _, i, _ in _structure(findings)] == ["key_missing_in_target",
                                                        "nullability_changed",
                                                        "key_missing_in_target"]  # fmt: skip
@@ -570,8 +605,10 @@ def test_a_schema_change_is_not_put_down_to_the_type_map(tmp_path, make_db, adap
     s, sc = make_db("src")
     t, tc = make_db("tgt")
     for c in (sc, tc):
-        c.execute("CREATE TABLE t (id int PRIMARY KEY, n smallint, m smallint);"
-                  "INSERT INTO t SELECT g, g % 7, g % 5 FROM generate_series(1, 100) g")
+        c.execute(
+            "CREATE TABLE t (id int PRIMARY KEY, n smallint, m smallint);"
+            "INSERT INTO t SELECT g, g % 7, g % 5 FROM generate_series(1, 100) g"
+        )
     engines = dict(DEFAULT_TYPE_MAP.engines)
     smallint = TypeRule(T.INTEGER, (T.DECIMAL,))
     engines["postgresql"] = dict(engines["postgresql"], smallint=smallint)

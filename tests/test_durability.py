@@ -249,8 +249,10 @@ def test_a_resume_under_another_type_map_is_refused(tmp_path, project, monkeypat
     capsys.readouterr()
     code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
     assert code == EXIT_CONFIG
-    assert "started under type map 1.0 with postgresql x as y, not type map 1.0 without " \
+    assert (
+        "started under type map 1.0 with postgresql x as y, not type map 1.0 without "
         "overrides" in capsys.readouterr().err
+    )
     del saved["type_map"]  # as a build from before the map was kept left it: the 1.0 defaults
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(saved).encode())
     code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
@@ -422,8 +424,17 @@ def web_project(tmp_path):
     """Web only, four journeys recorded on this instance, each finding one difference."""
     path = tmp_path / "projects" / "acme.yaml"
     path.parent.mkdir()
-    path.write_text(yaml.safe_dump({"project": "acme", "web": {
-        "source_url": "http://source.invalid", "target_url": "http://target.invalid"}}))
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "project": "acme",
+                "web": {
+                    "source_url": "http://source.invalid",
+                    "target_url": "http://target.invalid",
+                },
+            }
+        )
+    )
     return path
 
 
@@ -458,7 +469,11 @@ def test_a_lost_replay_reports_what_it_finished_on_a_replacement(tmp_path, web_p
                        .read())  # fmt: skip
     assert not saved["complete"]
     assert [(j["journey"], j["status"]) for j in saved["journeys"]] == [
-        ("j1", "different"), ("j2", "different"), ("j3", "not_run"), ("j4", "not_run")]
+        ("j1", "different"),
+        ("j2", "different"),
+        ("j3", "not_run"),
+        ("j4", "not_run"),
+    ]
     stored = tmp_path / "from-store"
     stored.mkdir()
     for key in _keys(s3, "acme/runs/r1/findings-"):
@@ -471,7 +486,10 @@ def test_a_lost_replay_reports_what_it_finished_on_a_replacement(tmp_path, web_p
     assert code == EXIT_RUN_FAILED
     report = json.loads((second / "acme/runs/r1/report.json").read_text())
     assert (report["mode"], report["verdict"], report["failure"]) == (
-        "replay", "failed", cli.UNFINISHED)
+        "replay",
+        "failed",
+        cli.UNFINISHED,
+    )
     started = json.loads((second / "acme/runs/r1" / ckpt.RUN_INFO).read_text())["started_at"]
     assert report["run"]["started_at"] == started
     assert report["run"]["finished_at"] >= started
@@ -484,7 +502,8 @@ def test_a_lost_replay_reports_what_it_finished_on_a_replacement(tmp_path, web_p
     assert [j["status"] for j in report["journeys"]] == ["different"] * 2 + ["not_run"] * 2
     assert report["coverage"]["not_covered"] == [
         {"object": "journey j3", "reason": webrun.REASON_STOPPED},
-        {"object": "journey j4", "reason": webrun.REASON_STOPPED}]
+        {"object": "journey j4", "reason": webrun.REASON_STOPPED},
+    ]
     assert {f["journey"] for f in report["findings"] if f["kind"] == "difference"} == {"j1", "j2"}
     assert "acme/runs/r1/report.json" in _keys(s3, "acme/runs/r1/")
 

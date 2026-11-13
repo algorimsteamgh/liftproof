@@ -218,7 +218,9 @@ def test_a_browser_that_exits_between_journeys_is_charged_to_none(monkeypatch, l
     scripted(monkeypatch, act)
     result, findings = replay_all([journey("a"), journey("b")])
     assert [(r.status, r.attempts, r.browser_crashes) for r in result.journeys] == [
-        ("passed", 1, 0), ("passed", 1, 0)]
+        ("passed", 1, 0),
+        ("passed", 1, 0),
+    ]
     assert len(launched) == 2
     [notice] = findings
     assert (notice.kind, notice.journey) == (Kind.NOTICE, "b")
@@ -243,7 +245,8 @@ def test_a_browser_that_exits_while_no_call_runs_is_found_at_the_next(
     result, findings = replay_all([journey("a"), journey("b"), journey("c")], workers=workers)
     assert result.complete
     assert [(r.status, r.attempts, r.browser_crashes) for r in result.journeys] == [
-        ("passed", 1, 0)] * 3
+        ("passed", 1, 0)
+    ] * 3
     # each worker's first journey has the browser it launched; every later one restarts it
     notices = [f.journey for f in findings if f.kind == Kind.NOTICE]
     assert len(notices) == len(launched) - workers >= 1 and "a" not in notices
@@ -301,8 +304,10 @@ def test_a_crash_after_a_write_answered_with_an_error_is_not_repeated(
     if status < 400:
         assert "not_repeated" not in error.detail
     else:
-        assert error.detail["not_repeated"] == ("the journey sent POST /api/orders (503); "
-                                                "running it again would submit it a second time")
+        assert error.detail["not_repeated"] == (
+            "the journey sent POST /api/orders (503); "
+            "running it again would submit it a second time"
+        )
 
 
 def test_a_closed_page_in_a_live_browser_keeps_the_crash_path(monkeypatch, launched):
@@ -328,7 +333,11 @@ def test_parallel_workers_survive_a_browser_crash(monkeypatch, launched):
     result, findings = replay_all([journey(f"j{n}") for n in range(1, 5)], workers=2)
     assert result.complete
     assert [(r.journey, r.status) for r in result.journeys] == [
-        ("j1", "passed"), ("j2", "failed"), ("j3", "passed"), ("j4", "passed")]
+        ("j1", "passed"),
+        ("j2", "failed"),
+        ("j3", "passed"),
+        ("j4", "passed"),
+    ]
     assert result.journeys[1].browser_crashes == 2
     assert [f.journey for f in findings if f.kind == Kind.ERROR] == ["j2"]
 

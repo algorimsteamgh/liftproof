@@ -38,7 +38,7 @@ def test_release_job_presents_a_subject_the_role_trusts():
     assert subjects == "ref"
     # GitHub's immutable subjects (repo:OWNER@ID/REPO@ID:ref:...) are trusted too; the
     # first release run presented that form and was refused without it.
-    assert 'repo:${local.github_immutable}:ref:${r}' in trust
+    assert "repo:${local.github_immutable}:ref:${r}" in trust
     build_env = (ROOT / "infra/envs/algorims-build/main.tf").read_text(encoding="utf-8")
     assert "github_repository_ids = var.github_repository_ids" in build_env
     for job in _load(ROOT / ".github/workflows/release.yml")["jobs"].values():
@@ -86,8 +86,11 @@ def test_the_character_set_fixture_gates_releases():
 def test_release_credentials_outlast_the_build_and_scan():
     """Packer plus the Inspector wait can pass the default one hour session."""
     job = _load(ROOT / ".github/workflows/release.yml")["jobs"]["ami"]
-    creds = next(s for s in job["steps"] if s.get("uses", "").startswith(
-        "aws-actions/configure-aws-credentials"))
+    creds = next(
+        s
+        for s in job["steps"]
+        if s.get("uses", "").startswith("aws-actions/configure-aws-credentials")
+    )
     duration = int(creds["with"]["role-duration-seconds"])
     tf = (ROOT / "infra/modules/build-account/main.tf").read_text(encoding="utf-8")
     allowed = int(re.search(r"max_session_duration\s*=\s*(\d+)", tf).group(1))

@@ -35,6 +35,7 @@ rm -rf /var/lib/apt/lists/*
 find /home /root -name authorized_keys -delete
 rm -f /etc/ssh/ssh_host_*
 truncate -s 0 /var/log/*.log || true
+rm -f /var/log/mvt/*.log
 rm -rf /var/lib/cloud/instances/*
 cloud-init clean --logs || true
 # each instance gets its own machine id on first boot

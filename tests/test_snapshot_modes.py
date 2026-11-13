@@ -62,8 +62,12 @@ def _entry(**kw):
     return {
         "columns": [["id", "integer", "integer", False]],
         "primary_key": ["id"],
-        "plan": {"columns": [["id", "integer"]], "key_columns": ["id"], "buckets": 1,
-                 "precision": 6},  # fmt: skip
+        "plan": {
+            "columns": [["id", "integer"]],
+            "key_columns": ["id"],
+            "buckets": 1,
+            "precision": 6,
+        },  # fmt: skip
         "row_count": 1,
         "bucket_aggregates": {"0": [1, "7"]},
         "completed_at": "2026-10-01T10:00:00+00:00",

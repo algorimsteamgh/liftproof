@@ -39,9 +39,9 @@ ROWS = 1_000_000
 def replays(browser_available, tmp_path_factory):
     assets_dir = tmp_path_factory.mktemp("assets")
     with ShopApp(latency_ms=LATENCY_MS) as app:
-        journey, assets = Recorder(
-            app.url, policy=BodyPolicy(["/api/*"]), headless=True
-        ).record("checkout", start="/login", story="ORD-14", drive=drive)
+        journey, assets = Recorder(app.url, policy=BodyPolicy(["/api/*"]), headless=True).record(
+            "checkout", start="/login", story="ORD-14", drive=drive
+        )
     for sha, body in assets.items():
         (assets_dir / sha).write_bytes(body)
     results = []

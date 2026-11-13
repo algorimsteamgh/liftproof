@@ -27,12 +27,19 @@ def test_reports_are_locked_and_kms_encrypted(tmp_path):
     f = tmp_path / "report.html"
     f.write_text("x")
     with Stubber(store.s3) as stub:
-        stub.add_response("put_object", {}, {
-            "Bucket": "bucket", "Key": "acme/runs/r1/report.html", "Body": ANY,
-            "ServerSideEncryption": "aws:kms",
-            "SSEKMSKeyId": "arn:aws:kms:ap-south-1:111122223333:key/k",
-            "ObjectLockMode": "GOVERNANCE", "ObjectLockRetainUntilDate": ANY,
-        })
+        stub.add_response(
+            "put_object",
+            {},
+            {
+                "Bucket": "bucket",
+                "Key": "acme/runs/r1/report.html",
+                "Body": ANY,
+                "ServerSideEncryption": "aws:kms",
+                "SSEKMSKeyId": "arn:aws:kms:ap-south-1:111122223333:key/k",
+                "ObjectLockMode": "GOVERNANCE",
+                "ObjectLockRetainUntilDate": ANY,
+            },
+        )
         store.put_file("runs/r1/report.html", f)
         stub.assert_no_pending_responses()
 
@@ -42,12 +49,18 @@ def test_assets_are_tagged_for_expiry(tmp_path):
     f = tmp_path / "body"
     f.write_text("x")
     with Stubber(store.s3) as stub:
-        stub.add_response("put_object", {}, {
-            "Bucket": "bucket", "Key": "acme/journeys/j1/assets/abc", "Body": ANY,
-            "ServerSideEncryption": "aws:kms",
-            "SSEKMSKeyId": "arn:aws:kms:ap-south-1:111122223333:key/k",
-            "Tagging": "liftproof:class=asset",
-        })
+        stub.add_response(
+            "put_object",
+            {},
+            {
+                "Bucket": "bucket",
+                "Key": "acme/journeys/j1/assets/abc",
+                "Body": ANY,
+                "ServerSideEncryption": "aws:kms",
+                "SSEKMSKeyId": "arn:aws:kms:ap-south-1:111122223333:key/k",
+                "Tagging": "liftproof:class=asset",
+            },
+        )
         store.put_file("journeys/j1/assets/abc", f)
         stub.assert_no_pending_responses()
 
@@ -86,7 +99,9 @@ def _recording(*urls):
                   exchanges=[Exchange("GET", "/api/orders/7", 200, body_asset="assets/body")])
              for n, u in enumerate(urls, 1)]  # fmt: skip
     return Journey("j1", "http://source.invalid", steps=steps, region_shape_version=1), {
-        "page": page.encode(), "body": b'{"id": 7}'}
+        "page": page.encode(),
+        "body": b'{"id": 7}',
+    }
 
 
 def test_the_bucket_holds_the_journey_and_what_it_kept(tmp_path, bucket):
@@ -115,7 +130,8 @@ def test_the_bucket_holds_the_journey_and_what_it_kept(tmp_path, bucket):
     cmp = compare_journey(first, run, WebOptions(), findings.append, assets)
     assert cmp.ui_compared == {"text": 0, "shape": 0, "expired": 1}
     assert [(f.kind, f.detail) for f in findings] == [
-        (Kind.NOTICE, {"snapshots_expired": 1, "bodies_expired": 0})]
+        (Kind.NOTICE, {"snapshots_expired": 1, "bodies_expired": 0})
+    ]
 
 
 def test_what_the_bucket_expired_goes_from_every_journey_here(tmp_path, bucket):
@@ -151,7 +167,11 @@ def test_a_journey_only_this_instance_holds_keeps_what_it_kept(tmp_path, bucket)
     cli._fetch_assets(bucket, here, [journey])
     assets = here / "journeys" / "j1" / "assets"
     assert sorted(p.name for p in assets.iterdir()) == ["body", "page"]
-    run = JourneyRun("j1", status="completed", attempts=1,
-                     steps=[StepRun(1, "goto", "ok", region='- heading "Order 7"')])
+    run = JourneyRun(
+        "j1",
+        status="completed",
+        attempts=1,
+        steps=[StepRun(1, "goto", "ok", region='- heading "Order 7"')],
+    )
     cmp = compare_journey(journey, run, WebOptions(), lambda f: None, assets)
     assert cmp.ui_compared == {"text": 1, "shape": 0, "expired": 0}

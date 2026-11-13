@@ -110,8 +110,13 @@ def test_replay_substitutes_every_form_and_compare_masks_them():
 
 
 def test_a_journey_with_an_unknown_transform_is_refused(tmp_path, monkeypatch):
-    j = Journey("j1", "http://t", correlations=[
-        Correlation("x", "json_path", "GET /a", "$.x", "12345", transforms=["rot13"])])
+    j = Journey(
+        "j1",
+        "http://t",
+        correlations=[
+            Correlation("x", "json_path", "GET /a", "$.x", "12345", transforms=["rot13"])
+        ],
+    )
     workdir = tmp_path / "work"
     (workdir / "journeys").mkdir(parents=True)
     j.save(workdir / "journeys" / "j1.json")
@@ -193,9 +198,11 @@ def test_rows_created_inside_the_replay_window_are_left_out(tmp_path, engine_pai
     schema = e.schema(e.tgt)
     columns = {"orders": column} if column else {}
     tables, problems = watermark.resolve(target, [schema], ["orders"], columns)
-    assert not problems and list(tables.values()) == [column.upper() if e.name == "oracle"
-                                                       and column else column or
-                                                       ("ID" if e.name == "oracle" else "id")]
+    assert not problems and list(tables.values()) == [
+        column.upper()
+        if e.name == "oracle" and column
+        else column or ("ID" if e.name == "oracle" else "id")
+    ]
     before = watermark.read(target, tables)
     e.insert(_orders(3, start=501))  # what the replay's journeys placed
     after = watermark.read(target, tables)
@@ -217,8 +224,10 @@ def test_rows_created_inside_the_replay_window_are_left_out(tmp_path, engine_pai
 
 def test_windows_after_a_target_baseline_only():
     at = "2026-10-08T{}:00:00+00:00"
-    w = [watermark.Window("public.orders", "id", "10", "12", "number", "r1", at.format("09")),
-         watermark.Window("public.orders", "id", "20", "25", "number", "r2", at.format(11))]
+    w = [
+        watermark.Window("public.orders", "id", "10", "12", "number", "r1", at.format("09")),
+        watermark.Window("public.orders", "id", "20", "25", "number", "r2", at.format(11)),
+    ]
     pg = SimpleNamespace(quote_name=lambda n: f'"{n}"', literal=lambda v: str(v))
     [rule] = watermark.rules(w, pg)
     assert rule.target_where == '("id" > 10 AND "id" <= 12) OR ("id" > 20 AND "id" <= 25)'
@@ -347,7 +356,6 @@ def correlate_type():
     from liftproof.canonical import CanonicalType
 
     return CanonicalType.INTEGER
-
 
 
 def test_since_compares_times_not_text():

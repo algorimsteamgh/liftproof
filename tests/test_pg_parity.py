@@ -47,9 +47,18 @@ INSERT INTO everything VALUES
 """
 
 COLUMNS = [
-    ("aware", T.TIMESTAMPTZ), ("at_time", T.TIME), ("blob", T.BINARY), ("code", T.CHAR),
-    ("day", T.DATE), ("flag", T.BOOLEAN), ("i2", T.INTEGER), ("id", T.INTEGER),
-    ("label", T.TEXT), ("naive", T.TIMESTAMP), ("num", T.DECIMAL), ("ref", T.UUID),
+    ("aware", T.TIMESTAMPTZ),
+    ("at_time", T.TIME),
+    ("blob", T.BINARY),
+    ("code", T.CHAR),
+    ("day", T.DATE),
+    ("flag", T.BOOLEAN),
+    ("i2", T.INTEGER),
+    ("id", T.INTEGER),
+    ("label", T.TEXT),
+    ("naive", T.TIMESTAMP),
+    ("num", T.DECIMAL),
+    ("ref", T.UUID),
 ]
 
 
@@ -59,8 +68,9 @@ def test_pushdown_matches_fallback(make_db, adapter_for, precision, keyed):
     db, conn = make_db()
     conn.execute(DDL)
     a: PostgresAdapter = adapter_for(db)
-    plan = HashPlan(TableRef("public", "everything"), COLUMNS, ["id"] if keyed else [], 3,
-                    precision)
+    plan = HashPlan(
+        TableRef("public", "everything"), COLUMNS, ["id"] if keyed else [], 3, precision
+    )
     pushed = a.bucket_aggregates(plan)
     fallback = a._bucket_aggregates_fallback(plan)
     assert pushed == fallback

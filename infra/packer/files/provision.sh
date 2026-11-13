@@ -125,7 +125,9 @@ python3.12 -m venv /var/tmp/audit
 rm -rf /var/tmp/audit /var/tmp/ami-requirements.txt
 
 # Record exact versions, including the AWS SDK, on the image (AWSAPI-004)
-/opt/mvt/bin/liftproof version --format json > /etc/mvt/build-info.json
+# (logging to a scratch folder: a root-owned /var/log/mvt/liftproof.log would lock mvt out)
+LIFTPROOF_LOG_DIR=/var/tmp /opt/mvt/bin/liftproof version --format json > /etc/mvt/build-info.json
+rm -f /var/tmp/liftproof.log
 echo "${LIFTPROOF_VERSION}" > /etc/mvt/version
 
 install -m 0644 /tmp/liftproof-files/mvt-cwagent.service /etc/systemd/system/
