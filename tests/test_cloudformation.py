@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -149,8 +151,7 @@ def test_endpoints_match(template):
     gateways = {
         r["Properties"]["ServiceName"]["Fn::Sub"].rsplit(".", 1)[1]
         for r in template["Resources"].values()
-        if r["Type"] == "AWS::EC2::VPCEndpoint"
-        and r["Properties"]["VpcEndpointType"] == "Gateway"
+        if r["Type"] == "AWS::EC2::VPCEndpoint" and r["Properties"]["VpcEndpointType"] == "Gateway"
     }
     # what doctor checks is what the deployment creates
     assert set(aws.GATEWAY_SERVICES) == gateways
@@ -250,3 +251,56 @@ def test_the_deployment_guide_names_every_alarm_and_input_it_relies_on(template)
         assert re.search(rf"^## \d+\. {heading}", guide, re.M), heading
     assert (ROOT / "docs/architecture.png").stat().st_size > 0
     assert "architecture.svg" in guide
+
+
+def _render_run_document(template, **params) -> str:
+    content = template["Resources"]["RunDocument"]["Properties"]["Content"]
+    values = {k: str(v.get("default", "")) for k, v in content["parameters"].items()}
+    values.update(params)
+    script = "\n".join(content["mainSteps"][0]["inputs"]["runCommand"])
+    return re.sub(r"\{\{ (\w+) \}\}", lambda m: values[m.group(1)], script)
+
+
+@pytest.mark.skipif(shutil.which("dash") is None, reason="dash not installed")
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        (
+            {"mode": "doctor"},
+            "doctor --project /var/lib/mvt/projects/example.yaml --fail-on {failOn} --format json",
+        ),
+        (
+            {"mode": "validate", "journeys": "login checkout", "sets": "docs"},
+            "validate --project /var/lib/mvt/projects/example.yaml --fail-on {failOn} "
+            "--format json --baseline {baseline} --journeys login|checkout --sets docs",
+        ),
+        (
+            {"mode": "reconcile", "resume": "true"},
+            "reconcile --project /var/lib/mvt/projects/example.yaml --fail-on {failOn} "
+            "--format json --baseline {baseline} --resume",
+        ),
+        ({"mode": "ui-login"}, "ui-login --workdir /var/lib/mvt/projects --format json"),
+    ],
+)
+def test_run_document_runs_under_sh(template, tmp_path, params, expected):
+    """aws:runShellScript runs the commands with /bin/sh, which is dash on Ubuntu."""
+    content = template["Resources"]["RunDocument"]["Properties"]["Content"]
+    defaults = {k: str(v.get("default", "")) for k, v in content["parameters"].items()}
+    params = {"project": "example", **params}
+    stub = tmp_path / "systemd-run"
+    # print liftproof's own arguments one per line, then exit with a known status
+    stub.write_text('#!/bin/sh\nwhile [ "$1" != /opt/mvt/bin/liftproof ]; do shift; done\n'
+                    'shift\nprintf "%s\\n" "$@"\nexit 3\n')  # fmt: skip
+    stub.chmod(0o755)
+    script = _render_run_document(template, **params)
+    out = subprocess.run(
+        ["dash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+    )
+    assert out.stderr == ""
+    assert out.returncode == 3  # liftproof's exit status reaches SSM unchanged
+    want = expected.format(**defaults).split(" ")
+    want = [w.replace("|", " ") for w in want]  # "|" marks a space inside one argument
+    assert out.stdout.splitlines() == want

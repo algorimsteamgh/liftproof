@@ -912,15 +912,16 @@ Resources:
             name: liftproof
             inputs:
               timeoutSeconds: "{{ executionTimeout }}"
+              # aws:runShellScript runs this with /bin/sh (dash on Ubuntu): POSIX sh only, no bash.
               runCommand:
-                - set -o pipefail
-                - "args=(--project /var/lib/mvt/projects/{{ project }}.yaml --fail-on {{ failOn }} --format json)"
-                - "case '{{ mode }}' in reconcile|validate) args+=(--baseline {{ baseline }});; esac"
-                - "case '{{ mode }}' in replay|smoke|validate) [ -z '{{ journeys }}' ] || args+=(--journeys '{{ journeys }}');; esac"
-                - "case '{{ mode }}' in files|validate) [ -z '{{ sets }}' ] || args+=(--sets '{{ sets }}');; esac"
-                - "case '{{ mode }}' in reconcile|baseline|rebaseline) [ '{{ resume }}' != true ] || args+=(--resume);; esac"
-                - "case '{{ mode }}' in ui-login) args=(--workdir /var/lib/mvt/projects --format json);; esac"
-                - "systemd-run --unit=liftproof-{{ project }}-$(date +%s) --wait --pipe --collect --quiet -p User=mvt -E LIFTPROOF_INVOKED_BY=ssm-run-command /opt/mvt/bin/liftproof {{ mode }} \"${args[@]}\""
+                - "set -eu"
+                - "set -- --project /var/lib/mvt/projects/{{ project }}.yaml --fail-on {{ failOn }} --format json"
+                - "case '{{ mode }}' in reconcile|validate) set -- \"$@\" --baseline {{ baseline }};; esac"
+                - "case '{{ mode }}' in replay|smoke|validate) [ -z '{{ journeys }}' ] || set -- \"$@\" --journeys '{{ journeys }}';; esac"
+                - "case '{{ mode }}' in files|validate) [ -z '{{ sets }}' ] || set -- \"$@\" --sets '{{ sets }}';; esac"
+                - "case '{{ mode }}' in reconcile|baseline|rebaseline) [ '{{ resume }}' != true ] || set -- \"$@\" --resume;; esac"
+                - "case '{{ mode }}' in ui-login) set -- --workdir /var/lib/mvt/projects --format json;; esac"
+                - "exec systemd-run --unit=liftproof-{{ project }}-$(date +%s) --wait --pipe --collect --quiet -p User=mvt -E LIFTPROOF_INVOKED_BY=ssm-run-command /opt/mvt/bin/liftproof {{ mode }} \"$@\""
 
   # --- alarms ---------------------------------------------------------------------------
   SystemStatusAlarm:
