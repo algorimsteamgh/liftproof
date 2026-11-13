@@ -4,6 +4,17 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+# A fresh Ubuntu instance runs its own apt jobs in the background (cloud-init, then the
+# apt-daily timers). One held the dpkg lock while Playwright installed Chromium's
+# libraries and the build stopped (v0.1.0rc4: "Could not get lock
+# /var/lib/dpkg/lock-frontend"). Let cloud-init finish, stop the timers for the rest of
+# the build (harden.sh disables them in the image), and make every apt call in the
+# build, Playwright's included, wait for the lock instead of failing. cleanup.sh
+# removes the setting.
+cloud-init status --wait >/dev/null 2>&1 || true
+systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+echo 'DPkg::Lock::Timeout "900";' > /etc/apt/apt.conf.d/90-liftproof-build-lock
+
 apt-get update
 apt-get -y -o Dpkg::Options::=--force-confold dist-upgrade
 # libatomic1: Playwright's bundled Node driver needs it, and minimal bases leave it out

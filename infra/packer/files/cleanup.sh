@@ -30,6 +30,7 @@ apt-mark manual python3.12
 apt-get -y purge python3.12-venv python3-pip-whl python3-setuptools-whl
 apt-get -y autoremove --purge
 apt-get clean
+rm -f /etc/apt/apt.conf.d/90-liftproof-build-lock
 rm -rf /var/lib/apt/lists/*
 find /home /root -name authorized_keys -delete
 rm -f /etc/ssh/ssh_host_*
