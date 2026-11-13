@@ -328,8 +328,10 @@ def test_doctor_proves_the_deployment_bucket_and_key(s3, settings, files_project
     code, checks = _doctor(files_project, tmp_path, capsys)
     assert code == EXIT_OK
     storage = checks["S3 bucket writable and readable with KMS encryption"]
-    assert storage["result"] == "pass" and "read back" in storage["detail"] and key in (
-        storage["detail"]
+    assert (
+        storage["result"] == "pass"
+        and "read back" in storage["detail"]
+        and key in (storage["detail"])
     )
     (probe,) = [o["Key"] for o in client.list_objects_v2(Bucket=BUCKET)["Contents"]]
     assert probe.endswith("doctor/probe.txt") and f"s3://{BUCKET}/{probe}" in storage["detail"]

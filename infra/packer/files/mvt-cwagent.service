@@ -9,4 +9,4 @@ ExecStart=/usr/local/sbin/mvt-cwagent-config
 RemainAfterExit=true
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=cloud-init.target

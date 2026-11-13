@@ -215,8 +215,10 @@ def test_the_image_drops_the_venv_bootstrap_wheels():
     import liftproof
 
     src = Path(liftproof.__file__).parent
-    assert not any("ensurepip" in f.read_text(encoding="utf-8") or "-m venv" in f.read_text(
-        encoding="utf-8") for f in src.rglob("*.py"))
+    assert not any(
+        "ensurepip" in f.read_text(encoding="utf-8") or "-m venv" in f.read_text(encoding="utf-8")
+        for f in src.rglob("*.py")
+    )
 
 
 def test_build_waits_for_the_instance_own_apt_jobs():
@@ -229,3 +231,25 @@ def test_build_waits_for_the_instance_own_apt_jobs():
     assert provision.index(lock) < provision.index("apt-get update")
     assert provision.index("cloud-init status --wait") < provision.index("apt-get update")
     assert f"rm -f {lock}" in cleanup
+
+
+def test_image_ships_no_root_owned_log_file():
+    """A root-owned /var/log/mvt/liftproof.log locked every run as mvt out of its log."""
+    provision, cleanup = _text("provision.sh"), _text("cleanup.sh")
+    runs = re.findall(r"^(?:\w+=\S+ )*/opt/mvt/bin/liftproof .*$", provision, re.M)
+    assert runs
+    assert all(r.startswith("LIFTPROOF_LOG_DIR=/var/tmp ") for r in runs), runs
+    assert "rm -f /var/log/mvt/*.log" in cleanup
+
+
+def test_services_start_after_cloud_init_without_an_ordering_cycle():
+    """Ubuntu orders cloud-final after multi-user.target. A unit that is After=cloud-final
+    and WantedBy=multi-user.target makes a cycle, and systemd drops its start job at boot:
+    on the rc5 image the UI, scheduler, restore and log shipping never started."""
+    units = sorted((Path(__file__).parents[1] / "infra/packer/files").glob("*.service"))
+    assert units
+    for unit in units:
+        text = unit.read_text()
+        if re.search(r"^After=.*\bcloud-final\.service", text, re.M):
+            assert "WantedBy=multi-user.target" not in text, unit.name
+            assert "WantedBy=cloud-init.target" in text, unit.name

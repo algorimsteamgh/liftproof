@@ -39,10 +39,20 @@ def test_secret(monkeypatch):
 
 
 def _project(tmp_path, src, tgt, **database):
-    conn = {"engine": "postgresql", "host": PG["host"], "port": PG["port"], "user": PG["user"],
-            "sslmode": "disable", "secret_arn": TEST_SECRET_ARN}
-    doc = {"project": "acme", "source": dict(conn, database=src),
-           "target": dict(conn, database=tgt), "database": {"rows_per_bucket": 500, **database}}
+    conn = {
+        "engine": "postgresql",
+        "host": PG["host"],
+        "port": PG["port"],
+        "user": PG["user"],
+        "sslmode": "disable",
+        "secret_arn": TEST_SECRET_ARN,
+    }
+    doc = {
+        "project": "acme",
+        "source": dict(conn, database=src),
+        "target": dict(conn, database=tgt),
+        "database": {"rows_per_bucket": 500, **database},
+    }
     path = tmp_path / "acme.yaml"
     path.write_text(yaml.safe_dump(doc))
     return path
@@ -80,8 +90,7 @@ def test_differences_exit_ten_and_json_carries_every_html_finding(tmp_path, dbs,
     s, t, tc = dbs
     tc.execute("DELETE FROM orders WHERE id <= 10")
     p = _project(tmp_path, s, t)
-    assert run(tmp_path, "reconcile", "--project", str(p), "--run-id", "r2") == \
-        EXIT_DIFFERENCES
+    assert run(tmp_path, "reconcile", "--project", str(p), "--run-id", "r2") == EXIT_DIFFERENCES
     out = json.loads(capsys.readouterr().out)
     assert out["verdict"] == "failed"
     run_dir = tmp_path / "work" / "acme" / "runs" / "r2"
@@ -102,8 +111,10 @@ def test_baseline_then_reconcile_against_it(tmp_path, dbs, capsys):
     s, t, _ = dbs
     p = _project(tmp_path, s, t)
     assert run(tmp_path, "baseline", "--project", str(p), "--baseline-id", "b1") == EXIT_OK
-    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest",
-               "--no-source") == EXIT_OK
+    assert (
+        run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest", "--no-source")
+        == EXIT_OK
+    )
 
 
 def test_unreachable_database_is_a_configuration_error(tmp_path):
@@ -129,8 +140,7 @@ def test_credentials_in_environment_are_refused(tmp_path, monkeypatch):
     assert run(tmp_path, "reconcile", "--project", str(p)) == EXIT_CONFIG
 
 
-def test_unreadable_instance_settings_are_a_configuration_error(tmp_path, dbs, capsys,
-                                                                monkeypatch):
+def test_unreadable_instance_settings_are_a_configuration_error(tmp_path, dbs, capsys, monkeypatch):
     """Running on without them would quietly drop the deployment's bucket, key and lock."""
 
     class Unreadable:
@@ -263,13 +273,16 @@ def test_the_report_records_what_limited_each_database_it_read(tmp_path, dbs, ca
 def test_latest_and_latest_target_are_separate(tmp_path, dbs, capsys):
     s, t, _ = dbs
     p = _project(tmp_path, s, t)
-    assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target") == \
-        EXIT_CONFIG
+    assert (
+        run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest-target")
+        == EXIT_CONFIG
+    )
     assert "liftproof rebaseline" in capsys.readouterr().err
     assert run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "t1") == EXIT_OK
     assert run(tmp_path, "reconcile", "--project", str(p), "--baseline", "latest") == EXIT_CONFIG
-    assert run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "latest") == \
-        EXIT_CONFIG
+    assert (
+        run(tmp_path, "rebaseline", "--project", str(p), "--baseline-id", "latest") == EXIT_CONFIG
+    )
     # a replacement instance (empty work directory) finds the marker through the store
     store_root = tmp_path / "store"
     shutil.copytree(tmp_path / "work/acme", store_root)
@@ -299,8 +312,15 @@ def test_support_bundle_carries_the_run_without_values(tmp_path, dbs, capsys, mo
     assert out["run_id"] == "r1"  # the latest run by default
     with zipfile.ZipFile(out["bundle"]) as z:
         names = set(z.namelist())
-        assert {"MANIFEST.json", "environment.json", "project.json", "run/report.json",
-                "run/findings.jsonl", "run/db-results.json", "run.log"} <= names
+        assert {
+            "MANIFEST.json",
+            "environment.json",
+            "project.json",
+            "run/report.json",
+            "run/findings.jsonl",
+            "run/db-results.json",
+            "run.log",
+        } <= names
         assert not [n for n in names if n.endswith(".html")]
         everything = "".join(z.read(n).decode() for n in names)
     assert "SECRET-VALUE-42" not in everything

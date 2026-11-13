@@ -32,7 +32,7 @@ def _doc(i: int, pretty: bool) -> str | None:
     if not pretty:
         return (
             f'<o:order xmlns:o="urn:lp:order" id="{i}" status="{status}"><o:customer>café '
-            f"{i}</o:customer><o:lines>{lines}</o:lines><o:note xml:space=\"preserve\"> a "
+            f'{i}</o:customer><o:lines>{lines}</o:lines><o:note xml:space="preserve"> a '
             "&lt; b &amp; c </o:note></o:order>"
         )
     return (

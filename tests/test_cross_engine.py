@@ -157,7 +157,6 @@ def test_postgres_infinity_is_a_changed_value(tmp_path, pg_and_mysql, direction)
     }
 
 
-
 def test_foreign_keys_and_their_indexes_across_engines(
     tmp_path, make_db, adapter_for, make_mysql_db, mysql_adapter_for
 ):

@@ -262,7 +262,8 @@ def test_a_journey_shows_from_this_instance_when_the_bucket_is_out_of_reach(site
     client, ui, _ = site
     client.login()
     Journey("checkout", "http://src.invalid", steps=[Step(1, "goto", url="/login")]).save(
-        ui.workdir / "acme" / "journeys" / "checkout.json")
+        ui.workdir / "acme" / "journeys" / "checkout.json"
+    )
 
     class Offline(LocalStore):  # no credentials, or the endpoint unreachable
         def modified(self, prefix):
@@ -282,7 +283,8 @@ def test_a_journey_shows_where_each_browser_navigation_went(site):
              Step(3, "reload", page_url="/orders"),
              Step(4, "goto", url="https://docs.example.com/help", page_url="/help")]  # fmt: skip
     Journey("browsing", "http://src.invalid", steps=steps, format="2.0").save(
-        ui.workdir / "acme" / "journeys" / "browsing.json")
+        ui.workdir / "acme" / "journeys" / "browsing.json"
+    )
     r, page = client.request("GET", "/p/acme/journeys/browsing")
     assert r.status == 200
     assert "<td>2 entries, to /orders</td>" in page and "<td>to /orders</td>" in page

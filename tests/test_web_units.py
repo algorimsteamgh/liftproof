@@ -56,8 +56,13 @@ def cmp(correlations=(), values=None, **opts):
 
 def test_numbers_compare_as_numbers():
     c, out = cmp()
-    c._json("GET /a", {"total": 10.50, "n": 3, "s": "10.50"}, {"total": 10.5, "n": 3.0,
-                                                                 "s": "10.5"}, "$", 1)
+    c._json(
+        "GET /a",
+        {"total": 10.50, "n": 3, "s": "10.50"},
+        {"total": 10.5, "n": 3.0, "s": "10.5"},
+        "$",
+        1,
+    )
     assert out == []
     c._json("GET /a", {"total": 10.5}, {"total": "10.5"}, "$", 1)  # a type change is real
     assert [f.column for f in out] == ["$.total"]
@@ -67,7 +72,9 @@ def test_shape_reports_added_and_missing_fields():
     c, out = cmp()
     c._shape("GET /a", shape({"a": 1, "b": "x"}), shape({"a": 2, "c": True}), "$", 1)
     assert sorted(f.summary for f in out) == [
-        "field $.b missing on the target", "field $.c added on the target"]
+        "field $.b missing on the target",
+        "field $.c added on the target",
+    ]
     assert all(f.kind == Kind.DIFFERENCE for f in out)
 
 
@@ -85,20 +92,29 @@ def test_shape_compares_array_elements():
     recorded = {"orders": [{"id": 1, "total": 10.5}, {"id": 2, "total": 3}]}
     c._shape("GET /api/orders", shape(recorded), shape({"orders": [{"id": 1}, {"id": 2}]}), "$", 1)
     assert [(f.kind, f.severity, f.column, f.summary) for f in out] == [
-        (Kind.DIFFERENCE, MEDIUM, "$.orders[*].total",
-         "field $.orders[*].total missing on the target")]
+        (
+            Kind.DIFFERENCE,
+            MEDIUM,
+            "$.orders[*].total",
+            "field $.orders[*].total missing on the target",
+        )
+    ]
     assert shapes({"orders": [{"id": 1}]}, {"orders": [{"id": 1, "tax": 0.5}]}) == [
-        (MEDIUM, "field $.orders[*].tax added on the target")]
+        (MEDIUM, "field $.orders[*].tax added on the target")
+    ]
     assert shapes([{"id": 1, "total": 1}], [{"id": 1}]) == [
-        (MEDIUM, "field $[*].total missing on the target")]
+        (MEDIUM, "field $[*].total missing on the target")
+    ]
     nested = {"o": [{"lines": [{"sku": "a", "qty": 1}]}, {"lines": []}]}
     assert shapes(nested, {"o": [{"lines": [{"sku": "b"}]}]}) == [
-        (MEDIUM, "field $.o[*].lines[*].qty missing on the target")]
+        (MEDIUM, "field $.o[*].lines[*].qty missing on the target")
+    ]
 
 
 def test_shape_field_missing_from_some_elements_is_low():
     assert shapes({"orders": [{"total": 1}, {"total": 2}]}, {"orders": [{"total": 1}, {}]}) == [
-        (LOW, "field $.orders[*].total missing from some elements on the target")]
+        (LOW, "field $.orders[*].total missing from some elements on the target")
+    ]
     # optional on the source: which elements have it is data
     assert shapes({"orders": [{"total": 1}, {}]}, {"orders": [{"total": 1}, {}]}) == []
     assert shapes({"orders": [{"total": 1}, {}]}, {"orders": [{"total": 1}]}) == []
@@ -106,23 +122,28 @@ def test_shape_field_missing_from_some_elements_is_low():
 
 def test_shape_of_drifted_data_is_low():
     # an optional field gone, an optional field added, a value where every one was null
-    assert shapes({"orders": [{"id": 1, "shipped_at": "x"}, {"id": 2}]},
-                  {"orders": [{"id": 3}]}) == [
-        (LOW, "field $.orders[*].shipped_at missing on the target")]
+    assert shapes(
+        {"orders": [{"id": 1, "shipped_at": "x"}, {"id": 2}]}, {"orders": [{"id": 3}]}
+    ) == [(LOW, "field $.orders[*].shipped_at missing on the target")]
     assert shapes({"orders": [{"id": 1}]}, {"orders": [{"id": 3, "discount": 1}, {"id": 4}]}) == [
-        (LOW, "field $.orders[*].discount added on the target")]
+        (LOW, "field $.orders[*].discount added on the target")
+    ]
     assert shapes({"orders": [{"shipped_at": None}]}, {"orders": [{"shipped_at": "x"}]}) == [
-        (LOW, "type of $.orders[*].shipped_at differs")]
+        (LOW, "type of $.orders[*].shipped_at differs")
+    ]
     assert shapes({"o": [{"t": 1}, {"t": "x"}]}, {"o": [{"t": 1}]}) == [
-        (LOW, "type of $.o[*].t differs")]
+        (LOW, "type of $.o[*].t differs")
+    ]
 
 
 def test_shape_array_element_types():
     c, out = cmp()
-    c._shape("GET /a", shape({"orders": [{"total": 1}]}), shape({"orders": [{"total": "1"}]}),
-             "$", 1)
+    c._shape(
+        "GET /a", shape({"orders": [{"total": 1}]}), shape({"orders": [{"total": "1"}]}), "$", 1
+    )
     assert [(f.severity, f.summary, f.expected, f.actual) for f in out] == [
-        (MEDIUM, "type of $.orders[*].total differs", "number", "string")]
+        (MEDIUM, "type of $.orders[*].total differs", "number", "string")
+    ]
     assert shapes({"o": [{"a": 1}]}, {"o": ["a"]}) == [(MEDIUM, "type of $.o[*] differs")]
     # null goes with any type
     assert shapes({"o": [{"t": 1}, {"t": None}]}, {"o": [{"t": 1}]}) == []
@@ -135,8 +156,10 @@ def test_shape_of_single_values_is_unchanged():
     assert shapes({"t": None}, {"t": 1}) == [(MEDIUM, "type of $.t differs")]
     assert shapes({"t": 1}, {"t": None}) == [(MEDIUM, "type of $.t differs")]
     assert shapes({"a": {"b": 1}, "c": [1]}, {"a": {"d": 1}, "c": "x"}) == [
-        (MEDIUM, "field $.a.b missing on the target"), (MEDIUM, "field $.a.d added on the target"),
-        (MEDIUM, "type of $.c differs")]
+        (MEDIUM, "field $.a.b missing on the target"),
+        (MEDIUM, "field $.a.d added on the target"),
+        (MEDIUM, "type of $.c differs"),
+    ]
 
 
 def test_ignore_json_paths_every_element():
@@ -161,22 +184,26 @@ def test_unkept_body_array_field_reported_through_api():
     got = Captured(Exchange("GET", "/api/orders", 200), 0.0, None, {"orders": [{"id": 1}]}, None)
     c.api([rec], [got], 3)
     assert [(f.object, f.column, f.locator, f.severity) for f in out] == [
-        ("GET /api/orders", "$.orders[*].total", "step 3", MEDIUM)]
+        ("GET /api/orders", "$.orders[*].total", "step 3", MEDIUM)
+    ]
 
 
 def test_a_low_shape_difference_passes_the_run_but_not_the_journey(monkeypatch):
     rec = Exchange("GET", "/api/orders", 200, body_shape=shape({"orders": [{"total": 1}]}))
     step = Step(1, "goto", url="/orders", region="- heading", exchanges=[rec])
     j = Journey("j1", "http://source.invalid", story="S-1", steps=[step])
-    got = Captured(Exchange("GET", "/api/orders", 200), 0.0, None, {"orders": [{"total": 1}, {}]},
-                   None)
+    got = Captured(
+        Exchange("GET", "/api/orders", 200), 0.0, None, {"orders": [{"total": 1}, {}]}, None
+    )
     ran = StepRun(1, "goto", status="ok", region="- heading", exchanges=[got], attempts=1)
-    fakereplay.no_browser(monkeypatch, lambda j: JourneyRun(
-        j.journey_id, status="completed", steps=[ran], attempts=1))
+    fakereplay.no_browser(
+        monkeypatch, lambda j: JourneyRun(j.journey_id, status="completed", steps=[ran], attempts=1)
+    )
     findings = []
     result = _replay([j], findings.append)
     assert [(f.severity, f.summary) for f in findings] == [
-        (LOW, "field $.orders[*].total missing from some elements on the target")]
+        (LOW, "field $.orders[*].total missing from some elements on the target")
+    ]
     assert [r.status for r in result.journeys] == ["different"]
     assert verdict(findings) == PASSED_WITH_DIFFERENCES
 
@@ -185,18 +212,27 @@ def test_correlated_values_are_masked_everywhere():
     corr = Correlation("orders.id", "json_path", "POST /api/orders", "$.id", "12345")
     c, out = cmp([corr], {"12345": "99999"})
     c._json("POST /api/orders", {"id": 12345}, {"id": 99999}, "$", 1)
-    c._json("GET /api/orders/{orders.id}", {"id": 12345, "ref": "ord-12345"},
-            {"id": 99999, "ref": "ord-99999"}, "$", 2)
-    c.ui("- heading \"Order 12345\"", "- heading \"Order 99999\"", 3)
+    c._json(
+        "GET /api/orders/{orders.id}",
+        {"id": 12345, "ref": "ord-12345"},
+        {"id": 99999, "ref": "ord-99999"},
+        "$",
+        2,
+    )
+    c.ui('- heading "Order 12345"', '- heading "Order 99999"', 3)
     assert out == []
-    assert normalise_path("/orders/99999/items", {"99999": "orders.id"}) == \
-        "/orders/{orders.id}/items"
+    assert (
+        normalise_path("/orders/99999/items", {"99999": "orders.id"}) == "/orders/{orders.id}/items"
+    )
 
 
 def test_default_volatile_values_and_ignore_rules():
     c, out = cmp(ignore_text=[r"Build \w+"], ignore_json_paths=["GET /a $.etag"])
-    c.ui("- text: Placed 2026-10-05T09:00:01Z Build abc", "- text: Placed 2026-10-06T10:11:12Z "
-         "Build def", 1)
+    c.ui(
+        "- text: Placed 2026-10-05T09:00:01Z Build abc",
+        "- text: Placed 2026-10-06T10:11:12Z Build def",
+        1,
+    )
     c._json("GET /a", {"etag": "1"}, {"etag": "2"}, "$", 1)
     assert out == []
 
@@ -215,19 +251,44 @@ def test_correlation_confidence_and_extractors():
     assert not correlate.confident("1") and not correlate.confident("OPEN")
     assert correlate.json_get({"a": [{"b": 7}]}, "$.a[0].b") == 7
     html = '<form><input type="hidden" name="__VIEWSTATE" value="dDwtMTA="></form>'
-    assert correlate.extract("form_field", "__VIEWSTATE", json=None, body=html.encode(),
-                             headers={}) == "dDwtMTA="
-    assert correlate.extract("header_segment", "location:2", json=None, body=None,
-                             headers={"location": "/orders/4411?x=1"}) == "4411"
+    assert (
+        correlate.extract("form_field", "__VIEWSTATE", json=None, body=html.encode(), headers={})
+        == "dDwtMTA="
+    )
+    assert (
+        correlate.extract(
+            "header_segment",
+            "location:2",
+            json=None,
+            body=None,
+            headers={"location": "/orders/4411?x=1"},
+        )
+        == "4411"
+    )
 
 
 def test_detect_skips_coincidences():
     traffic = [
-        [{"endpoint": "POST /api/orders", "json": {"id": 48213, "qty": 1, "status": "OPEN"},
-          "body": None, "headers": {}, "content_type": "application/json",
-          "request_text": "/api/orders\n{\"qty\": 1}"}],
-        [{"endpoint": "GET /api/orders/{id}", "json": None, "body": None, "headers": {},
-          "content_type": "", "request_text": "/api/orders/48213?status=OPEN\n"}],
+        [
+            {
+                "endpoint": "POST /api/orders",
+                "json": {"id": 48213, "qty": 1, "status": "OPEN"},
+                "body": None,
+                "headers": {},
+                "content_type": "application/json",
+                "request_text": '/api/orders\n{"qty": 1}',
+            }
+        ],
+        [
+            {
+                "endpoint": "GET /api/orders/{id}",
+                "json": None,
+                "body": None,
+                "headers": {},
+                "content_type": "",
+                "request_text": "/api/orders/48213?status=OPEN\n",
+            }
+        ],
     ]
     found = correlate.detect(traffic, [[""], [""]])
     assert [(c.recorded_value, c.confirmed) for c in found] == [("48213", True), ("OPEN", False)]
@@ -265,6 +326,7 @@ def test_a_worker_holds_one_journey_at_a_time(monkeypatch, workers):
             j2_written.set()
 
     fakereplay.no_browser(monkeypatch, replay_one)
+
     def journey_done(make):
         saved.append((sum(f.kind == Kind.DIFFERENCE for f in findings), make()))
 
@@ -277,7 +339,8 @@ def test_a_worker_holds_one_journey_at_a_time(monkeypatch, workers):
                                  "target_ms": 60.0, "change_pct": 50.0}]  # fmt: skip
     # each journey's findings are written when it finishes, not at the end of the run
     assert [(n, sum(r.status != "not_run" for r in s.journeys)) for n, s in saved] == [
-        (k, k) for k in range(1, 7)]
+        (k, k) for k in range(1, 7)
+    ]
     assert not any(s.complete for _, s in saved)
     written = [f.journey for f in findings if f.kind == Kind.DIFFERENCE]
     assert sorted(written) == sorted(j.journey_id for j in journeys)
@@ -300,11 +363,14 @@ def test_a_failure_keeps_the_journeys_that_finished(monkeypatch):
     partial = exc.value.partial_result
     assert not partial.complete
     assert [(r.journey, r.status) for r in partial.journeys] == [
-        ("j1", "different"), ("j2", "different"), ("j3", "not_run"), ("j4", "not_run")]
+        ("j1", "different"),
+        ("j2", "different"),
+        ("j3", "not_run"),
+        ("j4", "not_run"),
+    ]
     assert [r.reason for r in partial.journeys[2:]] == [REASON_STOPPED] * 2
     assert partial.journeys[3].steps == 1 and partial.journeys[3].recorded_ms == 40.0
-    assert {f.object for f in findings if f.kind == Kind.DIFFERENCE} == {
-        "j1 step 1", "j2 step 1"}
+    assert {f.object for f in findings if f.kind == Kind.DIFFERENCE} == {"j1 step 1", "j2 step 1"}
 
 
 def test_other_workers_finish_the_queue_when_one_fails(monkeypatch):
@@ -322,7 +388,8 @@ def test_other_workers_finish_the_queue_when_one_fails(monkeypatch):
         _replay(journeys, lambda f: None, workers=2)
     assert sorted(replayed) == ["j2", "j3", "j4", "j5", "j6"]
     assert [r.status for r in exc.value.partial_result.journeys] == (
-        ["not_run"] + ["different"] * 5)
+        ["not_run"] + ["different"] * 5
+    )
 
 
 def test_a_comparison_that_fails_is_not_a_journey_never_reached(monkeypatch):
@@ -362,7 +429,8 @@ def test_journeys_finishing_after_an_interrupt_are_dropped(monkeypatch):
     handed = []
     with pytest.raises(KeyboardInterrupt):
         Replayer("http://target.invalid", secret_values=lambda j: {}).run(
-            journeys, lambda i, j, run: handed.append(i), workers=2)
+            journeys, lambda i, j, run: handed.append(i), workers=2
+        )
     release.set()
     for t in [t for t in threading.enumerate() if isinstance(t, replay._Worker)]:
         join(t, 5)
@@ -374,8 +442,10 @@ def test_a_step_that_flakes_repeatedly_is_reported_with_its_journey(monkeypatch)
     flaky = [{"step": 1, "attempt": n, "error": "Timeout 15000ms exceeded", "unit": "step"}
              for n in (1, 2)]  # fmt: skip
     journeys = [fakereplay.journey("j1"), fakereplay.journey("j2")]
-    fakereplay.no_browser(monkeypatch, lambda j: fakereplay.replayed(
-        j, flakes=flaky if j.journey_id == "j1" else None))
+    fakereplay.no_browser(
+        monkeypatch,
+        lambda j: fakereplay.replayed(j, flakes=flaky if j.journey_id == "j1" else None),
+    )
     findings = []
     result = _replay(journeys, findings.append)
     [repeated] = [f for f in findings if f.kind == Kind.FLAKE and f.severity == Severity.MEDIUM]
@@ -401,9 +471,7 @@ def test_web_results_written_before_this_read_as_complete():
     ("crash", [("PUT /api/cart", 409)], False),
     ("browser_crash", [("POST /api/orders", 201)], True),
 ])  # fmt: skip
-def test_an_attempt_that_sent_a_write_repeats_only_after_a_transport_failure(
-    kind, writes, repeat
-):
+def test_an_attempt_that_sent_a_write_repeats_only_after_a_transport_failure(kind, writes, repeat):
     assert replay.may_repeat(kind, [Write(e, s) for e, s in writes]) is repeat
 
 
@@ -429,8 +497,15 @@ class _Page:
 def _request(method, path, resource_type="fetch", status=None):
     """A request the page sends; with a status, the target answers it."""
     resp = SimpleNamespace(status=status, headers={}, body=lambda: b"") if status else None
-    return SimpleNamespace(method=method, url=f"http://t{path}", resource_type=resource_type,
-                           response=lambda: resp, headers={}, timing={}, post_data=None)
+    return SimpleNamespace(
+        method=method,
+        url=f"http://t{path}",
+        resource_type=resource_type,
+        response=lambda: resp,
+        headers={},
+        timing={},
+        post_data=None,
+    )
 
 
 def test_a_write_counts_from_when_it_is_sent():
@@ -508,11 +583,17 @@ def test_a_step_that_sent_a_write_repeats_only_as_a_journey_would(
     assert Replayer("http://t", secret_values=lambda j: {})._steps(context, j, run, {}) is False
     if repeated:
         assert (run.status, tries, len(run.flakes), run.not_repeated) == (
-            "completed", [1, 1, 2], 1, None)
+            "completed",
+            [1, 1, 2],
+            1,
+            None,
+        )
     else:
         assert (run.status, tries, run.flakes) == ("failed", [1], [])
-        assert run.not_repeated == (f"the step sent POST /api/cart ({status}); running it "
-                                    "again would submit it a second time")
+        assert run.not_repeated == (
+            f"the step sent POST /api/cart ({status}); running it "
+            "again would submit it a second time"
+        )
 
 
 # ------------------------------------------------- correlations left unresolved (spec 6)
@@ -567,18 +648,31 @@ def test_an_unresolved_correlation_names_the_failure_it_caused():
     findings = _compare(j, run)
     [status] = [f for f in findings if f.summary == "status code differs"]
     assert (status.object, status.detail["unresolved_correlations"]) == (
-        "GET /api/orders/{orders.id}", ["orders.id"])
+        "GET /api/orders/{orders.id}",
+        ["orders.id"],
+    )
     [u] = _unresolved(findings)
     assert (u.kind, u.severity, u.column, u.locator, u.journey) == (
-        Kind.NOT_CHECKED, Severity.MEDIUM, "orders.id", "step 1", "checkout")
+        Kind.NOT_CHECKED,
+        Severity.MEDIUM,
+        "orders.id",
+        "step 1",
+        "checkout",
+    )
     assert u.summary == (
         "correlation orders.id not resolved: json_path $.id found no value in the target's "
         "POST /api/orders response (status 201); step 2 sent the recorded value; it explains "
-        "1 finding in step 2")
+        "1 finding in step 2"
+    )
     assert {k: u.detail[k] for k in ("cause", "source_step", "source_status", "sent_in")} == {
-        "cause": "not_in_response", "source_step": 1, "source_status": 201, "sent_in": [2]}
+        "cause": "not_in_response",
+        "source_step": 1,
+        "source_status": 201,
+        "sent_in": [2],
+    }
     assert u.detail["caused"] == [
-        {"step": 2, "object": "GET /api/orders/{orders.id}", "summary": "status code differs"}]
+        {"step": 2, "object": "GET /api/orders/{orders.id}", "summary": "status code differs"}
+    ]
     # the value stays out of the finding unless values are shown, and out of a bundle
     assert u.expected.startswith("sha256:") and RID not in json.dumps(u.to_dict())
     bundled = support.redact_finding(u.to_dict())
@@ -683,7 +777,11 @@ def test_a_candidate_never_confirmed_only_when_the_target_changed_it_and_it_was_
     assert replayed(5173, 5173, 200) == []  # the page carried the target's own
     [u] = replayed(5173, 4821, 404)
     assert (u.kind, u.severity, u.detail["cause"], u.actual) == (
-        Kind.NOT_CHECKED, Severity.MEDIUM, "unconfirmed", "5173")
+        Kind.NOT_CHECKED,
+        Severity.MEDIUM,
+        "unconfirmed",
+        "5173",
+    )
     assert "carried a different value" in u.summary and "confirm it" in u.summary
 
 
@@ -718,9 +816,17 @@ def test_every_answer_to_the_source_request_is_read(rid, rule, line_id, cause, f
     assert status.detail["unresolved_correlations"] == ["cart.line_id"]
     [u] = _unresolved(findings)
     assert (u.kind, u.severity, u.locator, u.actual) == (
-        Kind.NOT_CHECKED, Severity.MEDIUM, "step 2", found)
+        Kind.NOT_CHECKED,
+        Severity.MEDIUM,
+        "step 2",
+        found,
+    )
     assert {k: u.detail[k] for k in ("cause", "source_step", "source_status", "sent_in")} == {
-        "cause": cause, "source_step": 2, "source_status": 200, "sent_in": [3]}
+        "cause": cause,
+        "source_step": 2,
+        "source_status": 200,
+        "sent_in": [3],
+    }
 
 
 def _total_run(checkout, beacon, ts):
@@ -764,7 +870,10 @@ def test_a_value_sent_only_by_coincidence_is_not_named(tmp_path):
                       "GET /api/cart": None}  # fmt: skip
     [u] = _unresolved(findings)
     assert (u.detail["cause"], u.detail["sent_in"], u.severity) == (
-        "unconfirmed", [2], Severity.MEDIUM)
+        "unconfirmed",
+        [2],
+        Severity.MEDIUM,
+    )
     assert u.summary.count("it explains 1 finding in step 2") == 1
 
 
@@ -877,8 +986,12 @@ def _page_journey(**step):
 
 
 def _pages(journey, region, assets_dir=None, exchanges=()):
-    run = JourneyRun("j", status="completed", attempts=1,
-                     steps=[StepRun(1, "goto", "ok", region=region, exchanges=list(exchanges))])
+    run = JourneyRun(
+        "j",
+        status="completed",
+        attempts=1,
+        steps=[StepRun(1, "goto", "ok", region=region, exchanges=list(exchanges))],
+    )
     findings = []
     cmp = compare_journey(journey, run, WebOptions(), findings.append, assets_dir)
     return findings, cmp.ui_compared
@@ -895,7 +1008,11 @@ def test_a_page_not_kept_is_compared_by_structure():
     ]:
         [f], counts = _pages(j, page)
         assert (f.kind, f.severity, f.object, f.summary) == (
-            Kind.DIFFERENCE, MEDIUM, "j step 1", "page structure differs after the step")
+            Kind.DIFFERENCE,
+            MEDIUM,
+            "j step 1",
+            "page structure differs after the step",
+        )
         assert (f.expected, f.actual, f.detail["compared"]) == (expected, actual, "shape")
         assert counts == {"text": 0, "shape": 1, "expired": 0}
 
@@ -913,7 +1030,9 @@ def test_a_kept_snapshot_is_compared_as_text_until_it_expires(tmp_path):
     relabelled = ORDER_PAGE.replace('"Cancel"', '"Cancel order"')
     findings, counts = _pages(j, relabelled, tmp_path, [answer])
     assert sorted((f.summary, f.detail.get("compared")) for f in findings) == [
-        ("page content differs after the step", "text"), ("value of $.status differs", None)]
+        ("page content differs after the step", "text"),
+        ("value of $.status differs", None),
+    ]
     assert counts == {"text": 1, "shape": 0, "expired": 0}
     # the bucket expired both, and fetching the journey's assets dropped the copies here
     for f in tmp_path.iterdir():
@@ -921,11 +1040,16 @@ def test_a_kept_snapshot_is_compared_as_text_until_it_expires(tmp_path):
     [notice], counts = _pages(j, relabelled, tmp_path, [answer])  # the same structure, shape
     assert counts == {"text": 0, "shape": 0, "expired": 1}
     assert (notice.kind, notice.severity, notice.object, notice.detail) == (
-        Kind.NOTICE, Severity.INFO, "j", {"snapshots_expired": 1, "bodies_expired": 1})
+        Kind.NOTICE,
+        Severity.INFO,
+        "j",
+        {"snapshots_expired": 1, "bodies_expired": 1},
+    )
     assert notice.summary.endswith("compared 1 page by structure and 1 response by shape")
     findings, _ = _pages(j, relabelled.replace(" [checked]", ""), tmp_path, [answer])
     assert [f.summary for f in findings if f.kind == Kind.DIFFERENCE] == [
-        "page structure differs after the step"]
+        "page structure differs after the step"
+    ]
 
 
 def test_a_journey_recorded_with_its_snapshots_inline_compares_their_text():
@@ -950,8 +1074,19 @@ def test_a_structure_made_by_another_version_is_not_compared():
 
 
 def test_the_report_says_how_pages_were_compared():
-    compared = webrun.JourneyResult("checkout", "ORD-14", "passed", 6, 6, 1, 0, 0, 1.0, 1.0,
-                                    ui_compared={"text": 1, "shape": 4, "expired": 1})
+    compared = webrun.JourneyResult(
+        "checkout",
+        "ORD-14",
+        "passed",
+        6,
+        6,
+        1,
+        0,
+        0,
+        1.0,
+        1.0,
+        ui_compared={"text": 1, "shape": 4, "expired": 1},
+    )
     before = asdict(webrun.JourneyResult("login", None, "passed", 2, 2, 1, 0, 0, 1.0, 1.0))
     del before["ui_compared"]  # a run reported before pages were counted
     web = WebResult.from_dict({"journeys": [asdict(compared), before]})
@@ -1025,7 +1160,9 @@ def test_an_ignore_region_applies_to_the_journeys_recorded_with_it():
     own = IgnoreRegion("our own reason", VOLATILE.selector)
     assert in_force([own]) == [own]  # the project's reason for the built-in selector
     assert applied_regions(recorded, in_force([reworded, chat, banner])) == (
-        [VOLATILE, reworded, banner], [chat])
+        [VOLATILE, reworded, banner],
+        [chat],
+    )
     # dropped from the project, it still applies as recorded: the target hides what the
     # source did
     assert applied_regions(recorded, in_force([])) == ([VOLATILE, GREETING], [])
@@ -1034,10 +1171,18 @@ def test_an_ignore_region_applies_to_the_journeys_recorded_with_it():
 
 
 def _hiding(source: dict, target: dict, region: str = ORDER_PAGE):
-    j = Journey("j", "http://source.invalid", ignore_regions=[VOLATILE, GREETING],
-                steps=[Step(1, "goto", url="/orders/7", **{"region": ORDER_PAGE, **source})])
-    run = JourneyRun("j", status="completed", attempts=1,
-                     steps=[StepRun(1, "goto", "ok", region=region, **target)])
+    j = Journey(
+        "j",
+        "http://source.invalid",
+        ignore_regions=[VOLATILE, GREETING],
+        steps=[Step(1, "goto", url="/orders/7", **{"region": ORDER_PAGE, **source})],
+    )
+    run = JourneyRun(
+        "j",
+        status="completed",
+        attempts=1,
+        steps=[StepRun(1, "goto", "ok", region=region, **target)],
+    )
     findings = []
     cmp = compare_journey(j, run, WebOptions(), findings.append, None)
     return findings, cmp
@@ -1050,9 +1195,15 @@ def test_a_page_inside_an_ignore_region_is_not_checked():
                            ({}, {"region_ignored": ".greeting"})]:  # fmt: skip
         [f], cmp = _hiding(source, target, "" if target else ORDER_PAGE)
         assert (f.kind, f.severity, f.object, f.detail) == (
-            Kind.NOT_CHECKED, LOW, "j", {"steps": [1], "ignore_regions": [".greeting"]})
-        assert f.summary == "page after step 1 not compared: the whole page is inside " \
-                            "ignore region .greeting"
+            Kind.NOT_CHECKED,
+            LOW,
+            "j",
+            {"steps": [1], "ignore_regions": [".greeting"]},
+        )
+        assert (
+            f.summary == "page after step 1 not compared: the whole page is inside "
+            "ignore region .greeting"
+        )
         assert cmp.ui_compared == {"text": 0, "shape": 0, "expired": 0}
         assert cmp.hidden_by[GREETING]["source" if source else "target"] == [1]
         assert verdict([f]) == PASSED_WITH_DIFFERENCES
@@ -1094,24 +1245,36 @@ def test_each_ignore_region_is_listed_with_its_reason(monkeypatch):
 
     fakereplay.no_browser(monkeypatch, replay_one)
     findings = []
-    result = _replay(journeys, findings.append,
-                     options=WebOptions(ignore_regions=[GREETING, banner, chat, contents]))
+    result = _replay(
+        journeys,
+        findings.append,
+        options=WebOptions(ignore_regions=[GREETING, banner, chat, contents]),
+    )
     notices = {f.column: f for f in findings if f.object == "page region"}
     assert sorted(notices) == [
-        ".banner (matched nothing)", ".chat (not applied)", ".greeting", "target .promo"]
+        ".banner (matched nothing)",
+        ".chat (not applied)",
+        ".greeting",
+        "target .promo",
+    ]
     greeting = notices[".greeting"]
     assert (greeting.kind, greeting.severity, greeting.summary) == (
-        Kind.NOTICE, Severity.INFO,
-        "ignore region .greeting: what it matched was not compared: personalised")
-    assert {k: greeting.detail[k] for k in ("journeys", "steps_on_source", "steps_on_target")} \
-        == {"journeys": ["j1"], "steps_on_source": 1, "steps_on_target": 1}
+        Kind.NOTICE,
+        Severity.INFO,
+        "ignore region .greeting: what it matched was not compared: personalised",
+    )
+    assert {k: greeting.detail[k] for k in ("journeys", "steps_on_source", "steps_on_target")} == {
+        "journeys": ["j1"],
+        "steps_on_source": 1,
+        "steps_on_target": 1,
+    }
     assert notices[".chat (not applied)"].detail["not_applied"] == ["j1", "j2"]
     assert notices[".chat (not applied)"].summary == (
-        "ignore region .chat not applied: the journeys were recorded without it; "
-        "record them again")
+        "ignore region .chat not applied: the journeys were recorded without it; record them again"
+    )
     assert notices["target .promo"].summary.endswith(
-        "in 1 step an element it matched kept its own text, which is compared "
-        "(display: contents)")
+        "in 1 step an element it matched kept its own text, which is compared (display: contents)"
+    )
     report = build_report(run_id="r", project="p", mode="replay", started_at="t",
                           finished_at="t", db=None, findings=findings, metadata={},
                           range_block={}, web=result)  # fmt: skip
@@ -1140,8 +1303,11 @@ def test_record_says_what_each_ignore_region_hid_on_the_source(tmp_path, monkeyp
     p = tmp_path / "p.yaml"
     regions = [{"selector": ".greeting", "reason": "personalised"},
                {"source_selector": "#legacy-ad", "reason": "ads"}]  # fmt: skip
-    p.write_text(yaml.safe_dump({"project": "t",
-                                 "web": {"source_url": "http://a", "ignore_regions": regions}}))
+    p.write_text(
+        yaml.safe_dump(
+            {"project": "t", "web": {"source_url": "http://a", "ignore_regions": regions}}
+        )
+    )
     work = ["--workdir", str(tmp_path / "work"), "--format", "json"]
     assert cli.main(["record", "--project", str(p), "--journey", "j1", *work]) == 0
     out = json.loads(capsys.readouterr().out)
@@ -1451,7 +1617,8 @@ def _navigate(step, base_url, target_url, secrets=None):
                            context=context)  # fmt: skip
     journey = Journey("j", base_url, steps=[step])
     Replayer(target_url, secret_values=lambda j: {})._navigate(
-        page, step, journey, JourneyRun("j"), secrets or {}, 1000)
+        page, step, journey, JourneyRun("j"), secrets or {}, 1000
+    )
     return opened
 
 

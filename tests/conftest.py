@@ -38,8 +38,13 @@ def type_map_alternatives(engine: str, columns: dict[str, str]) -> list[tuple[st
 
 def _admin():
     return psycopg.connect(
-        host=PG["host"], port=PG["port"], user=PG["user"], password=PG["password"],
-        dbname="postgres", autocommit=True, connect_timeout=3,
+        host=PG["host"],
+        port=PG["port"],
+        user=PG["user"],
+        password=PG["password"],
+        dbname="postgres",
+        autocommit=True,
+        connect_timeout=3,
     )
 
 
@@ -65,8 +70,12 @@ def make_db(pg_available):
             c.execute(f'CREATE DATABASE "{name}" ENCODING {encoding}{locale} TEMPLATE template0')
         created.append(name)
         conn = psycopg.connect(
-            host=PG["host"], port=PG["port"], user=PG["user"], password=PG["password"],
-            dbname=name, autocommit=True,
+            host=PG["host"],
+            port=PG["port"],
+            user=PG["user"],
+            password=PG["password"],
+            dbname=name,
+            autocommit=True,
         )
         conns.append(conn)
         return name, conn
@@ -85,8 +94,14 @@ def adapter_for():
 
     def factory(dbname: str, read_only: bool = True, **kw) -> PostgresAdapter:
         a = PostgresAdapter(
-            host=PG["host"], port=PG["port"], database=dbname, user=PG["user"],
-            password=PG["password"], sslmode="disable", read_only=read_only, **kw,
+            host=PG["host"],
+            port=PG["port"],
+            database=dbname,
+            user=PG["user"],
+            password=PG["password"],
+            sslmode="disable",
+            read_only=read_only,
+            **kw,
         )
         opened.append(a)
         return a
@@ -124,8 +139,14 @@ def _my_connect(database: str | None = None):
     import pymysql
 
     return pymysql.connect(
-        host=MY["host"], port=MY["port"], user=MY["user"], password=MY["password"],
-        database=database, charset="utf8mb4", autocommit=True, connect_timeout=3,
+        host=MY["host"],
+        port=MY["port"],
+        user=MY["user"],
+        password=MY["password"],
+        database=database,
+        charset="utf8mb4",
+        autocommit=True,
+        connect_timeout=3,
     )
 
 
@@ -176,8 +197,14 @@ def mysql_adapter_for():
 
     def factory(dbname: str, read_only: bool = True, **kw) -> MySQLAdapter:
         a = MySQLAdapter(
-            host=MY["host"], port=MY["port"], database=dbname, user=MY["user"],
-            password=MY["password"], sslmode="disable", read_only=read_only, **kw,
+            host=MY["host"],
+            port=MY["port"],
+            database=dbname,
+            user=MY["user"],
+            password=MY["password"],
+            sslmode="disable",
+            read_only=read_only,
+            **kw,
         )
         opened.append(a)
         return a
@@ -271,9 +298,14 @@ def oracle_adapter_for():
 
     def factory(read_only: bool = True, **kw) -> OracleAdapter:
         a = OracleAdapter(
-            host=ORA["host"], port=ORA["port"], database=ORA["service"],
-            user=kw.pop("user", ORA["user"]), password=kw.pop("password", ORA["password"]),
-            sslmode="disable", read_only=read_only, **kw,
+            host=ORA["host"],
+            port=ORA["port"],
+            database=ORA["service"],
+            user=kw.pop("user", ORA["user"]),
+            password=kw.pop("password", ORA["password"]),
+            sslmode="disable",
+            read_only=read_only,
+            **kw,
         )
         opened.append(a)
         return a

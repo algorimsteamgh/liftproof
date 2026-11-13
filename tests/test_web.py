@@ -111,7 +111,12 @@ def test_recording_redacts_and_correlates(recorded):
     assert journey.steps[5].region_hidden == ["[data-liftproof-volatile]"]
     assert "Served by" not in (assets / journey.steps[5].region_sha256).read_text()
     assert journey.steps[2].region_shape.splitlines() == [  # the password filled in
-        "- text: *", '- textbox "*": *', "- text: *", '- textbox "*": *', '- button "*"']
+        "- text: *",
+        '- textbox "*": *',
+        "- text: *",
+        '- textbox "*": *',
+        '- button "*"',
+    ]
     roundtrip = Journey.from_dict(json.loads(text))
     assert roundtrip.to_dict() == journey.to_dict()
 
@@ -127,7 +132,10 @@ def test_unchanged_target_replays_clean(recorded):
     # the node names differ, and are left out on both sides, with the reason given
     [volatile] = [f for f in findings if f.object == "page region"]
     assert (volatile.kind, volatile.column, volatile.detail["reason"]) == (
-        Kind.NOTICE, "[data-liftproof-volatile]", VOLATILE.reason)
+        Kind.NOTICE,
+        "[data-liftproof-volatile]",
+        VOLATILE.reason,
+    )
     assert (volatile.detail["steps_on_source"], volatile.detail["steps_on_target"]) == (2, 2)
 
 
@@ -139,8 +147,11 @@ def test_changed_target_reports_exactly_the_changes(recorded):
     assert (Comparator.API, "POST /api/orders", "value of $.status differs") in got
     assert (Comparator.API, "POST /api/orders", "field $.currency added on the target") in got
     assert (Comparator.UI, "checkout step 6", "page content differs after the step") in got
-    assert (Comparator.UI, "checkout step 6",
-            "locator degraded: the primary locator no longer matches") in got
+    assert (
+        Comparator.UI,
+        "checkout step 6",
+        "locator degraded: the primary locator no longer matches",
+    ) in got
     # ids the replay created and 10.50 against 10.5 are not differences
     assert not [f for f in findings if f.column in ("$.id", "$.total")]
     assert all(f.story == "ORD-14" for f in findings if f.kind == Kind.DIFFERENCE)
@@ -322,7 +333,10 @@ def test_back_that_leads_elsewhere_on_the_target_is_a_difference(
     assert (r.status, r.attempts, r.flakes, r.differences) == ("different", 1, 0, 1)
     [wrong] = [f for f in findings if f.kind == Kind.DIFFERENCE]
     assert (wrong.severity, wrong.summary, wrong.locator) == (
-        Severity.HIGH, "Back or Forward led to a different page on the target", "step 7")
+        Severity.HIGH,
+        "Back or Forward led to a different page on the target",
+        "step 7",
+    )
     assert (wrong.expected, wrong.actual) == (expected, actual)
 
 
@@ -374,13 +388,17 @@ def test_an_ignore_region_leaves_the_same_part_out_on_both_sides(greeted):
     assert result.journeys[0].status == "passed", [f.summary for f in findings]
     notice = region_notices(findings)[".greeting"]
     assert (notice.kind, notice.detail["reason"], notice.detail["journeys"]) == (
-        Kind.NOTICE, GREETING.reason, ["greeted-with"])
+        Kind.NOTICE,
+        GREETING.reason,
+        ["greeted-with"],
+    )
     assert (notice.detail["steps_on_source"], notice.detail["steps_on_target"]) == (1, 1)
     # once the project drops it, the target still leaves out what the source did
     result, findings = replay(j, assets, "same", greeting="plain")
     assert result.journeys[0].status == "passed", [f.summary for f in findings]
     assert region_notices(findings)[".greeting"].detail["reason"] == (
-        f"{GREETING.reason} (as recorded; no longer in web.ignore_regions)")
+        f"{GREETING.reason} (as recorded; no longer in web.ignore_regions)"
+    )
     # the migrated application marks it instead: a selector for each side
     marked = IgnoreRegion("personalised", source_selector=".greeting",
                           target_selector=VOLATILE.selector)  # fmt: skip
@@ -401,7 +419,9 @@ def test_a_journey_recorded_without_an_ignore_region_is_compared_in_full(greeted
     assert result.journeys[0].status == "different"
     [diff] = [f for f in findings if f.kind == Kind.DIFFERENCE]
     assert (diff.object, diff.summary) == (
-        "greeted-without step 6", "page content differs after the step")
+        "greeted-without step 6",
+        "page content differs after the step",
+    )
     notice = region_notices(findings)[".greeting (not applied)"]
     assert notice.detail["not_applied"] == ["greeted-without"]
     assert notice.summary.endswith("the journey was recorded without it; record it again")
@@ -487,8 +507,12 @@ def test_a_step_finds_its_element_after_a_snapshot_left_it_hidden(browser_availa
     the snapshot before it hid, should that snapshot not have."""
     monkeypatch.setattr("liftproof.web.browser.unhide", lambda page: None)
     sign_in = Locator([{"kind": "role", "role": "link", "name": "Sign in"}], "Sign in")
-    journey = Journey("help", "http://source", ignore_regions=[VOLATILE],
-                      steps=[Step(1, "goto", url="/help"), Step(2, "click", locator=sign_in)])
+    journey = Journey(
+        "help",
+        "http://source",
+        ignore_regions=[VOLATILE],
+        steps=[Step(1, "goto", url="/help"), Step(2, "click", locator=sign_in)],
+    )
     runs = []
     with ShopApp() as target:
         Replayer(target.url, secret_values=lambda j: {}, step_timeout_ms=3000).run(
@@ -524,10 +548,17 @@ def test_a_selector_that_is_not_css_stops_a_validation_before_it_reconciles(
     from liftproof import cli
 
     monkeypatch.setattr(cli, "_reconcile_into", lambda *a: pytest.fail("reconciled"))
-    web = {"source_url": "http://source.invalid", "target_url": "http://target.invalid",
-           "ignore_regions": [{"selector": "div[", "reason": "a typo"}]}
-    conn = {"engine": "postgresql", "host": "db.invalid", "database": "app",
-            "secret_arn": "arn:aws:secretsmanager:ap-south-1:000000000000:secret:db"}
+    web = {
+        "source_url": "http://source.invalid",
+        "target_url": "http://target.invalid",
+        "ignore_regions": [{"selector": "div[", "reason": "a typo"}],
+    }
+    conn = {
+        "engine": "postgresql",
+        "host": "db.invalid",
+        "database": "app",
+        "secret_arn": "arn:aws:secretsmanager:ap-south-1:000000000000:secret:db",
+    }
     project = tmp_path / "shop.yaml"
     project.write_text(yaml.safe_dump({"project": "shop", "source": conn, "target": conn,
                                        "web": web}))  # fmt: skip
@@ -554,8 +585,17 @@ def test_an_unresolved_correlation_is_named_with_what_it_broke(recorded, resolve
     rid = order.recorded_value
     if not resolved:
         order.expression = "$.order_id"
-    j.steps.append(Step(7, "goto", url=f"/orders/{rid}", exchanges=[
-        Exchange("GET", f"/orders/{rid}", 200), Exchange("GET", f"/api/orders/{rid}", 200)]))
+    j.steps.append(
+        Step(
+            7,
+            "goto",
+            url=f"/orders/{rid}",
+            exchanges=[
+                Exchange("GET", f"/orders/{rid}", 200),
+                Exchange("GET", f"/api/orders/{rid}", 200),
+            ],
+        )
+    )
     result, findings = replay(j, assets, "same")
     named = [f for f in findings if "correlation" in f.detail]
     status = [f for f in findings if f.summary == "status code differs"]
@@ -564,16 +604,28 @@ def test_an_unresolved_correlation_is_named_with_what_it_broke(recorded, resolve
         return
     [u] = named
     assert (u.kind, u.severity, u.column, u.locator) == (
-        Kind.NOT_CHECKED, Severity.MEDIUM, "orders.id", "step 6")
+        Kind.NOT_CHECKED,
+        Severity.MEDIUM,
+        "orders.id",
+        "step 6",
+    )
     assert (u.detail["cause"], u.detail["source_status"], u.detail["sent_in"]) == (
-        "not_in_response", 201, [7])
+        "not_in_response",
+        201,
+        [7],
+    )
     [s7] = status
     assert (s7.object, s7.locator, s7.expected, s7.actual) == (
-        "GET /api/orders/{orders.id}", "step 7", "200", "404")
+        "GET /api/orders/{orders.id}",
+        "step 7",
+        "200",
+        "404",
+    )
     # every difference in the run is traced to it, and it says so
     diffs = [f for f in findings if f.kind == Kind.DIFFERENCE]
     assert all(f.detail.get("unresolved_correlations") == ["orders.id"] for f in diffs), [
-        (f.object, f.summary) for f in diffs if "unresolved_correlations" not in f.detail]
+        (f.object, f.summary) for f in diffs if "unresolved_correlations" not in f.detail
+    ]
     assert ("POST /api/orders", "value of $.id differs") in {(f.object, f.summary) for f in diffs}
     assert u.summary.endswith(f"it explains {len(diffs)} findings in steps 6 and 7")
     assert rid not in json.dumps([f.to_dict() for f in findings])
@@ -782,8 +834,11 @@ def test_a_browser_crash_fails_that_journey_and_the_run_goes_on(
     assert (crashes.attempts, crashes.browser_crashes) == (2, len(kill_on))
     assert [j["browser_crashes"] for j in result.to_dict()["journeys"]] == [0, len(kill_on), 0]
     # never a difference made up from the evidence of a dead browser
-    assert not [f for f in findings
-                if f.kind in (Kind.DIFFERENCE, Kind.NOTICE) and f.object != "page region"]
+    assert not [
+        f
+        for f in findings
+        if f.kind in (Kind.DIFFERENCE, Kind.NOTICE) and f.object != "page region"
+    ]
     ours = [f for f in findings if f.journey == "crashes"]
     assert [f.detail.get("cause") for f in ours if f.kind == Kind.FLAKE] == ["browser_crash"]
     errors = [f for f in findings if f.kind == Kind.ERROR]
@@ -837,7 +892,8 @@ def test_a_browser_that_dies_between_journeys_is_started_again(recorded, monkeyp
                               workers=workers)  # fmt: skip
     assert result.complete
     assert [(r.status, r.attempts, r.browser_crashes) for r in result.journeys] == [
-        ("passed", 1, 0)] * 3, [f.summary for f in findings]
+        ("passed", 1, 0)
+    ] * 3, [f.summary for f in findings]
     # each worker's first journey has the browser it launched; every later one restarts it
     notices = [f.journey for f in findings if f.kind == Kind.NOTICE and f.journey]
     assert len(notices) == len(launched) - workers >= 1 and "first" not in notices
@@ -862,16 +918,29 @@ def test_cli_bind_and_replay(recorded, tmp_path, monkeypatch, capsys, variant, e
     monkeypatch.setattr(cli, "secret_value", lambda a, k: PASSWORD if a == arn else None)
     with ShopApp(variant) as target:
         project = tmp_path / "shop.yaml"
-        project.write_text(yaml.safe_dump({"project": "shop", "web": {
-            "source_url": "http://source.invalid", "target_url": target.url,
-            "capture_bodies": ["/api/*"],
-            "ignore_regions": [{"selector": ".greeting", "reason": "personalised"}]}}))
+        project.write_text(
+            yaml.safe_dump(
+                {
+                    "project": "shop",
+                    "web": {
+                        "source_url": "http://source.invalid",
+                        "target_url": target.url,
+                        "capture_bodies": ["/api/*"],
+                        "ignore_regions": [{"selector": ".greeting", "reason": "personalised"}],
+                    },
+                }
+            )
+        )
         base = ["--project", str(project), "--workdir", str(work), "--format", "json"]
         # the password token is not bound yet: the journey is reported as not run
         assert cli.main(["replay", *base, "--run-id", "r-unbound"]) == 10
         [token] = j.secrets
-        assert cli.main(["bind", *base, "--journey", "checkout", "--token", token,
-                         "--secret-arn", arn]) == 0
+        assert (
+            cli.main(
+                ["bind", *base, "--journey", "checkout", "--token", token, "--secret-arn", arn]
+            )
+            == 0
+        )
         capsys.readouterr()
         assert cli.main(["validate", *base, "--run-id", "r-web"]) == exit_code
     out = json.loads(capsys.readouterr().out)

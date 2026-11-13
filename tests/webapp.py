@@ -172,16 +172,21 @@ class ShopApp:
                 if path == "/inbox":
                     return self._send(200, INBOX)
                 if path == "/export":
-                    return self._send(200, "a,b\n", "text/csv",
-                                      {"Content-Disposition": 'attachment; filename="o.csv"'})
+                    return self._send(
+                        200,
+                        "a,b\n",
+                        "text/csv",
+                        {"Content-Disposition": 'attachment; filename="o.csv"'},
+                    )
                 if path == "/empty":
                     return self._send(204, "")
                 if path == "/framed":
                     return self._send(200, FRAMED)
                 if path.startswith("/frame/"):
                     name = path.rsplit("/", 1)[1]
-                    return self._send(200, FRAME.format(
-                        name=name, script=NEXT_FRAME if name == "a" else ""))
+                    return self._send(
+                        200, FRAME.format(name=name, script=NEXT_FRAME if name == "a" else "")
+                    )
                 if path == "/help":
                     return self._send(200, HELP.format(node=secrets.token_hex(4)))
                 if path == "/api/updates":
@@ -197,18 +202,29 @@ class ShopApp:
                     return self._send(302, "", headers={"Location": "/login"})
                 if path == "/orders":
                     same = app.variant == "same"
-                    return self._send(200, ORDERS.format(
-                        testid='data-testid="place-order"' if same else "",
-                        button="Place order", node=secrets.token_hex(4)))
+                    return self._send(
+                        200,
+                        ORDERS.format(
+                            testid='data-testid="place-order"' if same else "",
+                            button="Place order",
+                            node=secrets.token_hex(4),
+                        ),
+                    )
                 if path.startswith("/orders/"):
-                    return self._send(200, ORDER.format(
-                        oid=path.rsplit("/", 1)[1], node=secrets.token_hex(4),
-                        greeting=app._greeting()))
+                    return self._send(
+                        200,
+                        ORDER.format(
+                            oid=path.rsplit("/", 1)[1],
+                            node=secrets.token_hex(4),
+                            greeting=app._greeting(),
+                        ),
+                    )
                 if path.startswith("/api/orders/"):
                     o = app.orders.get(path.rsplit("/", 1)[1])
                     if o is None:
-                        return self._send(500 if app.variant == "changed" else 404, "{}",
-                                          "application/json")
+                        return self._send(
+                            500 if app.variant == "changed" else 404, "{}", "application/json"
+                        )
                     return self._send(200, o, "application/json")
                 return self._send(404, "not found")
 
@@ -223,21 +239,25 @@ class ShopApp:
                         return self._send(401, "<main><h1>Sign in failed</h1></main>")
                     sid = secrets.token_hex(16)
                     app.sessions.add(sid)
-                    return self._send(302, "", headers={"Location": "/orders",
-                                                        "Set-Cookie": f"sid={sid}; Path=/"})
+                    return self._send(
+                        302, "", headers={"Location": "/orders", "Set-Cookie": f"sid={sid}; Path=/"}
+                    )
                 if self.path == "/api/orders" and self._authed():
                     item = json.loads(raw or "{}").get("item", "")
                     oid = str(secrets.randbelow(900000) + 100000)
                     placed = dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
                     if app.variant == "changed":
-                        body = (f'{{"id": {oid}, "item": "{item}", "status": "PENDING", '
-                                f'"total": 10.5, "currency": "EUR", "placed_at": "{placed}"}}')
+                        body = (
+                            f'{{"id": {oid}, "item": "{item}", "status": "PENDING", '
+                            f'"total": 10.5, "currency": "EUR", "placed_at": "{placed}"}}'
+                        )
                     else:
-                        body = (f'{{"id": {oid}, "item": "{item}", "status": "OPEN", '
-                                f'"total": 10.50, "placed_at": "{placed}"}}')
+                        body = (
+                            f'{{"id": {oid}, "item": "{item}", "status": "OPEN", '
+                            f'"total": 10.50, "placed_at": "{placed}"}}'
+                        )
                     app.orders[oid] = body
-                    return self._send(app.post_status.get(self.path, 201), body,
-                                      "application/json")
+                    return self._send(app.post_status.get(self.path, 201), body, "application/json")
                 return self._send(403, "{}", "application/json")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
