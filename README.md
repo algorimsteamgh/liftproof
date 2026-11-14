@@ -8,7 +8,8 @@ This repository is being built against the *Migration Validation Tool* PRD and T
 Specification (Draft 1). Supported databases: PostgreSQL (13 and later, including RDS and Aurora), MySQL (8.0 and
 later, including Aurora MySQL 3; not MariaDB), Oracle (19c and later, including RDS for
 Oracle) and SQL Server (2016 and later, including RDS for SQL Server and Azure SQL), as
-source or target, in any combination. An older server is refused when Liftproof connects. Built so far: the database core, PRD F2 (baseline), F6 (reconcile), F8/F9 (reports),
+source or target, in any combination; and SQLite as a source, read from a copy of its file
+(SQLite sources, below). An older server is refused when Liftproof connects. Built so far: the database core, PRD F2 (baseline), F6 (reconcile), F8/F9 (reports),
 F11 (CLI and exit codes), F14 (credentials) and F15 (storage); and record and replay,
 F1 (record), F3 (replay), F4 (user interface comparison), F5 (API comparison) and F16
 (response times).
@@ -240,6 +241,19 @@ The report's journey table counts the pages compared each way. Replay and `bind`
 the journey from the bucket, so one recorded again on another machine replaces the
 instance's copy, and a replay deletes the instance's copies of what the bucket has expired.
 
+A link to a file in an object store is signed (Amazon S3, CloudFront, Google Cloud
+Storage, an Azure SAS): its signature and expiry change with every answer, and its host
+with the store the file moved to. Wherever one appears, in a kept body or a page, it is
+compared as `<signed link>`; the file it opens is compared by a file set.
+
+A sign in with a one time code sent by SMS or email cannot replay the code recording saw.
+Fields named like `otp`, `code` or `pin` (or marked `data-liftproof-sensitive`) are
+recorded as tokens like passwords; give the target application a test account whose code
+is fixed and sends no message, put that code in a secret and `bind` the token to it, so
+replay signs in with it. Recording signs in on the source with a real code. Messages a
+page exchanges over a WebSocket (a chat) are not compared as API calls; what they put on
+the page is, through the page comparison.
+
 Parts of a page expected to differ (a greeting with the user's name, recently viewed
 items, an advert) are left out with `web.ignore_regions`: a CSS selector and a reason,
 which the report prints, such as `{selector: ".recently-viewed", reason: personalised}`,
@@ -267,7 +281,81 @@ line, or row and column. What the text says stays out of the report unless the s
 `show_content: true`. `validate` compares files after reconciling and before replaying.
 A bucket in AWS is read with the instance role. An S3 compatible store outside AWS is
 given as `{location: s3://..., endpoint_url: https://..., secret_arn: ...}`, with its
-access key pair in that secret (keys `access_key_id` and `secret_access_key`).
+access key pair in that secret (keys `access_key_id` and `secret_access_key`). Google
+Cloud Storage is one: `{location: s3://BUCKET/prefix, endpoint_url:
+https://storage.googleapis.com, secret_arn: ...}`, with an HMAC key of a service account
+that can read the bucket (Cloud Storage, Settings, Interoperability). Such stores are
+listed with the first version of the S3 listing, addressed by path, signed for us-east-1
+and sent no checksums the API does not require, which every one of them accepts.
+
+A file set side can also be an Azure Blob Storage container, or a prefix in it, given by
+its URL: `{location: https://ACCOUNT.blob.core.windows.net/CONTAINER/prefix, secret_arn:
+...}`. It is read with a shared access signature that allows Read and List, kept in that
+secret under the key `sas_token` (in the Azure portal: the storage account, Containers, the
+container, Shared access tokens), over the Blob service REST API with no Azure SDK. The
+instance needs outbound HTTPS to the account, and the account's network rules must let the
+instance's address in. Folder placeholders of a hierarchical namespace are not files.
+
+And it can be the files a database table holds, for an application that stored its
+uploads in the database and moves them to object storage: `{database: source, table:
+documents, content: data, path: "{id}/{file_name}"}`. Each row is one file: its content is
+the `content` column (`encoding: binary`, the default, for a BLOB or bytea; `base64` for
+base64 text, a `data:` URL included; `text` for UTF-8 text), and its path is the row's
+values put into the template, the key the migration wrote it under below the target
+prefix. `where` keeps only some rows (one SQL condition in that database's dialect).
+Rows whose content is NULL hold no file and are counted in one notice; two rows giving the
+same path are not checked. The rows are read once through the project's read only
+connection (`source` or `target`) and spooled to a private temporary directory while the
+set is compared. The column that held the files is usually gone from the target table: an
+ignore rule for it (`{table: documents, column: data, reason: moved to S3, compared by
+file set stored-files}`) keeps the reconciliation from reporting it as missing.
+
+Where the rows name their files instead (a key or URL column, the files in an object
+store), `object` takes the place of `content`: the template of the location each row
+names, `{database: target, table: candidates, object: "s3://cv-bucket/{cv_key}", path:
+"{id}"}`. A location is `s3://bucket/key`, `gs://bucket/key` (with the Google Cloud
+Storage `endpoint_url` and `secret_arn` above), an object's https URL (Amazon S3 in either
+style, storage.googleapis.com, or an Azure blob, with `secret_arn` and, where the URL is
+not on blob.core.windows.net, `kind: azure_blob`), or an absolute path on the instance; a
+signed link's query string is not part of it. A column holding another URL, a CDN's,
+becomes one with `object_map: [regex, replacement]`, such as `["^https://cdn\\.example\\.com/([^?]*).*$",
+"s3://media-bucket/\\1"]`. With the source's rows on one side and the target's on the other,
+each record's file is compared across the move by the record's own path, whatever keys the
+migration gave the objects; each object is looked up on its own, and rows naming one that
+is not there are counted in a notice and reported missing. That also proves the target's
+rows point at real objects.
+
+## SQLite sources
+
+An application that keeps its data in a SQLite file has no server to connect to: the
+source is a copy of the file, `{engine: sqlite, path: s3://BUCKET/inputs/app.db}` (or a
+path on the instance). Take the copy once the application stopped writing, with
+`litestream restore` where Litestream replicates it, `sqlite3 app.db ".backup copy.db"`, or
+`VACUUM INTO`; never copy the file of a running application, which can leave out what is
+still in its write-ahead log. Put it in the deployment's bucket, which the instance role
+reads. Liftproof downloads it once (kept under the object's ETag), checks it is a SQLite
+file, and opens it read only and immutable, so it is one consistent state; `doctor` runs
+`PRAGMA quick_check` on it. Its SHA-256 is the baseline's consistency position, and
+`source.sha256` can pin the file a project must read. SQLite is a source only, its tables
+are in schema `main` (mapped onto the target's home schema), and the source protections do
+not apply: nothing is read from the application.
+
+SQLite's internal tables, Litestream's (`_litestream_seq`, `_litestream_lock`), virtual
+tables (full text search) and their shadow tables are not compared: the application or
+Litestream derives them. SQLite types are loose, so each column is typed by its declared
+type and else by its type affinity, and is compared as its target column's type where that
+is one the type map allows (docs/canonical-v1.md, SQLite): a TEXT column of ISO 8601 times
+against a timestamptz, an INTEGER of 0 and 1 against a boolean, an INTEGER of Unix
+milliseconds against a timestamp. Each table with such a column gets a notice naming them.
+A value that does not parse as its column's type leaves the column out, reported as not
+checked.
+
+A baseline is taken before the target exists, under SQLite's own types. Against the
+target, a table whose columns are then compared as the target's types is hashed again from
+the file, which is cheap and puts no load on anything; `validate` reads the file again from
+`source.path`, and only when it is the file the baseline was taken of (the same SHA-256).
+Another file is not used: the run compares against the baseline alone, with a notice, and
+such tables are not checked.
 
 ## Scheduled and pipeline runs
 

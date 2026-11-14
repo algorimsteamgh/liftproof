@@ -70,6 +70,7 @@ def sdk_versions() -> dict[str, str]:
     return {"boto3": boto3.__version__, "botocore": botocore.__version__}
 
 
+STORE_REGION = "us-east-1"  # what S3 compatible stores take when they name no region
 DEFAULT_RATE = 20.0  # requests per second, all clients together
 
 
@@ -83,10 +84,22 @@ def client(
     """Every client the product makes, rate limited and retried alike. `endpoint_url` and
     `credentials` serve an S3 compatible store outside AWS only, whose access key pair
     comes from a Secrets Manager secret; AWS itself is reached with the default chain."""
+    store: dict[str, Any] = {}
+    if endpoint_url:
+        # a store outside AWS (Google Cloud Storage's XML API with an HMAC key, MinIO, R2):
+        # path style addressing, a region it accepts in the signature unless one is given,
+        # and checksums only where the API requires them, since these stores do not all
+        # answer the ones newer SDKs add to every request
+        store = {
+            "s3": {"addressing_style": "path"},
+            "request_checksum_calculation": "when_required",
+            "response_checksum_validation": "when_required",
+        }
     cfg = Config(
         retries={"mode": "adaptive", "max_attempts": 10},
         user_agent_extra=f"liftproof/{__version__}",
-        region_name=region or _region,
+        region_name=region or (STORE_REGION if endpoint_url else _region),
+        **store,
     )
     c = boto3.session.Session().client(
         service, config=cfg, endpoint_url=endpoint_url, **(credentials or {})

@@ -37,7 +37,9 @@ def test_mysql_verifies_against_a_named_ca_file():
 
 
 def _conn(**kw) -> Connection:
-    return Connection(engine="postgresql", host="db", port=5432, database="app", **kw)
+    return Connection(
+        **{"engine": "postgresql", "host": "db", "port": 5432, "database": "app", **kw}
+    )
 
 
 def test_the_ami_bundle_is_used_when_no_ca_is_named(tmp_path, monkeypatch):
@@ -79,3 +81,63 @@ def test_mysql_refuses_a_server_certificate_it_cannot_verify(mysql_available, mo
     with pytest.raises(ConfigError, match="CERTIFICATE_VERIFY_FAILED"):
         mysql.MySQLAdapter(host=MY["host"], port=MY["port"], database="mysql",
                            user=MY["user"], password=MY["password"], sslmode=mode)  # fmt: skip
+
+
+def test_a_ca_kept_in_s3_is_read_with_the_instance_role(tmp_path, monkeypatch):
+    """A Cloud SQL server CA (or any private CA) put in the project's bucket, so no one
+    needs a shell on the instance."""
+    boto3 = pytest.importorskip("boto3")
+    moto = pytest.importorskip("moto")
+    monkeypatch.setenv("LIFTPROOF_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    with moto.mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="lp-certs")
+        s3.put_object(Bucket="lp-certs", Key="certs/server-ca.pem", Body=RDS_BUNDLE.read_bytes())
+        s3.put_object(Bucket="lp-certs", Key="certs/not.pem", Body=b"hello")
+        path = Path(cli._sslrootcert(_conn(sslrootcert="s3://lp-certs/certs/server-ca.pem")))
+        assert path.read_bytes() == RDS_BUNDLE.read_bytes()
+        assert path.stat().st_mode & 0o777 == 0o600
+        with pytest.raises(ConfigError, match="not a PEM certificate"):
+            cli._sslrootcert(_conn(sslrootcert="s3://lp-certs/certs/not.pem"))
+        with pytest.raises(ConfigError, match="cannot read it"):
+            cli._sslrootcert(_conn(sslrootcert="s3://lp-certs/certs/missing.pem"))
+
+
+def test_postgresql_connects_by_address_and_verifies_by_name(monkeypatch, tmp_path):
+    """A server across a VPN whose name resolves only in its own network's private DNS
+    zone: libpq connects to hostaddr and checks the certificate against host."""
+    import yaml
+
+    from liftproof.adapters import postgres
+    from liftproof.config import load_project
+
+    seen = {}
+
+    def fake_connect(**params):
+        seen.update(params)
+        raise postgres.psycopg.OperationalError("stop here")
+
+    monkeypatch.setattr(postgres.psycopg, "connect", fake_connect)
+    conn = _conn(hostaddr="10.20.0.4", host="app.private.postgres.database.azure.com")
+    with pytest.raises(ConfigError, match=r"database.azure.com \(10.20.0.4\):5432"):
+        cli.connect(conn)
+    assert (seen["host"], seen["hostaddr"], seen["sslmode"]) == (
+        "app.private.postgres.database.azure.com",
+        "10.20.0.4",
+        "verify-full",
+    )
+
+    p = tmp_path / "p.yaml"
+    doc = {"project": "p",
+           "source": {"engine": "postgresql", "host": "h.example", "database": "d",
+                      "hostaddr": "10.20.0.4"},
+           "target": {"engine": "postgresql", "host": "t", "database": "d"}}  # fmt: skip
+    p.write_text(yaml.safe_dump(doc))
+    assert load_project(p).source.hostaddr == "10.20.0.4"
+    for engine, value, says in [("postgresql", "db.internal", "IP address"),
+                                ("mysql", "10.0.0.1", "for PostgreSQL")]:  # fmt: skip
+        doc["source"].update(engine=engine, hostaddr=value)
+        p.write_text(yaml.safe_dump(doc))
+        with pytest.raises(ConfigError, match=says):
+            load_project(p)

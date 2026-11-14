@@ -49,7 +49,13 @@ reliability design (section 9).
 
 Liftproof supports PostgreSQL 13 and later, MySQL 8.0 and later (including Aurora MySQL
 3), Oracle 19c and later, and SQL Server 2016 and later, on premises or on Amazon RDS and
-Aurora. Older engines are refused when Liftproof connects.
+Aurora. Older engines are refused when Liftproof connects. A SQLite database can be the
+source: upload a copy of its file, taken once the application stopped writing, to the
+deployment's bucket and set `source.path` to it (README, SQLite sources); no network route
+to the application is needed for it. Files can be read from Azure Blob Storage with a SAS
+token kept in Secrets Manager, and from Google Cloud Storage through its S3 interface with
+an HMAC key kept in Secrets Manager; both need outbound HTTPS from the instance to the
+store (ApplicationCidrs, port 443).
 
 ## 3. Choosing an instance size
 
@@ -135,8 +141,13 @@ What each login needs:
   read the tables journeys write to.
 - **Web journeys:** logins used during replay are bound to secrets with `liftproof bind`;
   recordings keep a token, never the value.
-- **S3 file sources outside the account:** an access key pair in a secret
-  (`access_key_id`, `secret_access_key`).
+- **S3 compatible file stores outside AWS** (Google Cloud Storage HMAC keys, MinIO):
+  an access key pair in a secret (`access_key_id`, `secret_access_key`).
+- **Azure Blob Storage:** a SAS token with Read and List in a secret (`sas_token`). Where
+  the storage account has shared key access turned off, a user delegation SAS works the
+  same way; it lasts at most seven days, so put a new one in the secret before each run.
+- **Web journeys with a one time code sign in:** the code a test account always gets on
+  the target, in a secret bound to the code field (README, Record and replay).
 
 **Rotation.** Secrets Manager rotation is supported: Liftproof reads a secret each time a
 run connects, so the next run uses the new value. The KMS key rotates yearly
@@ -150,7 +161,22 @@ values; core dumps are disabled.
 
 **Database connections** use TLS with full certificate verification by default. The image
 trusts the public certificate authorities and the Amazon RDS CAs; for a private CA, point
-`sslrootcert` at your bundle. A lower setting is reported in every report.
+`sslrootcert` at your bundle: a path on the instance, or `s3://BUCKET/certs/ca.pem` in the
+deployment's bucket, which the instance role reads, so no one needs a shell on the
+instance to put it there. A lower setting is reported in every report.
+
+- **Google Cloud SQL:** add the instance's outbound address (the NAT gateway's) to the
+  Cloud SQL instance's authorized networks, and download its server CA (Connections,
+  Security) into the bucket for `sslrootcert`. An instance on the Google managed CA
+  (`GOOGLE_MANAGED_CAS_CA`) has a DNS name in its certificate: give that as `host` and the
+  public IP as `hostaddr`, and `verify-full` holds. An instance on its own per instance CA
+  has no host name in its certificate; use `verify-ca`, which the report shows.
+- **A server reached over a VPN by address only** (Azure Database for PostgreSQL flexible
+  server in a private VNet, whose name resolves only in its private DNS zone): set `host`
+  to the server's name, which its certificate carries, and `hostaddr` to its private IP
+  (PostgreSQL). For the other engines, make the name resolve in the VPC with a Route 53
+  private hosted zone or a Resolver forwarding rule. Azure's certificates chain to public
+  roots the image trusts.
 
 **Access to the instance** is only through Session Manager, controlled by IAM and logged
 by CloudTrail. To keep Session Manager transcripts, turn on session logging in your

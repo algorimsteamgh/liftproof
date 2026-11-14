@@ -54,6 +54,15 @@ from liftproof.web.journey import (
 from liftproof.web.replay import JourneyRun, StepRun
 
 DEFAULT_VOLATILE = [
+    # a signed link to a file (Amazon S3, CloudFront, Google Cloud Storage, an Azure SAS):
+    # its signature and expiry change with every answer, and its host and path with the
+    # store the file moved to, so the link is compared as a link and the file it opens as
+    # a file (a file set). First, before its dates and times are masked one by one
+    (
+        r"https?://[^\s\"'<>]+?\?[^\s\"'<>]*?\b(?:X-Amz-Signature|X-Goog-Signature|Signature|sig)="
+        r"[^\s\"'<>]*",
+        "<signed link>",
+    ),
     (r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?", "<datetime>"),
     (r"\b\d{4}-\d{2}-\d{2}\b", "<date>"),
     (r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", "<date>"),

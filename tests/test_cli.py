@@ -174,7 +174,7 @@ def test_version_reports_sdk(capsys):
     info = json.loads(capsys.readouterr().out)
     assert info["canonical_version"] == "1.0" and "botocore" in info
     assert info["canonical_revision"] == CANONICAL_REVISION
-    assert info["type_map_version"] == "1.0"
+    assert info["type_map_version"] == "1.1"
 
 
 def test_init_writes_template(tmp_path):
@@ -332,7 +332,7 @@ def test_support_bundle_carries_the_run_without_values(tmp_path, dbs, capsys, mo
     env = json.loads(bundle.read("environment.json"))
     assert env["canonical_version"] and env["packages"]["psycopg"]
     assert env["canonical_revision"] == CANONICAL_REVISION
-    assert env["type_map_version"] == "1.0"
+    assert env["type_map_version"] == "1.1"
     type_map = DEFAULT_TYPE_MAP.record("postgresql")
     assert json.loads(bundle.read("project.json"))["database"]["type_map"] == type_map
     assert json.loads(bundle.read("run/report.json"))["run"]["type_map"] == type_map

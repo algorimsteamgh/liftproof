@@ -8,6 +8,7 @@ it.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,8 @@ import yaml
 from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
 from liftproof.errors import ConfigError
 from liftproof.files.compare import FileSetConfig, IgnoreFile
+from liftproof.files.rows import ENCODINGS, RowFiles
+from liftproof.files.sources import is_azure
 from liftproof.reconcile.baseline import SNAPSHOT_MODES
 from liftproof.reconcile.engine import ReconcileOptions
 from liftproof.reconcile.plan import IgnoreRule
@@ -30,7 +33,9 @@ FORBIDDEN_KEYS = re.compile(
     r"(password|passwd|secret_access_key|access_key_id|session_token)", re.I
 )
 DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306, "oracle": 1521, "sqlserver": 1433}
-ENGINES = set(DEFAULT_PORTS)
+# SQLite is a file, read from a copy: a source only, with path in place of a server
+FILE_ENGINES = {"sqlite"}
+ENGINES = set(DEFAULT_PORTS) | FILE_ENGINES
 VERIFYING_TLS = {"verify-full", "verify-ca"}
 # Spec 9.15: the source is the machine not to saturate. Left out of the project file, its
 # connections read at most this many rows a second each, on one core, and pause between
@@ -49,19 +54,32 @@ class Connection:
     user: str | None = None
     secret_arn: str | None = None
     sslmode: str = "verify-full"
-    sslrootcert: str | None = None
+    sslrootcert: str | None = None  # a path on this instance, or s3://bucket/key
+    # PostgreSQL: the address to connect to, with host the name its certificate is
+    # verified against (a server reached across a VPN by an address only)
+    hostaddr: str | None = None
     statement_timeout_ms: int = 0
     rows_per_second: int = 0  # 0: no cap
     pause_ms: int = 0  # least time between two statements on a connection
     lock_timeout_ms: int = LOCK_TIMEOUT_MS  # 0: wait for a lock as long as it takes
     # a baseline of this database: one snapshot over every table, or one per table
     snapshot: str = "whole"
+    # a file engine (SQLite): the database file, a path on this instance or s3://bucket/key,
+    # and optionally the SHA-256 it must have
+    path: str | None = None
+    sha256: str | None = None
+
+    @property
+    def is_file(self) -> bool:
+        return self.engine in FILE_ENGINES
 
     @property
     def tls_verified(self) -> bool:
-        return self.sslmode in VERIFYING_TLS
+        return self.is_file or self.sslmode in VERIFYING_TLS  # a file crosses no network
 
     def describe(self) -> str:
+        if self.is_file:
+            return f"{self.engine}:{self.path}"
         return f"{self.engine}://{self.host}:{self.port}/{self.database}"
 
 
@@ -153,6 +171,8 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
             f"{role}.engine {engine!r} is not supported in this build "
             f"(supported: {', '.join(sorted(ENGINES))})"
         )
+    if engine in FILE_ENGINES:
+        return _file_connection(d, role, engine)
     cap, pause = (SOURCE_ROWS_PER_SECOND, SOURCE_PAUSE_MS) if role == "source" else (0, 0)
     snapshot = d.get("snapshot", "whole")
     if snapshot not in SNAPSHOT_MODES:
@@ -171,6 +191,7 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
             secret_arn=d.get("secret_arn"),
             sslmode=d.get("sslmode", "verify-full"),
             sslrootcert=d.get("sslrootcert"),
+            hostaddr=_hostaddr(d, role, engine),
             statement_timeout_ms=int(d.get("statement_timeout_ms", 0)),
             rows_per_second=_whole(d, "rows_per_second", cap, role),
             pause_ms=_whole(d, "pause_ms", pause, role),
@@ -181,6 +202,51 @@ def _connection(d: dict[str, Any], role: str) -> Connection:
         raise ConfigError(f"{role}.{exc.args[0]} is required") from None
 
 
+SERVER_SETTINGS = {"host", "port", "database", "user", "secret_arn", "sslmode", "sslrootcert",
+                   "hostaddr", "rows_per_second", "pause_ms", "snapshot"}  # fmt: skip
+
+
+def _hostaddr(d: dict[str, Any], role: str, engine: str) -> str | None:
+    value = d.get("hostaddr")
+    if value is None:
+        return None
+    if engine != "postgresql":
+        raise ConfigError(
+            f"{role}.hostaddr is for PostgreSQL; for {engine}, make host resolve on the "
+            "instance (a Route 53 private hosted zone or Resolver rule in its VPC)"
+        )
+    try:
+        return str(ipaddress.ip_address(str(value)))
+    except ValueError:
+        raise ConfigError(
+            f"{role}.hostaddr is the server's IP address; host stays the name its "
+            "certificate is verified against"
+        ) from None
+
+
+def _file_connection(d: dict[str, Any], role: str, engine: str) -> Connection:
+    """A database file: the source only, read from a copy taken once the application
+    stopped writing. Server settings have no meaning for it and are refused."""
+    if role != "source":
+        raise ConfigError(f"{role}.engine {engine}: a {engine} database can be the source only")
+    path = d.get("path")
+    if not path or not isinstance(path, str):
+        raise ConfigError(
+            f"{role}.path is required for {engine}: the database file, a path on this "
+            "instance or s3://bucket/key (a copy taken once the application stopped writing)"
+        )
+    server = sorted(set(d) & SERVER_SETTINGS)
+    if server:
+        raise ConfigError(
+            f"{role}: {', '.join(server)} do not apply to a {engine} file; give path only"
+        )
+    sha = d.get("sha256")
+    if sha is not None and not re.fullmatch(r"(sha256:)?[0-9a-fA-F]{64}", str(sha)):
+        raise ConfigError(f"{role}.sha256 is the file's SHA-256, 64 hexadecimal characters")
+    return Connection(engine=engine, host="", database="main", port=0, path=path,
+                      sha256=str(sha) if sha else None, lock_timeout_ms=0)  # fmt: skip
+
+
 def _home_schema(conn: Connection | None) -> str:
     """Where tables live by default: PostgreSQL's public schema, the MySQL database, or
     the Oracle login's own schema (upper case, as Oracle stores unquoted names), or
@@ -189,6 +255,8 @@ def _home_schema(conn: Connection | None) -> str:
         return "public"
     if conn.engine == "mysql":
         return conn.database
+    if conn.engine == "sqlite":
+        return "main"
     if conn.engine == "sqlserver":
         return "dbo"
     if conn.engine == "oracle":
@@ -370,21 +438,120 @@ def _parallel(v: Any) -> int:
     return n
 
 
-def _side(d: Any, where: str) -> tuple[str, str | None, str | None]:
+@dataclass
+class _Side:
+    location: str
+    endpoint_url: str | None = None
+    secret_arn: str | None = None
+    kind: str | None = None
+    rows: RowFiles | None = None
+
+
+def _side(d: Any, where: str) -> _Side:
     """A file location: a string, or {location, endpoint_url, secret_arn} for an S3
-    compatible store outside AWS."""
+    compatible store outside AWS, {location, secret_arn} for Azure Blob Storage, or
+    {database, table, content or object, path} for the files a database table holds or
+    names."""
     if isinstance(d, str) and d:
-        return d, None, None
+        return _Side(d)
+    if isinstance(d, dict) and d.get("database"):
+        return _Side(f"{d['database']} database", rows=_rows(d, where))
     if isinstance(d, dict) and d.get("location"):
-        if d.get("secret_arn") and not d.get("endpoint_url"):
+        kind = d.get("kind")
+        if kind not in (None, "azure_blob"):
+            raise ConfigError(f"{where}.kind is azure_blob, or left out")
+        location = str(d["location"])
+        azure = kind == "azure_blob" or is_azure(location)
+        if d.get("secret_arn") and not d.get("endpoint_url") and not azure:
             # keys in a secret would mean an IAM user with long lived keys (IAM-002)
             raise ConfigError(
                 f"{where}.secret_arn is for an S3 compatible store outside AWS, with its "
-                "endpoint_url; a bucket in AWS is read with the instance role, so leave "
-                "secret_arn out and grant the role s3:ListBucket and s3:GetObject"
+                "endpoint_url, or for Azure Blob Storage; a bucket in AWS is read with the "
+                "instance role, so leave secret_arn out and grant the role s3:ListBucket and "
+                "s3:GetObject"
             )
-        return str(d["location"]), d.get("endpoint_url"), d.get("secret_arn")
-    raise ConfigError(f"{where} must be a path, an s3:// location, or {{location: ...}}")
+        if azure and not d.get("secret_arn"):
+            raise ConfigError(
+                f"{where}: Azure Blob Storage is read with a SAS token (Read and List) kept "
+                "in a Secrets Manager secret under the key sas_token; give its secret_arn"
+            )
+        return _Side(location, d.get("endpoint_url"), d.get("secret_arn"),
+                     "azure_blob" if azure else None)  # fmt: skip
+    raise ConfigError(
+        f"{where} must be a path, an s3:// location, {{location: ...}}, or {{database: source "
+        "or target, table, content or object, path}"
+    )
+
+
+def _rows(d: dict[str, Any], where: str) -> RowFiles:
+    database = d.get("database")
+    if database not in ("source", "target"):
+        raise ConfigError(f"{where}.database is source or target: the project's connection")
+    if bool(d.get("content")) == bool(d.get("object")):
+        raise ConfigError(
+            f"{where}: give content, the column holding each file, or object, the template of "
+            'the location each row names ("s3://bucket/{cv_key}", or "{photo_url}"); not both'
+        )
+    missing = [k for k in ("table", "path") if not d.get(k)]
+    if missing:
+        raise ConfigError(
+            f"{where}: {', '.join(missing)} required; the table, and each file's path from "
+            'the row\'s columns, as the other side names it (path: "{id}/{file_name}")'
+        )
+    encoding = d.get("encoding", "binary")
+    if encoding not in ENCODINGS:
+        raise ConfigError(f"{where}.encoding is one of {', '.join(ENCODINGS)}")
+    pred = d.get("where")
+    if pred is not None and (not str(pred).strip() or UNSAFE_SQL.search(str(pred))):
+        raise ConfigError(f"{where}.where is one SQL condition, without ';' or comments")
+    obj = str(d["object"]) if d.get("object") else None
+    store = _Side("", d.get("endpoint_url"), d.get("secret_arn"), d.get("kind"))
+    object_map = None
+    if obj is None:
+        stray = sorted(set(d) & {"object_map", "endpoint_url", "secret_arn", "kind"})
+        if stray:
+            raise ConfigError(f"{where}: {', '.join(stray)} apply to object, not content")
+    else:
+        if store.kind not in (None, "azure_blob"):
+            raise ConfigError(f"{where}.kind is azure_blob, or left out")
+        azure = store.kind == "azure_blob" or is_azure(obj)
+        if azure and not store.secret_arn:
+            raise ConfigError(
+                f"{where}: Azure Blob Storage is read with a SAS token (Read) kept in a "
+                "Secrets Manager secret under the key sas_token; give its secret_arn"
+            )
+        if store.secret_arn and not store.endpoint_url and not azure:
+            raise ConfigError(
+                f"{where}.secret_arn is for an S3 compatible store outside AWS, with its "
+                "endpoint_url, or for Azure Blob Storage (kind: azure_blob); a bucket in AWS "
+                "is read with the instance role"
+            )
+        pair = d.get("object_map")
+        if pair is not None:
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise ConfigError(f"{where}.object_map: use [regex, replacement]")
+            try:
+                re.compile(str(pair[0]))
+            except re.error as exc:
+                raise ConfigError(f"{where}.object_map: {pair[0]!r} is not a valid regular "
+                                  f"expression: {exc}") from None  # fmt: skip
+            object_map = (str(pair[0]), str(pair[1]))
+    rows = RowFiles(
+        str(database), str(d["table"]), str(d["content"]) if obj is None else None,
+        str(d["path"]), str(pred) if pred else None, encoding, obj, object_map,
+        store.endpoint_url, store.secret_arn,
+        "azure_blob" if obj and (store.kind or is_azure(obj)) else None,
+    )  # fmt: skip
+    for key, template in (("path", rows.path), ("object", obj)):
+        if template is None:
+            continue
+        try:
+            if not rows.path_columns if key == "path" else not rows.object_columns:
+                raise ValueError("it names no column")
+        except ValueError as exc:
+            raise ConfigError(f"{where}.{key} {template!r} is not a template of the row's "
+                              f"columns: {exc}") from None  # fmt: skip
+    return rows
 
 
 def _files(d: Any) -> list[FileSetConfig]:
@@ -401,8 +568,8 @@ def _files(d: Any) -> list[FileSetConfig]:
         if name in names:
             raise ConfigError(f"{where}: file set name {name!r} is used twice")
         names.add(name)
-        src, src_ep, src_secret = _side(f.get("source"), f"{where}.source")
-        tgt, tgt_ep, tgt_secret = _side(f.get("target"), f"{where}.target")
+        src = _side(f.get("source"), f"{where}.source")
+        tgt = _side(f.get("target"), f"{where}.target")
         ignore = []
         for j, r in enumerate(f.get("ignore") or []):
             if not isinstance(r, dict) or not r.get("path") or not r.get("reason"):
@@ -425,8 +592,8 @@ def _files(d: Any) -> list[FileSetConfig]:
         sets.append(
             FileSetConfig(
                 name=name,
-                source=src,
-                target=tgt,
+                source=src.location,
+                target=tgt.location,
                 include=[str(x) for x in f.get("include") or []],
                 ignore=ignore,
                 ignore_text=[str(x) for x in f.get("ignore_text") or []],
@@ -435,10 +602,14 @@ def _files(d: Any) -> list[FileSetConfig]:
                 show_content=bool(f.get("show_content", False)),
                 max_text_mb=int(f.get("max_text_mb", 64)),
                 workers=int(f.get("workers", 8)),
-                source_endpoint_url=src_ep,
-                target_endpoint_url=tgt_ep,
-                source_secret_arn=src_secret,
-                target_secret_arn=tgt_secret,
+                source_endpoint_url=src.endpoint_url,
+                target_endpoint_url=tgt.endpoint_url,
+                source_secret_arn=src.secret_arn,
+                target_secret_arn=tgt.secret_arn,
+                source_kind=src.kind,
+                target_kind=tgt.kind,
+                source_rows=src.rows,
+                target_rows=tgt.rows,
             )
         )
     return sets
@@ -481,8 +652,17 @@ def load_project(path: Path) -> Project:
             f"{path}: configure source and target databases, a web section, file sets, "
             "or any combination"
         )
-    source = _connection(raw.get("source"), "source") if has_db else None
-    target = _connection(raw.get("target"), "target") if has_db else None
+    # a file set reading the files a table holds needs that database alone
+    used = {r.database for f in files for r in (f.source_rows, f.target_rows) if r is not None}
+    both = has_db and not used
+    source = _connection(raw.get("source"), "source") if both or raw.get("source") else None
+    target = _connection(raw.get("target"), "target") if both or raw.get("target") else None
+    for database in sorted(used):
+        if raw.get(database) is None:
+            raise ConfigError(
+                f"{path}: a file set reads files from the {database} database, which the "
+                f"project does not configure ({database}: ...)"
+            )
     return Project(
         name=str(raw["project"]),
         source=source,
@@ -516,8 +696,11 @@ source:                         # a read replica where there is one (README: Pro
   sslmode: verify-full          # full certificate verification; lowering it is reported
                                 # Oracle: TLS is TCPS, usually on port 2484
                                 # SQL Server: verify-ca or verify-full
-  # sslrootcert: /var/lib/mvt/certs/private-ca.pem   # only for a private CA; the AMI
+  # sslrootcert: s3://REPLACE-with-your-bucket/certs/server-ca.pem   # a private CA (a
+                                # Cloud SQL server CA), or a path on the instance; the AMI
                                 # already trusts Amazon RDS and public certificate authorities
+  # hostaddr: 10.20.0.4         # PostgreSQL: connect to this address and verify the
+                                # certificate against host (a name only a VPN's DNS knows)
   statement_timeout_ms: 600000
   lock_timeout_ms: 10000        # a read kept waiting this long for a lock fails the run
   rows_per_second: 125000       # rows read a second, on one core, by each connection (each
@@ -525,9 +708,14 @@ source:                         # a read replica where there is one (README: Pro
   pause_ms: 100                 # at least this long between two statements on a connection
   # snapshot: per_table         # a baseline holds one snapshot over every table; per_table
                                 # when the source cannot (README: Protecting the source)
+# source:                       # an application that kept its data in a SQLite file: a copy
+#   engine: sqlite              # taken once it stopped writing (litestream restore, or
+#   path: s3://REPLACE-with-your-bucket/inputs/app.db    # sqlite3 .backup); or a local path
+#   # sha256: ...               # optional: the copy must be this file
 
 target:
   engine: postgresql            # postgresql, mysql, oracle or sqlserver; may differ
+                                # (sqlite is a source only)
   host: target.cluster-xyz.REGION.rds.amazonaws.com
   port: 5432
   database: app
@@ -567,6 +755,38 @@ files:                          # compare files the application generates or sto
     # ignore:
     #   - path: "tmp/*"
     #     reason: scratch files, not migrated
+  # - name: uploads             # Azure Blob Storage: the container URL, read with a SAS token
+  #   source:                   # (Read and List) kept in a secret under the key sas_token
+  #     location: https://ACCOUNT.blob.core.windows.net/uploads
+  #     secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/azure-blob
+  #   target: s3://REPLACE-target-bucket/uploads/
+  # - name: stored-files        # files the source database holds, one a row, moved to S3
+  #   source:
+  #     database: source        # the project's source (or target) connection
+  #     table: documents
+  #     content: data           # the column holding each file (BLOB, bytea)
+  #     path: "{{id}}/{{file_name}}"  # each file's key under target, from the row's columns
+  #     # encoding: base64      # when the column holds base64 text; default binary
+  #     # where: "deleted = 0"  # only these rows
+  #   target: s3://REPLACE-target-bucket/documents/
+  # - name: media               # Google Cloud Storage, through its S3 interface: an HMAC
+  #   source:                   # key in a secret (access_key_id, secret_access_key)
+  #     location: s3://REPLACE-gcs-bucket/media/
+  #     endpoint_url: https://storage.googleapis.com
+  #     secret_arn: arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/gcs-hmac
+  #   target: s3://REPLACE-target-bucket/media/
+  # - name: named-files         # the files each row names: each record's file before and
+  #   source:                   # after the move, whatever keys the migration gave them
+  #     database: source
+  #     table: documents
+  #     content: data
+  #     path: "{{id}}"
+  #   target:
+  #     database: target
+  #     table: documents
+  #     object: "s3://REPLACE-target-bucket/{{file_key}}"   # or "{{file_url}}", an object URL
+  #     # object_map: ["^https://cdn\\.example\\.com/([^?]*).*$", "s3://REPLACE-target-bucket/\\1"]
+  #     path: "{{id}}"
 
 database:
   schemas: [public]             # MySQL: the database; Oracle: the owner; SQL Server: dbo

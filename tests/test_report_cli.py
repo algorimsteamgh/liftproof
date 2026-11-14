@@ -10,7 +10,7 @@ import yaml
 
 from liftproof import cli
 from liftproof.canonical import CANONICAL_REVISION
-from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, legacy_record
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_DIFFERENCES, EXIT_OK
 from tests.conftest import PG
@@ -164,7 +164,7 @@ def test_a_report_rebuilt_from_a_checkpoint_states_its_revision(tmp_path, projec
     del saved["canonical_revision"], saved["type_map"]
     run = rebuilt(dict(saved, complete=False))
     assert run["canonical_revision"] == 0
-    assert run["type_map"] == DEFAULT_TYPE_MAP.record("postgresql")  # the 1.0 defaults
+    assert run["type_map"] == legacy_record("postgresql")  # the 1.0 defaults
 
 
 def test_the_classification_follows_show_values_for_files(tmp_path):

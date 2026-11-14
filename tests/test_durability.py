@@ -21,7 +21,7 @@ import yaml
 from liftproof import checkpoint as ckpt
 from liftproof import cli
 from liftproof.canonical import CANONICAL_REVISION
-from liftproof.canonical.typemap import DEFAULT_TYPE_MAP
+from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, legacy_record
 from liftproof.credentials import DbCredentials
 from liftproof.errors import EXIT_CONFIG, EXIT_DIFFERENCES, EXIT_RUN_FAILED
 from liftproof.findings import Comparator, Finding, FindingWriter, Kind, read_findings
@@ -250,7 +250,7 @@ def test_a_resume_under_another_type_map_is_refused(tmp_path, project, monkeypat
     code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
     assert code == EXIT_CONFIG
     assert (
-        "started under type map 1.0 with postgresql x as y, not type map 1.0 without "
+        "started under type map 1.0 with postgresql x as y, not type map 1.1 without "
         "overrides" in capsys.readouterr().err
     )
     del saved["type_map"]  # as a build from before the map was kept left it: the 1.0 defaults
@@ -287,7 +287,7 @@ def test_a_baseline_resumes_under_its_type_map_only(tmp_path, project, monkeypat
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(saved).encode())
     assert _main("baseline", "--project", str(project), "--workdir", str(work), "--resume") == 0
     manifest = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
-    assert manifest["complete"] and manifest["type_map"] == DEFAULT_TYPE_MAP.record("postgresql")
+    assert manifest["complete"] and manifest["type_map"] == legacy_record("postgresql")
 
 
 def test_baseline_resumes_on_a_replacement_instance(tmp_path, project, monkeypatch, s3):

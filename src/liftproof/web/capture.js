@@ -137,8 +137,11 @@
     const el = e.target;
     if (el.tagName === "INPUT" && ["checkbox", "radio", "file"].includes(el.type)) return;
     if (["INPUT", "TEXTAREA"].includes(el.tagName)) {
+      // a one time code too: autocomplete="one-time-code", or a name or id like otp_code,
+      // verificationCode or oneTimeCode (README, Record and replay)
       const sensitive = el.type === "password" || el.hasAttribute("data-liftproof-sensitive") ||
-        /pass|secret|token|otp|pin/i.test(el.name || "");
+        /one-time-code/i.test(el.getAttribute("autocomplete") || "") ||
+        /pass|secret|token|otp|pin|one.?time|verif/i.test(`${el.name || ""} ${el.id || ""}`);
       // A sensitive value goes to the recorder process only, which swaps it for a
       // token and scrubs it from every captured request; it is never written anywhere.
       send({ action: "fill", locator: describe(el), value: el.value, sensitive,

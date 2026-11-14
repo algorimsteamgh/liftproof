@@ -229,6 +229,7 @@ class PostgresAdapter(Adapter):
         rows_per_second: int = 0,
         pause_ms: int = 0,
         connect_timeout: int = 10,
+        hostaddr: str | None = None,
     ) -> None:
         self._kwargs = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
         params: dict[str, Any] = {
@@ -245,11 +246,16 @@ class PostgresAdapter(Adapter):
             params["password"] = password  # passed as a parameter, never in a DSN string
         if sslrootcert:
             params["sslrootcert"] = sslrootcert
+        if hostaddr:
+            # reach the server at this address, and verify its certificate by host: a name
+            # this instance cannot resolve (a private DNS zone across a VPN)
+            params["hostaddr"] = hostaddr
         try:
             self.conn = psycopg.connect(**params, autocommit=True)
         except psycopg.OperationalError as exc:
+            at = f"{host} ({hostaddr})" if hostaddr else host
             raise ConfigError(
-                f"cannot connect to PostgreSQL at {host}:{port}/{database}: {exc}"
+                f"cannot connect to PostgreSQL at {at}:{port}/{database}: {exc}"
             ) from exc
         load_infinity(self.conn)
         self.conn = sqllog.wrap(self.conn, self.engine)
@@ -527,6 +533,13 @@ class PostgresAdapter(Adapter):
             cur.itersize = fetch_batch(plan, 5000)
             cur.execute(q)
             yield from self.pacer.each(cur)
+
+    def _cursor_rows(self, q: str, batch: int) -> Iterator[tuple[Any, ...]]:
+        # a server side cursor: a table of files is never fetched whole
+        with self.conn.transaction(), self.conn.cursor(name="liftproof_rows") as cur:
+            cur.itersize = batch
+            cur.execute(q)
+            yield from cur
 
     def _bucket_aggregates_fallback(self, plan: HashPlan) -> dict[int, BucketAggregate]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)

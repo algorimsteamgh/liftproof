@@ -272,8 +272,8 @@ def test_a_baseline_is_compared_under_the_map_it_was_taken_under(tmp_path, flags
     assert flags_.status == "matched" and not flags_.partial
 
     # resumed under another map, its finished tables would be typed otherwise than the rest
-    with pytest.raises(ConfigError, match=r"started under type map 1\.0 without overrides, not "
-                       r"type map 1\.0 with mysql datetime as timestamptz, mysql tinyint\(1\) "
+    with pytest.raises(ConfigError, match=r"started under type map 1\.1 without overrides, not "
+                       r"type map 1\.1 with mysql datetime as timestamptz, mysql tinyint\(1\) "
                        "as integer"):  # fmt: skip
         take_baseline(my, manifest, resume=True, type_map=MAPPED, **take)
     mapped_manifest = tmp_path / "b2.json"
