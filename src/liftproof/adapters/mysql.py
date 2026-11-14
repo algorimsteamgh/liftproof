@@ -536,6 +536,11 @@ class MySQLAdapter(Adapter):
             for row in self.pacer.each(cur):
                 yield [prepare(v, t, plan.precision) for v, t in zip(row, types, strict=True)]
 
+    def _cursor_rows(self, q: str, batch: int) -> Iterator[tuple[Any, ...]]:
+        with self.conn.cursor(pymysql.cursors.SSCursor) as cur:  # unbuffered
+            cur.execute(q)
+            yield from cur
+
     def _bucket_aggregates_fallback(
         self,
         plan: HashPlan,

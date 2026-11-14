@@ -511,6 +511,30 @@ class Adapter(abc.ABC):
         [row] = self._rows(q.replace("{", "{{").replace("}", "}}"), [])  # no placeholders
         return {c: (row[2 * i], row[2 * i + 1]) for i, c in enumerate(columns)}
 
+    def stream_columns(
+        self, table: TableRef, columns: Sequence[str], where: str | None = None, batch: int = 100
+    ) -> Iterator[tuple[Any, ...]]:
+        """Raw values of some columns of every row (that where, a condition from the
+        project file, keeps): a file set reading the files a table holds. Streamed, a batch
+        at a time, under this connection's cap."""
+        cols = ", ".join(self.quote_name(c) for c in columns)
+        q = f"SELECT {cols} FROM {self.qualified_name(table)}"  # noqa: S608
+        if where:
+            q += f" WHERE {where}"
+        with self.pacer.statement():
+            yield from self.pacer.each(self._cursor_rows(q, batch), batch)
+
+    def _cursor_rows(self, q: str, batch: int) -> Iterator[tuple[Any, ...]]:
+        cur = self.conn.cursor()
+        try:
+            with contextlib.suppress(AttributeError):
+                cur.arraysize = batch
+            cur.execute(q)
+            while rows := cur.fetchmany(batch):
+                yield from rows
+        finally:
+            cur.close()
+
     def column_max(self, table: TableRef, column: str) -> Any:
         q = f"SELECT MAX({self.quote_name(column)}) FROM {self.qualified_name(table)}"  # noqa: S608
         return self._rows(q, [])[0][0]

@@ -28,6 +28,20 @@ ORACLE_NUMBER = re.compile(r"number\((\d+|\*)(?:,(-?\d+))?\)")
 ARGUMENTS = re.compile(r"\([^)]*\)")
 
 
+def affinity(declared: str) -> str:
+    """SQLite's type affinity of a declared column type (sqlite.org/datatype3.html 3.1)."""
+    t = declared.upper()
+    if "INT" in t:
+        return "integer"
+    if "CHAR" in t or "CLOB" in t or "TEXT" in t:
+        return "text"
+    if "BLOB" in t or not t.strip():
+        return "blob"
+    if "REAL" in t or "FLOA" in t or "DOUB" in t:
+        return "real"
+    return "numeric"
+
+
 def type_keys(engine: str, native: str) -> tuple[str, ...]:
     """The keys a native type is looked up by, most specific first, each lower case with
     single spaces, none in its arguments: the whole type, then (MySQL) the type with its
@@ -35,6 +49,9 @@ def type_keys(engine: str, native: str) -> tuple[str, ...]:
     without arguments."""
     full = " ".join(str(native).lower().split())
     full = ARGUMENTS.sub(lambda m: "".join(m[0].split()), full)  # 'number(1, 0)': 'number(1,0)'
+    if engine == "sqlite":  # the declared type, without arguments, then its affinity
+        bare = " ".join(ARGUMENTS.sub("", full).split())
+        return tuple(dict.fromkeys([full, bare, f"affinity {affinity(full)}"]))
     if engine == "mysql":
         head = MYSQL_HEAD.match(full)  # 'tinyint(1) unsigned': 'tinyint(1)', 'tinyint'
         keys = [full, head[0], head[1]] if head else [full]
@@ -125,6 +142,12 @@ class TypeMap:
             if key in rules:
                 return rules[key].canonical
         return CanonicalType.UNSUPPORTED
+
+    def allows(self, engine: str, native: str, ctype: CanonicalType) -> bool:
+        """Whether a column of this native type may be compared as ctype: its default or
+        one of the alternatives the map lists for it."""
+        rule = self.rule(engine, native)
+        return rule is not None and ctype in (rule.canonical, *rule.also)
 
     def common(self, a: CanonicalType, b: CanonicalType) -> CanonicalType | None:
         """The type two different canonical types compare as, if they are compatible."""

@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from liftproof.files import text as textmod
+from liftproof.files.rows import RowFiles
 from liftproof.files.sources import Entry, FileSource
 from liftproof.findings import Comparator, Finding, Kind, Severity
 
@@ -50,6 +51,12 @@ class FileSetConfig:
     target_endpoint_url: str | None = None
     source_secret_arn: str | None = None
     target_secret_arn: str | None = None
+    # azure_blob: an Azure Blob Storage container URL outside the usual host name
+    source_kind: str | None = None
+    target_kind: str | None = None
+    # the files a database table holds, in place of a location (files/rows.py)
+    source_rows: RowFiles | None = None
+    target_rows: RowFiles | None = None
 
 
 @dataclass
@@ -164,6 +171,8 @@ class FileComparator:
             for path, reason in getattr(skipped, "skipped", []):
                 res.not_checked += 1
                 self._f(Kind.NOT_CHECKED, Severity.MEDIUM, path, f"{side} file {reason}")
+            for note in getattr(skipped, "notes", []):
+                self._f(Kind.NOTICE, Severity.INFO, "", f"{side}: {note}")
         res.files = len(src)
         res.source_bytes = sum(e.size for e, _ in src.values())
 
@@ -262,6 +271,13 @@ def compare_files(
     """Compare every file set. open_source(config, "source" | "target") builds a side."""
     result = FileResult()
     for c in sets:
-        source, target = open_source(c, "source"), open_source(c, "target")
-        result.sets.append(FileComparator(c, source, target, emit).run())
+        source = open_source(c, "source")
+        try:
+            target = open_source(c, "target")
+            try:
+                result.sets.append(FileComparator(c, source, target, emit).run())
+            finally:
+                getattr(target, "close", lambda: None)()
+        finally:
+            getattr(source, "close", lambda: None)()
     return result

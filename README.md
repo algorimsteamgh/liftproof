@@ -8,7 +8,8 @@ This repository is being built against the *Migration Validation Tool* PRD and T
 Specification (Draft 1). Supported databases: PostgreSQL (13 and later, including RDS and Aurora), MySQL (8.0 and
 later, including Aurora MySQL 3; not MariaDB), Oracle (19c and later, including RDS for
 Oracle) and SQL Server (2016 and later, including RDS for SQL Server and Azure SQL), as
-source or target, in any combination. An older server is refused when Liftproof connects. Built so far: the database core, PRD F2 (baseline), F6 (reconcile), F8/F9 (reports),
+source or target, in any combination; and SQLite as a source, read from a copy of its file
+(SQLite sources, below). An older server is refused when Liftproof connects. Built so far: the database core, PRD F2 (baseline), F6 (reconcile), F8/F9 (reports),
 F11 (CLI and exit codes), F14 (credentials) and F15 (storage); and record and replay,
 F1 (record), F3 (replay), F4 (user interface comparison), F5 (API comparison) and F16
 (response times).
@@ -268,6 +269,60 @@ line, or row and column. What the text says stays out of the report unless the s
 A bucket in AWS is read with the instance role. An S3 compatible store outside AWS is
 given as `{location: s3://..., endpoint_url: https://..., secret_arn: ...}`, with its
 access key pair in that secret (keys `access_key_id` and `secret_access_key`).
+
+A file set side can also be an Azure Blob Storage container, or a prefix in it, given by
+its URL: `{location: https://ACCOUNT.blob.core.windows.net/CONTAINER/prefix, secret_arn:
+...}`. It is read with a shared access signature that allows Read and List, kept in that
+secret under the key `sas_token` (in the Azure portal: the storage account, Containers, the
+container, Shared access tokens), over the Blob service REST API with no Azure SDK. The
+instance needs outbound HTTPS to the account, and the account's network rules must let the
+instance's address in. Folder placeholders of a hierarchical namespace are not files.
+
+And it can be the files a database table holds, for an application that stored its
+uploads in the database and moves them to object storage: `{database: source, table:
+documents, content: data, path: "{id}/{file_name}"}`. Each row is one file: its content is
+the `content` column (`encoding: binary`, the default, for a BLOB or bytea; `base64` for
+base64 text, a `data:` URL included; `text` for UTF-8 text), and its path is the row's
+values put into the template, the key the migration wrote it under below the target
+prefix. `where` keeps only some rows (one SQL condition in that database's dialect).
+Rows whose content is NULL hold no file and are counted in one notice; two rows giving the
+same path are not checked. The rows are read once through the project's read only
+connection (`source` or `target`) and spooled to a private temporary directory while the
+set is compared. The column that held the files is usually gone from the target table: an
+ignore rule for it (`{table: documents, column: data, reason: moved to S3, compared by
+file set stored-files}`) keeps the reconciliation from reporting it as missing.
+
+## SQLite sources
+
+An application that keeps its data in a SQLite file has no server to connect to: the
+source is a copy of the file, `{engine: sqlite, path: s3://BUCKET/inputs/app.db}` (or a
+path on the instance). Take the copy once the application stopped writing, with
+`litestream restore` where Litestream replicates it, `sqlite3 app.db ".backup copy.db"`, or
+`VACUUM INTO`; never copy the file of a running application, which can leave out what is
+still in its write-ahead log. Put it in the deployment's bucket, which the instance role
+reads. Liftproof downloads it once (kept under the object's ETag), checks it is a SQLite
+file, and opens it read only and immutable, so it is one consistent state; `doctor` runs
+`PRAGMA quick_check` on it. Its SHA-256 is the baseline's consistency position, and
+`source.sha256` can pin the file a project must read. SQLite is a source only, its tables
+are in schema `main` (mapped onto the target's home schema), and the source protections do
+not apply: nothing is read from the application.
+
+SQLite's internal tables, Litestream's (`_litestream_seq`, `_litestream_lock`), virtual
+tables (full text search) and their shadow tables are not compared: the application or
+Litestream derives them. SQLite types are loose, so each column is typed by its declared
+type and else by its type affinity, and is compared as its target column's type where that
+is one the type map allows (docs/canonical-v1.md, SQLite): a TEXT column of ISO 8601 times
+against a timestamptz, an INTEGER of 0 and 1 against a boolean, an INTEGER of Unix
+milliseconds against a timestamp. Each table with such a column gets a notice naming them.
+A value that does not parse as its column's type leaves the column out, reported as not
+checked.
+
+A baseline is taken before the target exists, under SQLite's own types. Against the
+target, a table whose columns are then compared as the target's types is hashed again from
+the file, which is cheap and puts no load on anything; `validate` reads the file again from
+`source.path`, and only when it is the file the baseline was taken of (the same SHA-256).
+Another file is not used: the run compares against the baseline alone, with a notice, and
+such tables are not checked.
 
 ## Scheduled and pipeline runs
 

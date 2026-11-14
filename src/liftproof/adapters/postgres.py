@@ -528,6 +528,13 @@ class PostgresAdapter(Adapter):
             cur.execute(q)
             yield from self.pacer.each(cur)
 
+    def _cursor_rows(self, q: str, batch: int) -> Iterator[tuple[Any, ...]]:
+        # a server side cursor: a table of files is never fetched whole
+        with self.conn.transaction(), self.conn.cursor(name="liftproof_rows") as cur:
+            cur.itersize = batch
+            cur.execute(q)
+            yield from cur
+
     def _bucket_aggregates_fallback(self, plan: HashPlan) -> dict[int, BucketAggregate]:
         hasher = RowHasher(plan.columns, plan.key_positions, plan.precision)
         sample = None if plan.sample is None else set(plan.sample)

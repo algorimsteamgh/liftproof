@@ -119,6 +119,37 @@ def map_types(
     return replace(schema, columns=columns), overridden
 
 
+# Engines whose columns are compared as their target column's type when the type map lists
+# it as an alternative: their values are parsed and hashed application side, so any of
+# them renders alike (SQLite, whose declared types are loose).
+ADOPTS_TARGET_TYPES = frozenset({"sqlite"})
+
+
+def adopt_target_types(
+    schema: TableSchema, target: TableSchema, engine: str, type_map: TypeMap
+) -> tuple[TableSchema, list[TypeOverride]]:
+    """The source schema with each column whose target column has another canonical type,
+    one its native type may be compared as, typed as the target's; and those columns. A
+    pair the map already compares as one (char and text) is left to it."""
+    if engine not in ADOPTS_TARGET_TYPES:
+        return schema, []
+    columns, adopted = [], []
+    for c in schema.columns:
+        t = target.column(c.name)
+        if (
+            t is not None
+            and t.canonical != c.canonical
+            and t.canonical is not CanonicalType.UNSUPPORTED
+            and type_map.common(c.canonical, t.canonical) is None
+            and type_map.allows(engine, c.native_type, t.canonical)
+        ):
+            adopted.append(TypeOverride(c.name, "source", c.native_type or "(no type)",
+                                        str(t.canonical), str(c.canonical)))  # fmt: skip
+            c = replace(c, canonical=t.canonical)
+        columns.append(c)
+    return replace(schema, columns=columns), adopted
+
+
 def canonical_order(names: list[str]) -> list[str]:
     return sorted(names, key=lambda n: n.lower().encode("utf-8"))
 

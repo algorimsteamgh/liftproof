@@ -37,6 +37,7 @@ from liftproof.reconcile.plan import (
     NOT_IN_BASELINE,
     IgnoreRule,
     TablePlan,
+    adopt_target_types,
     map_types,
     plan_table,
     row_filter,
@@ -497,6 +498,10 @@ class Reconciler:
             with self.source.pacer.statement() as counted:
                 source_rows = counted.rows = self.source.row_count(table)
         overridden = s_over + t_over
+        # a loosely typed source (SQLite) is compared as the target's types where it may be
+        engine = self.baseline.engine if base_entry is not None else self.source.engine
+        sschema, adopted = adopt_target_types(sschema, tschema, engine, tm)
+        retyped |= {o.column.lower() for o in adopted} if base_entry is not None else set()
 
         tp: TablePlan = plan_table(
             sschema,
@@ -561,6 +566,15 @@ class Reconciler:
                     for o in overridden
                 ),
                 detail={"type_map": [asdict(o) for o in overridden]},
+            )
+        if adopted:
+            self.emit(
+                Kind.NOTICE,
+                Severity.INFO,
+                q,
+                f"{engine} columns compared as the target's types: "
+                + ", ".join(f"{o.column} ({o.native} as {o.canonical})" for o in adopted),
+                detail={"adopted_types": [asdict(o) for o in adopted]},
             )
         res.structure_differences = self._structure(q, sschema, tschema)
         if tp.partial:

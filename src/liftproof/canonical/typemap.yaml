@@ -11,7 +11,7 @@
 # differ by just that.
 #
 # Change any entry, alternative or compatible pair, and raise version.
-version: "1.0"
+version: "1.1"
 
 engines:
   postgresql:
@@ -130,6 +130,32 @@ engines:
     uniqueidentifier: uuid
     json: json  # SQL Server 2025 and Azure SQL
     xml: xml
+
+  # SQLite (a source only): a column is looked up by its declared type, then by its type
+  # affinity (sqlite.org/datatype3.html), as "affinity <name>". Values are parsed and hashed
+  # application side, so every alternative renders alike by construction; a column is
+  # compared as its target column's type when that is one of them (docs/canonical-v1.md).
+  sqlite:
+    affinity integer:
+      {canonical: integer, also: [boolean, decimal, float, date, timestamp, timestamptz]}
+    affinity text:
+      canonical: text
+      also: [integer, decimal, boolean, date, time, timestamp, timestamptz, uuid, json]
+    affinity blob:
+      canonical: binary
+      also: [text, integer, decimal, boolean, date, time, timestamp, timestamptz, uuid, json]
+    affinity real: {canonical: float, also: [decimal]}
+    affinity numeric:
+      canonical: decimal
+      also: [integer, float, boolean, date, time, timestamp, timestamptz, text]
+    boolean: {canonical: boolean, also: [integer]}
+    bool: {canonical: boolean, also: [integer]}
+    date: {canonical: date, also: [timestamp, timestamptz, text]}
+    datetime: {canonical: timestamp, also: [timestamptz, date, text]}
+    timestamp: {canonical: timestamp, also: [timestamptz, date, text]}
+    time: {canonical: time, also: [text]}
+    json: {canonical: json, also: [text]}
+    uuid: {canonical: uuid, also: [text, binary]}
 
 compatible:
   # the strip rule only applies when both sides are fixed width

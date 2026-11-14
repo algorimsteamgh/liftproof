@@ -66,8 +66,9 @@ MySQL sessions pin `time_zone='+00:00'`, `sql_mode='NO_ENGINE_SUBSTITUTION'` (so
 
 Mapping a native type to a canonical type is a policy, not a fact (spec 9.13: `NUMBER(10,0)`
 to integer, `tinyint(1)` to boolean). The mapping lives in
-`src/liftproof/canonical/typemap.yaml`, version 1.0, shipped with the package; the engine
-tables below are its defaults, which reproduce the mapping of the builds before it.
+`src/liftproof/canonical/typemap.yaml`, version 1.1, shipped with the package; the engine
+tables below are its defaults, which reproduce the mapping of the builds before it. Version
+1.1 adds SQLite and changes nothing for the other engines: their fingerprints are 1.0's.
 
 - **Lookup.** A native type, as each adapter reads it and the report shows it, is looked up
   by its keys, most specific first, each lower case with single spaces and none between
@@ -294,6 +295,62 @@ row is hashed application side; the two are summed.
 
 The default schema is `dbo`; a SQL Server `dbo` maps onto PostgreSQL `public` (or the MySQL
 database) unless `database.schema_map` says otherwise.
+
+### SQLite type mapping and engine specific rules
+
+SQLite (a source only, read from a copy of its file) stores any value in any column, so a
+column is looked up by its declared type, lower cased, then without its arguments, then by
+its type affinity as `affinity <name>` (sqlite.org/datatype3.html, 3.1: `INT` anywhere is
+integer; `CHAR`, `CLOB` or `TEXT` is text; `BLOB` or no type is blob; `REAL`, `FLOA` or
+`DOUB` is real; anything else is numeric). Every row is hashed application side, by the
+reference implementation, after each stored value (NULL, integer, real, text or blob) is
+parsed as its column's canonical type.
+
+| SQLite key | Canonical | Alternatives |
+|---|---|---|
+| affinity integer (INTEGER, INT, BIGINT...) | integer | boolean, decimal, float, date, timestamp, timestamptz |
+| affinity text (TEXT, VARCHAR(n), CHAR(n), CLOB) | text | integer, decimal, boolean, date, time, timestamp, timestamptz, uuid, json |
+| affinity blob (BLOB, no type) | binary | text, integer, decimal, boolean, date, time, timestamp, timestamptz, uuid, json |
+| affinity real (REAL, DOUBLE, FLOAT) | float | decimal |
+| affinity numeric (NUMERIC, DECIMAL(p,s), anything else) | decimal | integer, float, boolean, date, time, timestamp, timestamptz, text |
+| boolean, bool | boolean | integer |
+| date | date | timestamp, timestamptz, text |
+| datetime, timestamp | timestamp | timestamptz, date, text |
+| time | time | text |
+| json | json | text |
+| uuid | uuid | text, binary |
+
+**Compared as the target's type.** Against a target, a SQLite column whose target column
+has another canonical type, one its entry lists, is compared as that type (a pair the map
+already compares as one, char with text, is left to it). The report notes each such column
+per table, as `<column> (<native type> as <type>)`. A project's `database.type_map: {sqlite:
+...}` sets a default before that, for a baseline taken without a target.
+
+**Parsing.** Each rule is the value an application most likely meant; one that does not
+apply raises, and the column is left out as not checked.
+
+- integer: an integer, a real with no fraction, or text of digits.
+- decimal: an integer, a real (its shortest repr: `0.1` is `0.1`) or numeric text.
+- boolean: a number (0 is false, any other true), or `1`, `true`, `t`, `yes`, `y` and `0`,
+  `false`, `f`, `no`, `n` in any case.
+- timestamp, timestamptz and date: ISO 8601 text as `datetime.fromisoformat` reads it
+  (SQLite's `YYYY-MM-DD HH:MM:SS[.SSS]`, JavaScript's `toISOString`, with `Z` or an
+  offset), or Unix time as a number or text of digits: seconds, or milliseconds from
+  100,000,000,000 on (a value of seconds that large is after the year 5000). For
+  timestamptz, text without a zone is UTC, as SQLite's `CURRENT_TIMESTAMP` writes it; for
+  timestamp, a zone given (or Unix time) is converted to UTC and dropped. For date, a value
+  with a time of day other than midnight renders as a naive timestamp, which no date equals.
+- time: `HH:MM`, `HH:MM:SS` or with a fraction.
+- uuid: text in any case, or a 16 byte blob. json: text parsed as JSON (a number is
+  itself). text: text, a blob decoded as UTF-8, a number as written. binary: a blob, or
+  text as its UTF-8 bytes.
+
+Floats are compared statistically, as on every engine; SQLite stores no NaN.
+
+**Keys.** A primary key column is NOT NULL in every target, so it is recorded as not
+nullable; a NULL in one (SQLite allows it outside an INTEGER PRIMARY KEY) shows up as a row
+difference. Indexes are B-trees, partial or over expressions; foreign keys name their
+columns, and a `REFERENCES t` without columns refers to t's primary key.
 
 ## 3. Framing and hashing
 

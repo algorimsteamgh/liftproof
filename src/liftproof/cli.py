@@ -105,6 +105,10 @@ def _sslrootcert(conn: Connection) -> str | None:
 
 
 def connect(conn: Connection) -> Adapter:
+    if conn.is_file:
+        from liftproof.adapters.sqlite import SQLiteAdapter
+
+        return SQLiteAdapter(path=conn.path or "", sha256=conn.sha256)
     creds = from_secrets_manager(conn.secret_arn) if conn.secret_arn else None
     cls = {"mysql": MySQLAdapter, "oracle": OracleAdapter, "sqlserver": SQLServerAdapter}.get(
         conn.engine, PostgresAdapter
@@ -399,6 +403,7 @@ def _reconcile_into(
                 if baseline is None:
                     raise
                 log.warning("source unreachable; comparing against the baseline only")
+            source = _same_file(source, baseline, writer)
         for conn in (src_conn, tgt_conn) if not resuming else ():  # written the first time
             if not conn.tls_verified:
                 writer.write(
@@ -449,6 +454,30 @@ def _reconcile_into(
                 a.close()
 
 
+def _same_file(source: Adapter | None, baseline, writer: FindingWriter) -> Adapter | None:
+    """A database file is the source only when it is the file the baseline was taken of:
+    another one would re-hash tables against a state the baseline never saw."""
+    if source is None or baseline is None or getattr(source, "sha256", None) is None:
+        return source
+    taken = baseline.position.get("position") if baseline.position.get("type") == "file" else None
+    if taken is None or taken == f"sha256:{source.sha256}":
+        return source
+    source.close()
+    writer.write(
+        Finding(
+            Comparator.DATABASE,
+            Kind.NOTICE,
+            Severity.MEDIUM,
+            source.describe_location(),
+            "the source file is not the one the baseline was taken of; compared against the "
+            "baseline only",
+            detail={"baseline_file": taken, "source_file": f"sha256:{source.sha256}"},
+        )
+    )
+    log.warning("source file differs from the baseline's; comparing against the baseline only")
+    return None
+
+
 def _without_replay_rows(o, store: Store, workdir: Path, target: Adapter, baseline):
     """The options with the rows earlier replays created left out on the target."""
     from dataclasses import replace
@@ -497,7 +526,6 @@ def _files_into(args: argparse.Namespace, project: Project, writer: FindingWrite
     from dataclasses import replace
 
     from liftproof.files.compare import compare_files
-    from liftproof.files.sources import open_source
 
     sets = project.require_files()
     wanted = [x.strip() for x in (getattr(args, "sets", None) or "").split(",") if x.strip()]
@@ -509,14 +537,35 @@ def _files_into(args: argparse.Namespace, project: Project, writer: FindingWrite
     if getattr(args, "show_values", False):
         sets = [replace(c, show_content=True) for c in sets]
 
-    def side(c, which: str):
+    return compare_files(sets, writer.write, lambda c, which: _file_side(project, c, which))
+
+
+def _file_side(project: Project, c, which: str):
+    """One side of a file set: a location, or the files a table of the project's source or
+    target database holds, read through its read only connection."""
+    from liftproof.files.rows import open_rows
+    from liftproof.files.sources import open_source
+
+    rows = getattr(c, f"{which}_rows")
+    if rows is None:
         return open_source(
             getattr(c, which),
             endpoint_url=getattr(c, f"{which}_endpoint_url"),
             secret_arn=getattr(c, f"{which}_secret_arn"),
+            kind=getattr(c, f"{which}_kind"),
         )
 
-    return compare_files(sets, writer.write, side)
+    def opened(database: str):
+        conn = project.source if database == "source" else project.target
+        if conn is None:
+            raise ConfigError(f"file set {c.name}: the project has no {database} database")
+        o = project.database
+        home = o.schemas[0] if o.schemas else "public"
+        if database == "target":
+            home = o.schema_map.get(home, home)
+        return connect(conn), home
+
+    return open_rows(rows, opened)
 
 
 def _locked(args, project: Project, store: Store, run_id: str, mode: str, body) -> int:
@@ -1611,6 +1660,21 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
                 lambda c=conn: from_secrets_manager(c.secret_arn) and c.secret_arn,
                 "grant secretsmanager:GetSecretValue on the secret and kms:Decrypt on its key",
             )
+        if conn.is_file:
+
+            def _file_check(c=conn):
+                with connect(c) as a:
+                    tables = a.list_tables(project.database.schemas)
+                    return (f"{c.describe()}: {a.product} {a.version}, {a.probe()}, "
+                            f"{len(tables)} tables, sha256 {a.sha256}")  # fmt: skip
+
+            check(
+                f"{role} database file",
+                _file_check,
+                "upload a copy restored once the application stopped writing (litestream "
+                "restore, or sqlite3 .backup) and set source.path to it",
+            )
+            continue
         check(
             f"{role} TLS verifies the server certificate",
             lambda c=conn: (
@@ -1756,25 +1820,23 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
         for which in ("source", "target"):
 
             def _listing(c=fs, w=which):
-                from liftproof.files.sources import open_source
-
-                src = open_source(
-                    getattr(c, w),
-                    endpoint_url=getattr(c, f"{w}_endpoint_url"),
-                    secret_arn=getattr(c, f"{w}_secret_arn"),
-                )
+                src = _file_side(project, c, w)
                 n = 0
-                for _ in src.entries():
-                    n += 1
-                    if n >= 1000:
-                        break
+                try:
+                    for _ in src.entries():
+                        n += 1
+                        if n >= 1000:
+                            break
+                finally:
+                    getattr(src, "close", lambda: None)()
                 return f"{src.describe()}: {n if n < 1000 else '1000+'} file(s) listed"
 
             check(
                 f"file set {fs.name} {which} readable",
                 _listing,
-                "mount the share on the instance read only, or grant s3:ListBucket and "
-                "s3:GetObject on the prefix to the instance role",
+                "mount the share on the instance read only, grant s3:ListBucket and "
+                "s3:GetObject on the prefix to the instance role, give an Azure SAS token "
+                "with Read and List, or check the table and columns a database side names",
             )
     if isinstance(store, S3Store):  # the project's bucket, or the deployment's
 

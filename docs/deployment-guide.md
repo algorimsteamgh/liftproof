@@ -49,7 +49,12 @@ reliability design (section 9).
 
 Liftproof supports PostgreSQL 13 and later, MySQL 8.0 and later (including Aurora MySQL
 3), Oracle 19c and later, and SQL Server 2016 and later, on premises or on Amazon RDS and
-Aurora. Older engines are refused when Liftproof connects.
+Aurora. Older engines are refused when Liftproof connects. A SQLite database can be the
+source: upload a copy of its file, taken once the application stopped writing, to the
+deployment's bucket and set `source.path` to it (README, SQLite sources); no network route
+to the application is needed for it. Files can be read from Azure Blob Storage with a SAS
+token kept in Secrets Manager, which needs outbound HTTPS from the instance to the storage
+account (ApplicationCidrs).
 
 ## 3. Choosing an instance size
 
