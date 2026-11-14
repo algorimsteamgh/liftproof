@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 from typing import Any
@@ -99,9 +101,41 @@ CA_BUNDLE = Path(os.environ.get("LIFTPROOF_CA_BUNDLE", "/opt/mvt/certs/ca-bundle
 
 
 def _sslrootcert(conn: Connection) -> str | None:
+    if conn.sslrootcert and conn.sslrootcert.startswith("s3://"):
+        return str(_certificate_from_s3(conn.sslrootcert))
     if conn.sslrootcert or not conn.tls_verified:
         return conn.sslrootcert
     return str(CA_BUNDLE) if CA_BUNDLE.is_file() else None
+
+
+MAX_CA_BYTES = 1 << 20
+
+
+def _certificate_from_s3(location: str) -> Path:
+    """A private CA's certificate (a Cloud SQL instance's server CA, say) kept in the
+    project's bucket, so that no one needs a shell on the instance to put it there: read
+    with the instance role, checked to be PEM certificates, kept in a private file."""
+    bucket, _, key = location[len("s3://") :].partition("/")
+    if not bucket or not key:
+        raise ConfigError(f"sslrootcert {location}: give s3://bucket/key of the PEM file")
+    try:
+        obj = aws.client("s3").get_object(Bucket=bucket, Key=key)
+        data = obj["Body"].read(MAX_CA_BYTES + 1)
+    except Exception as exc:  # noqa: BLE001 - the SDK's errors, said in one line
+        raise ConfigError(f"sslrootcert {location}: cannot read it: {exc}") from None
+    if len(data) > MAX_CA_BYTES or b"-----BEGIN CERTIFICATE-----" not in data:
+        raise ConfigError(
+            f"sslrootcert {location}: not a PEM certificate file (-----BEGIN CERTIFICATE-----)"
+        )
+    folder = Path(os.environ.get("LIFTPROOF_CACHE") or tempfile.gettempdir()) / "liftproof-certs"
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    dest = folder / f"{hashlib.sha256(data).hexdigest()[:24]}.pem"
+    if not dest.is_file():
+        part = dest.with_suffix(".part")
+        part.write_bytes(data)
+        part.chmod(0o600)
+        part.replace(dest)
+    return dest
 
 
 def connect(conn: Connection) -> Adapter:
@@ -113,7 +147,9 @@ def connect(conn: Connection) -> Adapter:
     cls = {"mysql": MySQLAdapter, "oracle": OracleAdapter, "sqlserver": SQLServerAdapter}.get(
         conn.engine, PostgresAdapter
     )
+    extra = {"hostaddr": conn.hostaddr} if conn.hostaddr else {}
     return cls(
+        **extra,
         host=conn.host,
         port=conn.port,
         database=conn.database,
@@ -1821,15 +1857,17 @@ def _doctor_checks(args: argparse.Namespace, project: Project) -> list[dict[str,
 
             def _listing(c=fs, w=which):
                 src = _file_side(project, c, w)
+                # a database side reads each file (or looks each object up): a sample will do
+                most = 50 if getattr(c, f"{w}_rows") is not None else 1000
                 n = 0
                 try:
                     for _ in src.entries():
                         n += 1
-                        if n >= 1000:
+                        if n >= most:
                             break
                 finally:
                     getattr(src, "close", lambda: None)()
-                return f"{src.describe()}: {n if n < 1000 else '1000+'} file(s) listed"
+                return f"{src.describe()}: {n if n < most else f'{most}+'} file(s) listed"
 
             check(
                 f"file set {fs.name} {which} readable",

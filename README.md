@@ -241,6 +241,19 @@ The report's journey table counts the pages compared each way. Replay and `bind`
 the journey from the bucket, so one recorded again on another machine replaces the
 instance's copy, and a replay deletes the instance's copies of what the bucket has expired.
 
+A link to a file in an object store is signed (Amazon S3, CloudFront, Google Cloud
+Storage, an Azure SAS): its signature and expiry change with every answer, and its host
+with the store the file moved to. Wherever one appears, in a kept body or a page, it is
+compared as `<signed link>`; the file it opens is compared by a file set.
+
+A sign in with a one time code sent by SMS or email cannot replay the code recording saw.
+Fields named like `otp`, `code` or `pin` (or marked `data-liftproof-sensitive`) are
+recorded as tokens like passwords; give the target application a test account whose code
+is fixed and sends no message, put that code in a secret and `bind` the token to it, so
+replay signs in with it. Recording signs in on the source with a real code. Messages a
+page exchanges over a WebSocket (a chat) are not compared as API calls; what they put on
+the page is, through the page comparison.
+
 Parts of a page expected to differ (a greeting with the user's name, recently viewed
 items, an advert) are left out with `web.ignore_regions`: a CSS selector and a reason,
 which the report prints, such as `{selector: ".recently-viewed", reason: personalised}`,
@@ -268,7 +281,12 @@ line, or row and column. What the text says stays out of the report unless the s
 `show_content: true`. `validate` compares files after reconciling and before replaying.
 A bucket in AWS is read with the instance role. An S3 compatible store outside AWS is
 given as `{location: s3://..., endpoint_url: https://..., secret_arn: ...}`, with its
-access key pair in that secret (keys `access_key_id` and `secret_access_key`).
+access key pair in that secret (keys `access_key_id` and `secret_access_key`). Google
+Cloud Storage is one: `{location: s3://BUCKET/prefix, endpoint_url:
+https://storage.googleapis.com, secret_arn: ...}`, with an HMAC key of a service account
+that can read the bucket (Cloud Storage, Settings, Interoperability). Such stores are
+listed with the first version of the S3 listing, addressed by path, signed for us-east-1
+and sent no checksums the API does not require, which every one of them accepts.
 
 A file set side can also be an Azure Blob Storage container, or a prefix in it, given by
 its URL: `{location: https://ACCOUNT.blob.core.windows.net/CONTAINER/prefix, secret_arn:
@@ -291,6 +309,21 @@ connection (`source` or `target`) and spooled to a private temporary directory w
 set is compared. The column that held the files is usually gone from the target table: an
 ignore rule for it (`{table: documents, column: data, reason: moved to S3, compared by
 file set stored-files}`) keeps the reconciliation from reporting it as missing.
+
+Where the rows name their files instead (a key or URL column, the files in an object
+store), `object` takes the place of `content`: the template of the location each row
+names, `{database: target, table: candidates, object: "s3://cv-bucket/{cv_key}", path:
+"{id}"}`. A location is `s3://bucket/key`, `gs://bucket/key` (with the Google Cloud
+Storage `endpoint_url` and `secret_arn` above), an object's https URL (Amazon S3 in either
+style, storage.googleapis.com, or an Azure blob, with `secret_arn` and, where the URL is
+not on blob.core.windows.net, `kind: azure_blob`), or an absolute path on the instance; a
+signed link's query string is not part of it. A column holding another URL, a CDN's,
+becomes one with `object_map: [regex, replacement]`, such as `["^https://cdn\\.example\\.com/([^?]*).*$",
+"s3://media-bucket/\\1"]`. With the source's rows on one side and the target's on the other,
+each record's file is compared across the move by the record's own path, whatever keys the
+migration gave the objects; each object is looked up on its own, and rows naming one that
+is not there are counted in a notice and reported missing. That also proves the target's
+rows point at real objects.
 
 ## SQLite sources
 

@@ -84,7 +84,11 @@ class FakeBlobService(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_HEAD(self):  # noqa: N802 - Get Blob Properties
+        self.do_GET()
 
 
 @pytest.fixture
@@ -297,7 +301,20 @@ def test_project_file_database_sides(tmp_path, docs_db, bucket_tree, capsys):
     assert json.loads(capsys.readouterr().out)["counts"]["files"] == 4
     for bad, says in [
         ({"database": "elsewhere"}, "database is source or target"),
-        ({"database": "source", "table": "t"}, "content, path required"),
+        ({"database": "source", "table": "t"}, "give content"),
+        ({"database": "source", "content": "c"}, "table, path required"),
+        ({"database": "source", "table": "t", "content": "c", "object": "s3://b/{k}",
+          "path": "{id}"}, "not both"),
+        ({"database": "source", "table": "t", "content": "c", "path": "{id}",
+          "object_map": ["a", "b"]}, "apply to object"),
+        ({"database": "source", "table": "t", "object": "s3://b/k", "path": "{id}"},
+         "object 's3://b/k' is not a template"),
+        ({"database": "source", "table": "t", "object": "{u}", "path": "{id}",
+          "object_map": ["(", "x"]}, "not a valid regular expression"),
+        ({"database": "source", "table": "t", "object": "{u}", "path": "{id}",
+          "kind": "azure_blob"}, "SAS token"),
+        ({"database": "source", "table": "t", "object": "s3://b/{k}", "path": "{id}",
+          "secret_arn": "arn:aws:secretsmanager:x"}, "instance role"),
         ({"database": "source", "table": "t", "content": "c", "path": "fixed"},
          "names no column"),
         ({"database": "source", "table": "t", "content": "c", "path": "{id}",
@@ -350,3 +367,188 @@ def test_files_in_a_sqlserver_table(make_sqlserver_db, sqlserver_adapter_for, bu
     src = open_rows(config, lambda database: (sqlserver_adapter_for(db), "dbo"))
     s, _ = _compare(src, bucket_tree)
     assert (s.files, s.matched) == (4, 4)
+
+
+# ------------------------------------------------- files a database row names by location
+CV_KEYS = {1: "cvs/7f3a.pdf", 2: "cvs/91bc.docx", 3: "cvs/0d2e.pdf", 4: "cvs/c4d1.txt"}
+
+
+@pytest.fixture
+def named_db(tmp_path):
+    """The target side after the move: each row names its file's object, under a key the
+    migration chose, not one the source's rows give."""
+    path = tmp_path / "target.db"
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE candidates (id INTEGER PRIMARY KEY, cv_key TEXT, cv_url TEXT)")
+    c.executemany("INSERT INTO candidates VALUES (?, ?, ?)", [
+        (i, k, f"https://cdn.example.com/{k}?Expires=1&Signature=abc&Key-Pair-Id=K")
+        for i, k in CV_KEYS.items()
+    ])  # fmt: skip
+    c.execute("INSERT INTO candidates VALUES (5, NULL, NULL)")
+    c.commit()
+    c.close()
+    return path
+
+
+def _named(db, obj, **kw):
+    config = RowFiles("target", "candidates", None, "{id}", object=obj, **kw)
+    return open_rows(config, lambda database: (SQLiteAdapter(path=str(db)), "main"))
+
+
+def _sides(source, target):
+    found = []
+    sets = [FileSetConfig("cvs", "source database", "target database")]
+    result = compare_files(sets, found.append, lambda c, w: source if w == "source" else target)
+    return result.sets[0], found
+
+
+def _put_objects(put):
+    data = {i: d for i, _, d in DOCS}
+    for i, key in CV_KEYS.items():
+        put(key, data[i])
+
+
+def test_files_a_row_names_are_compared_with_the_files_a_row_holds(docs_db, named_db,
+                                                                    tmp_path):  # fmt: skip
+    store = tmp_path / "store"
+    _put_objects(lambda k, d: ((store / k).parent.mkdir(parents=True, exist_ok=True),
+                               (store / k).write_bytes(d)))  # fmt: skip
+    src = _rows_source(docs_db, path="{id}", where="deleted = 0")
+    tgt = _named(named_db, f"{store}/{{cv_key}}")
+    s, found = _sides(src, tgt)
+    assert (s.files, s.matched, s.different, s.missing, s.extra) == (4, 4, 0, 0, 0)
+    notes = sorted(f.summary for f in found if f.kind == Kind.NOTICE)
+    assert any("1 row(s) of main.candidates name no file (cv_key is NULL" in n for n in notes)
+    assert not tgt._objects  # closed after the set
+
+    # a changed object, and a row that names one no longer there
+    (store / CV_KEYS[3]).write_bytes(b"%PDF-1.4 CHEN")
+    (store / CV_KEYS[2]).unlink()
+    s, found = _sides(_rows_source(docs_db, path="{id}", where="deleted = 0"),
+                      _named(named_db, f"{store}/{{cv_key}}"))  # fmt: skip
+    assert (s.matched, s.different, s.missing) == (2, 1, 1)
+    assert {f.object for f in found if f.kind == Kind.DIFFERENCE} == {"cvs:3", "cvs:2"}
+    assert any("1 row(s) of main.candidates name an object that does not exist: 2"
+               in f.summary for f in found if f.kind == Kind.NOTICE)  # fmt: skip
+
+
+def test_files_a_row_names_in_s3_by_key_or_by_url(docs_db, named_db, monkeypatch):
+    boto3 = pytest.importorskip("boto3")
+    moto = pytest.importorskip("moto")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    with moto.mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="lp-cvs")
+        _put_objects(lambda k, d: s3.put_object(Bucket="lp-cvs", Key=k, Body=d))
+        for obj, kw in [
+            ("s3://lp-cvs/{cv_key}", {}),
+            # a CDN link with its signature: object_map turns it into the object
+            ("{cv_url}", {"object_map": (r"^https://cdn\.example\.com/([^?]*).*$",
+                                         r"s3://lp-cvs/\1")}),
+            ("https://lp-cvs.s3.us-east-1.amazonaws.com/{cv_key}?X-Amz-Signature=1", {}),
+        ]:  # fmt: skip
+            src = _rows_source(docs_db, path="{id}", where="deleted = 0")
+            s, found = _sides(src, _named(named_db, obj, **kw))
+            assert (s.files, s.matched, s.missing) == (4, 4, 0), obj
+        s, found = _sides(_rows_source(docs_db, path="{id}", where="deleted = 0"),
+                          _named(named_db, "{cv_url}"))  # fmt: skip
+        assert {f.object for f in found if f.kind == Kind.NOT_CHECKED} >= {"cvs:1"}
+        assert any("turn the URL into one with object_map" in f.summary for f in found)
+
+
+def test_files_a_row_names_in_azure(docs_db, tmp_path, azure, monkeypatch):
+    monkeypatch.setattr("liftproof.credentials.secret_value", lambda arn, key: SAS)
+    db = tmp_path / "t.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE candidates (id INTEGER PRIMARY KEY, url TEXT)")
+    data = {i: d for i, _, d in DOCS}
+    FakeBlobService.blobs["cvs"] = {f"in/{i} cv.bin": d for i, d in data.items() if d}
+    c.executemany("INSERT INTO candidates VALUES (?, ?)",
+                  [(i, f"{azure}/cvs/in/{i}%20cv.bin") for i in (1, 2, 3, 4)])  # fmt: skip
+    c.commit()
+    c.close()
+    config = RowFiles("target", "candidates", None, "{id}", object="{url}",
+                      secret_arn="arn:aws:secretsmanager:x", kind="azure_blob")  # fmt: skip
+    tgt = open_rows(config, lambda database: (SQLiteAdapter(path=str(db)), "main"))
+    s, _ = _sides(_rows_source(docs_db, path="{id}", where="deleted = 0"), tgt)
+    assert (s.files, s.matched, s.missing) == (4, 4, 0)
+    assert sum(r.startswith("/cvs/in/") for r in FakeBlobService.requests) == 8  # HEAD + GET
+
+
+def test_split_location():
+    from liftproof.files.sources import split_location
+
+    assert split_location("s3://b/k/a?b#c.pdf") == ("s3://b", "k/a?b#c.pdf")
+    assert split_location("gs://b/m/x.jpg") == ("s3://b", "m/x.jpg")
+    assert split_location("https://b.s3.ap-south-1.amazonaws.com/cv/1.pdf?X-Amz-Signature=1"
+                          ) == ("s3://b", "cv/1.pdf")  # fmt: skip
+    assert split_location("https://s3.ap-south-1.amazonaws.com/b/cv/1.pdf") == (
+        "s3://b",
+        "cv/1.pdf",
+    )
+    assert split_location("https://storage.googleapis.com/bkt/m/x%20y.jpg?X-Goog-Signature=a"
+                          ) == ("s3://bkt", "m/x y.jpg")  # fmt: skip
+    assert split_location("https://acct.blob.core.windows.net/up/kyc/1.png?sv=1&sig=x") == (
+        "https://acct.blob.core.windows.net/up",
+        "kyc/1.png",
+    )
+    assert split_location("/data/x.pdf") == ("/", "data/x.pdf")
+    for bad in ("https://cdn.example.com/x", "x/y", "s3://b", "ftp://h/x"):
+        with pytest.raises(ConfigError):
+            split_location(bad)
+
+
+def test_project_file_object_side(tmp_path, docs_db):
+    p = tmp_path / "p.yaml"
+    p.write_text(yaml.safe_dump({
+        "project": "app",
+        "source": {"engine": "sqlite", "path": str(docs_db)},
+        "target": {"engine": "postgresql", "host": "h", "database": "d"},
+        "files": [{"name": "cvs",
+                   "source": {"database": "source", "table": "documents", "content": "data",
+                              "path": "{id}"},
+                   "target": {"database": "target", "table": "candidates", "path": "{id}",
+                              "object": "{cv_url}",
+                              "object_map": ["^https://cdn/", "s3://lp-cvs/"]}}],
+    }))  # fmt: skip
+    [fs] = load_project(p).files
+    assert fs.target_rows == RowFiles(
+        "target",
+        "candidates",
+        None,
+        "{id}",
+        object="{cv_url}",
+        object_map=("^https://cdn/", "s3://lp-cvs/"),
+    )
+
+
+# ------------------------------------------- S3 compatible stores (Google Cloud Storage)
+def test_a_store_outside_aws_is_listed_and_signed_as_they_all_accept():
+    from botocore.stub import Stubber
+
+    from liftproof import aws
+    from liftproof.files.sources import S3Source
+
+    c = aws.client(
+        "s3",
+        endpoint_url="https://storage.googleapis.com",
+        credentials={"aws_access_key_id": "GOOG1E", "aws_secret_access_key": "x"},
+    )
+    assert c.meta.region_name == aws.STORE_REGION
+    assert c.meta.config.s3["addressing_style"] == "path"
+    assert c.meta.config.request_checksum_calculation == "when_required"
+    assert c.meta.config.response_checksum_validation == "when_required"
+    src = S3Source("media", "m", endpoint_url="https://storage.googleapis.com", client=c)
+    with Stubber(c) as stub:
+        stub.add_response("list_objects", {"Contents": [{"Key": "m/a.jpg", "Size": 3}],
+                                           "IsTruncated": False},
+                          {"Bucket": "media", "Prefix": "m/"})  # fmt: skip
+        stub.add_client_error(
+            "head_object",
+            "404",
+            http_status_code=404,
+            expected_params={"Bucket": "media", "Key": "m/b.jpg"},
+        )
+        assert [(e.path, e.size) for e in src.entries()] == [("a.jpg", 3)]
+        assert src.stat("b.jpg") is None
+    assert aws.client("s3", "ap-south-1").meta.region_name == "ap-south-1"  # AWS: as given

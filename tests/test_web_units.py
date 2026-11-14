@@ -237,6 +237,28 @@ def test_default_volatile_values_and_ignore_rules():
     assert out == []
 
 
+def test_signed_links_are_compared_as_links():
+    """A file the application moved from Google Cloud Storage (or Azure, or one S3 bucket)
+    to S3 is linked to with a new host, path and signature on every answer."""
+    c, out = cmp()
+    gcs = (
+        "https://storage.googleapis.com/kisan-media/m/7.jpg?X-Goog-Algorithm=GOOG4-RSA-"
+        "SHA256&X-Goog-Date=20261114T101500Z&X-Goog-Expires=900&X-Goog-Signature=9f1c"
+    )
+    s3 = (
+        "https://media.s3.ap-south-1.amazonaws.com/m/7.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Date=20261120T080000Z&X-Amz-Signature=77ab"
+    )
+    azure = "https://acct.blob.core.windows.net/uploads/k/1.png?sv=2022-11-02&se=2026&sig=a%3D"
+    cf = "https://d1.cloudfront.net/k/1.png?Expires=1&Signature=a~b&Key-Pair-Id=K"
+    c.ui(f"- link: Photo /url: {gcs}", f"- link: Photo /url: {s3}", 1)
+    c._json("GET /a", {"photo": gcs, "kyc": azure}, {"photo": s3, "kyc": cf}, "$", 1)
+    assert out == []
+    c._json("GET /a", {"u": "https://x.example/a?design=1"},
+            {"u": "https://x.example/b?design=1"}, "$", 1)  # fmt: skip
+    assert len(out) == 1  # a plain link is still compared
+
+
 def test_values_hidden_unless_asked():
     c, out = cmp()
     c._json("GET /a", {"s": "secret-ish"}, {"s": "other"}, "$", 1)
@@ -1648,3 +1670,29 @@ def test_where_back_led_is_reported_without_secret_values():
         _navigate(step, "http://src", "http://t", {"@@REDACTED_1": "s3cret-pass"})
     assert (caught.value.expected, caught.value.actual) == ("/notes/@@REDACTED_1", "/orders/{id}")
     assert "s3cret-pass" not in str(caught.value)
+
+
+def test_one_time_code_fields_are_recorded_as_tokens(browser_available):
+    """capture.js marks a code field sensitive like a password, so the recording keeps a
+    token that `bind` points at the target test account's fixed code."""
+    from playwright.sync_api import sync_playwright
+
+    from liftproof.web.browser import launch
+    from liftproof.web.recorder import CAPTURE_JS
+
+    html = """<input name="otp"><input autocomplete="one-time-code" name="c1">
+    <input id="verificationCode"><input name="oneTimeCode"><input name="city">
+    <input type="password" name="x"><input name="postal" data-liftproof-sensitive>"""
+    events = []
+    with sync_playwright() as pw:
+        browser = launch(pw)
+        page = browser.new_page()
+        page.expose_function("__liftproofRecord", lambda ev: events.append(json.loads(ev)))
+        page.add_init_script(CAPTURE_JS)
+        page.route("http://app.test/", lambda r: r.fulfill(body=html, content_type="text/html"))
+        page.goto("http://app.test/")
+        for el in page.locator("input").all():
+            el.fill("482913")
+        browser.close()
+    fills = [e for e in events if e["action"] == "fill"]
+    assert [e["sensitive"] for e in fills] == [True, True, True, True, False, True, True]
