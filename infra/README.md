@@ -114,7 +114,9 @@ root). Terraform prints both, filled in, as `customer_key_policy_statements` in
     "Principal": {"Service": "logs.REGION.amazonaws.com"},
     "Action": ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
     "Resource": "*",
-    "Condition": {"ArnLike": {"kms:EncryptionContext:aws:logs:arn": "arn:aws:logs:REGION:ACCOUNT:log-group:/liftproof/NAME*"}}
+    "Condition": {"ArnLike": {"kms:EncryptionContext:aws:logs:arn": [
+      "arn:aws:logs:REGION:ACCOUNT:log-group:/liftproof/NAME*",
+      "arn:aws:logs:REGION:ACCOUNT:log-group:/aws/lambda/liftproof-NAME-*"]}}
   },
   {
     "Sid": "LiftproofInstanceRole",
