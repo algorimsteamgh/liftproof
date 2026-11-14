@@ -304,3 +304,24 @@ def test_run_document_runs_under_sh(template, tmp_path, params, expected):
     want = expected.format(**defaults).split(" ")
     want = [w.replace("|", " ") for w in want]  # "|" marks a space inside one argument
     assert out.stdout.splitlines() == want
+
+
+def test_the_key_lets_logs_encrypt_every_log_group_it_encrypts(template):
+    """CloudWatch Logs refuses to create a log group with a key whose policy does not name
+    it (the image lookup function's group failed the first launch in a real account)."""
+    allowed = template["Resources"]["Key"]["Properties"]["KeyPolicy"]["Statement"]
+    [logs] = [s for s in allowed if s.get("Sid") == "CloudWatchLogs"]
+    patterns = logs["Condition"]["ArnLike"]["kms:EncryptionContext:aws:logs:arn"]
+    patterns = [p["Fn::Sub"] for p in (patterns if isinstance(patterns, list) else [patterns])]
+    prefix = "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:"
+    groups = [r["Properties"]["LogGroupName"]["Fn::Sub"]
+              for r in template["Resources"].values()
+              if r["Type"] == "AWS::Logs::LogGroup" and "KmsKeyId" in r["Properties"]]  # fmt: skip
+    assert len(groups) >= 2
+    for name in groups:
+        arn = prefix + name.replace("${DeploymentName}", "smac")
+        assert any(
+            re.fullmatch(re.escape(p.replace("${DeploymentName}", "smac")).replace(r"\*", ".*"),
+                         arn)
+            for p in patterns
+        ), name

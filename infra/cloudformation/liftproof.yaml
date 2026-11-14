@@ -253,7 +253,10 @@ Resources:
             Resource: "*"
             Condition:
               ArnLike:
-                kms:EncryptionContext:aws:logs:arn: { "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/liftproof/${DeploymentName}*" }
+                # the product's log group, and the image lookup function's
+                kms:EncryptionContext:aws:logs:arn:
+                  - { "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/liftproof/${DeploymentName}*" }
+                  - { "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/liftproof-${DeploymentName}-*" }
       Tags:
         - { Key: liftproof:deployment, Value: { Ref: DeploymentName } }
         - { Key: liftproof:managed-by, Value: cloudformation }
