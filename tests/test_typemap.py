@@ -36,7 +36,7 @@ ADAPTER_MAPS = {
         "smallint": "integer", "integer": "integer", "bigint": "integer",
         "numeric": "decimal", "real": "float", "double precision": "float",
         "boolean": "boolean", "text": "text", "character varying": "text", "name": "text",
-        "citext": "text", "character": "char", "date": "date",
+        "citext": "text", "enum": "text", "character": "char", "date": "date",
         "time without time zone": "time", "timestamp without time zone": "timestamp",
         "timestamp with time zone": "timestamptz", "bytea": "binary", "uuid": "uuid",
         "json": "json", "jsonb": "json", "xml": "xml",
@@ -112,7 +112,15 @@ NATIVES = [
 ]
 
 # Every version shipped, and a digest of all it holds: alternatives and pairs included.
-SHIPPED = {"1.0": "46712c041b6b7042", "1.1": "dba7c3b071966821"}  # 1.1: SQLite
+SHIPPED = {
+    "1.0": "46712c041b6b7042",
+    "1.1": "dba7c3b071966821",  # SQLite
+    "1.2": "e80057867018c69e",  # PostgreSQL enum
+}
+
+
+# PostgreSQL's fingerprint since 1.2, which compares enum columns
+PG_FINGERPRINT = "433ceacf1949b400"
 
 
 def _digest(m: TypeMap) -> str:
@@ -159,9 +167,11 @@ def test_the_shipped_map_is_versioned():
     assert _digest(M) == SHIPPED.get(M.version), (
         "typemap.yaml changed: raise its version and add the new digest to SHIPPED"
     )
-    # what manifests from before the map was recorded were under: no later version changes
-    # how these engines compare, only adds engines
-    assert {e: M.fingerprint(e) for e in V1_FINGERPRINTS} == V1_FINGERPRINTS
+    # what manifests from before the map was recorded were under; later versions changed
+    # only PostgreSQL's (1.2: enum), besides adding engines
+    assert {e: M.fingerprint(e) for e in V1_FINGERPRINTS} == dict(
+        V1_FINGERPRINTS, postgresql=PG_FINGERPRINT
+    )
 
 
 def test_a_fingerprint_is_what_decides_one_engines_comparison():
@@ -206,13 +216,16 @@ def test_overrides():
 
     assert m.record("mysql")["overrides"] == {"mysql": {"tinyint": "decimal"}}
     assert M.record("postgresql", "mysql", "mysql") == {
-        "version": "1.1",
+        "version": "1.2",
+        "overrides": {},
+        "fingerprints": {"mysql": V1_FINGERPRINTS["mysql"], "postgresql": PG_FINGERPRINT},
+    }  # fmt: skip
+    assert legacy_record("mysql", "postgresql") == {
+        "version": "1.0",
         "overrides": {},
         "fingerprints": {"mysql": V1_FINGERPRINTS["mysql"],
                          "postgresql": V1_FINGERPRINTS["postgresql"]},
     }  # fmt: skip
-    assert legacy_record("mysql", "postgresql") == dict(M.record("mysql", "postgresql"),
-                                                        version="1.0")  # fmt: skip
 
 
 @pytest.mark.parametrize(
@@ -224,11 +237,11 @@ def test_overrides():
         ({"oracle": {"DATE": "date"}}, "neither the source nor the target is oracle"),
         ({"mysql": {"bool": "integer"}}, "database.type_map.mysql.bool: not a mysql type"),
         ({"mysql": {"datetime": "date"}},
-         "mysql.datetime: datetime is compared as timestamp or timestamptz in type map 1.1, "
+         "mysql.datetime: datetime is compared as timestamp or timestamptz in type map 1.2, "
          "not date"),
-        ({"mysql": {"tinyint(1)": "bool"}}, "boolean or integer in type map 1.1, not bool"),
+        ({"mysql": {"tinyint(1)": "bool"}}, "boolean or integer in type map 1.2, not bool"),
         # columns are left out by ignore rules, which carry a reason (spec 9.12)
-        ({"mysql": {"json": "unsupported"}}, "json is compared as json in type map 1.1"),
+        ({"mysql": {"json": "unsupported"}}, "json is compared as json in type map 1.2"),
         ({"postgresql": {"boolean": "integer"}}, "boolean is compared as boolean in type map"),
         ({"mysql": {"tinyint(1)": None}}, "not None"),
     ],

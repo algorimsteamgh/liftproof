@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, replace
 
-from liftproof.adapters.base import HashPlan, TableSchema
+from liftproof.adapters.base import Column, HashPlan, TableSchema
 from liftproof.canonical import CanonicalType
 from liftproof.canonical.typemap import DEFAULT_TYPE_MAP, TypeMap
 
@@ -150,6 +150,22 @@ def adopt_target_types(
     return replace(schema, columns=columns), adopted
 
 
+REASON_ENUM = (
+    "the baseline was taken before enum columns were compared (canonical revision 3); "
+    "take it again to compare this column"
+)
+
+
+def _enum_before_revision_3(col: Column, tcol: Column) -> bool:
+    """A PostgreSQL enum column of a baseline from before revision 3, which recorded the
+    bare type name, unsupported, against the enum the adapter now describes: not hashed
+    then, so not compared until the baseline is taken again, and no type change."""
+    return (
+        col.canonical is CanonicalType.UNSUPPORTED
+        and tcol.native_type.lower() == f"enum({col.native_type.lower()})"
+    )
+
+
 def canonical_order(names: list[str]) -> list[str]:
     return sorted(names, key=lambda n: n.lower().encode("utf-8"))
 
@@ -202,6 +218,17 @@ def plan_table(
                         "missing_in_target",
                         "column exists on the source only",
                         col.native_type,
+                    )
+                )
+                continue
+            if tcol.canonical != ctype and _enum_before_revision_3(col, tcol):
+                issues.append(
+                    ColumnIssue(
+                        col.name,
+                        NOT_IN_BASELINE,
+                        REASON_ENUM,
+                        col.native_type,
+                        tcol.native_type,
                     )
                 )
                 continue

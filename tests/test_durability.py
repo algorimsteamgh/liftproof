@@ -244,17 +244,22 @@ def test_a_resume_under_another_type_map_is_refused(tmp_path, project, monkeypat
     key = "acme/runs/r5/progress.json"
     saved = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
     assert saved["type_map"] == DEFAULT_TYPE_MAP.record("postgresql")
+    current = saved["type_map"]
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(dict(saved, type_map=OTHER_MAP)))
     monkeypatch.setattr(Reconciler, "_table", original)
     capsys.readouterr()
     code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
     assert code == EXIT_CONFIG
     assert (
-        "started under type map 1.0 with postgresql x as y, not type map 1.1 without "
+        "started under type map 1.0 with postgresql x as y, not type map 1.2 without "
         "overrides" in capsys.readouterr().err
     )
     del saved["type_map"]  # as a build from before the map was kept left it: the 1.0 defaults
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(saved).encode())
+    code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
+    assert code == EXIT_CONFIG  # PostgreSQL compares enum columns since type map 1.2
+    assert "started under type map 1.0 without overrides" in capsys.readouterr().err
+    s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(saved | {"type_map": current}).encode())
     code = _main("reconcile", "--project", str(project), "--workdir", str(work), "--resume")
     assert code == EXIT_DIFFERENCES
 
@@ -283,11 +288,19 @@ def test_a_baseline_resumes_under_its_type_map_only(tmp_path, project, monkeypat
     assert "baseline b9 was started under type map 1.0 with postgresql x as y" in (
         capsys.readouterr().err
     )
+    current = saved["type_map"]
     del saved["type_map"]  # as a build from before the map was kept left it
     s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(saved).encode())
+    assert _main("baseline", "--project", str(project), "--workdir", str(work),
+                 "--resume") == EXIT_CONFIG  # fmt: skip
+    assert legacy_record("postgresql") != current  # PostgreSQL enum columns, type map 1.2
+    assert "baseline b9 was started under type map 1.0 without overrides" in (
+        capsys.readouterr().err
+    )
+    s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(saved | {"type_map": current}).encode())
     assert _main("baseline", "--project", str(project), "--workdir", str(work), "--resume") == 0
     manifest = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
-    assert manifest["complete"] and manifest["type_map"] == legacy_record("postgresql")
+    assert manifest["complete"] and manifest["type_map"] == current
 
 
 def test_baseline_resumes_on_a_replacement_instance(tmp_path, project, monkeypatch, s3):

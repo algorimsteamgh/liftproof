@@ -36,7 +36,8 @@ CANONICAL_VERSION = "1.0"
 # revision of each table it holds.
 #   1: PostgreSQL infinity and -infinity dates and timestamps
 #   2: XML columns (PostgreSQL xml, Oracle XMLTYPE, SQL Server xml)
-CANONICAL_REVISION = 2
+#   3: PostgreSQL enum columns, as their label text
+CANONICAL_REVISION = 3
 HASH_ALGORITHM = "md5"
 GROUP_SIZE = 32
 MOD64 = 1 << 64

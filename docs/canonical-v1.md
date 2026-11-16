@@ -27,6 +27,7 @@ compared. Builds from before revisions do not read the field.
 |---|---|---|
 | 1 | PostgreSQL `infinity` and `-infinity` dates and timestamps (below) | it is not PostgreSQL, it has no date or timestamp column, its data ranges cover every one (reading the range of a column holding infinity failed then), or it has a JSON column (it was hashed application side, and loading infinity failed then) |
 | 2 | XML columns: PostgreSQL `xml`, Oracle `XMLTYPE`, SQL Server `xml` (below) | always; its XML columns, which it recorded as unsupported, are reported not checked (`not_in_baseline`) until the baseline is taken again |
+| 3 | PostgreSQL enum columns, as their label text (below) | always; its enum columns, which it recorded as unsupported under the type's bare name, are reported not checked (`not_in_baseline`) until the baseline is taken again |
 
 ## 1. Columns
 
@@ -178,6 +179,13 @@ migration that mapped an open ended date to NULL or to a sentinel such as `9999-
 reports each such row as a changed value; ignore the column if that mapping is intended.
 The pushdown is `coalesce(<finite rendering>, c::text)`: `to_char` gives NULL for both
 words, and their text form does not depend on `DateStyle`.
+
+A PostgreSQL enum column (a `CREATE TYPE ... AS ENUM` type) is described as `enum(<type>)`
+and compared as text: its label, `c::text`, exactly as written (revision 3). Its sort
+order, the order the labels were declared in, plays no part, since keys are compared and
+bucketed by their rendering. So an enum on one side and text or varchar on the other with
+the same labels match, and a label renamed in the migration is a changed value. Other user
+defined types (domains, composites, ranges) are still unsupported.
 
 A database whose server encoding is not UTF8 (LATIN1, WIN1252) has no `normalize()`, and
 `md5` there would hash its own bytes. Its text and char columns are read through the UTF8

@@ -11,7 +11,7 @@
 # differ by just that.
 #
 # Change any entry, alternative or compatible pair, and raise version.
-version: "1.1"
+version: "1.2"
 
 engines:
   postgresql:
@@ -26,6 +26,7 @@ engines:
     character varying: text
     name: text
     citext: text
+    enum: text
     character: char
     date: date
     time without time zone: time
