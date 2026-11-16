@@ -398,14 +398,18 @@ class PostgresAdapter(Adapter):
     def describe(self, table: TableRef) -> TableSchema:
         with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT column_name, data_type, udt_name, is_nullable "
-                "FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+                "SELECT c.column_name, c.data_type, c.udt_name, c.is_nullable, t.typtype "
+                "FROM information_schema.columns c "
+                "LEFT JOIN pg_namespace n ON n.nspname = c.udt_schema "
+                "LEFT JOIN pg_type t ON t.typnamespace = n.oid AND t.typname = c.udt_name "
+                "WHERE c.table_schema = %s AND c.table_name = %s ORDER BY c.ordinal_position",
                 (table.schema, table.name),
             )
             cols = []
-            for name, data_type, udt, nullable in cur.fetchall():
+            for name, data_type, udt, nullable, typtype in cur.fetchall():
                 native = udt if data_type == "USER-DEFINED" else data_type
+                if data_type == "USER-DEFINED" and typtype == "e":
+                    native = f"enum({udt})"  # compared as its label text, as MySQL's enum
                 ctype = DEFAULT_TYPE_MAP.canonical(self.engine, native)
                 cols.append(Column(name, native, ctype, fixed_width=native == "character",
                                    nullable=nullable == "YES"))  # fmt: skip

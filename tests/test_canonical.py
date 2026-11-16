@@ -323,6 +323,13 @@ def test_golden_vectors_of_revision_2():
     assert row_hash(["1", doc]) == "1590b46167f97dd56707d3b509f5882b"
 
 
+def test_golden_vectors_of_revision_3():
+    # a PostgreSQL enum renders as its label, as text does
+    assert CANONICAL_REVISION >= 3
+    assert render("ADMIN", T.TEXT) == "ADMIN"
+    assert column_digest("ADMIN") == "e5f4797af96fcb90a7fb0a8a1507a112"
+
+
 # -- revisions in baselines ----------------------------------------------------------
 def _entry(columns, revision=None, entry_ranges=None, natives=None):
     natives = natives or {}

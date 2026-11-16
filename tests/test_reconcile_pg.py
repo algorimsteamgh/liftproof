@@ -635,3 +635,76 @@ def test_a_schema_change_is_not_put_down_to_the_type_map(tmp_path, make_db, adap
         "the type map compares m, n otherwise than the baseline did; the live source is "
         "needed to re-hash"
     )
+
+
+# -- enum columns (canonical revision 3) -----------------------------------------------
+
+ENUMS = """
+CREATE TYPE "Role" AS ENUM ('PASSENGER', 'DRIVER', 'ADMIN');
+CREATE TABLE members (id text PRIMARY KEY, role "Role" NOT NULL, tier "Role");
+INSERT INTO members SELECT 'm' || g, (ARRAY['PASSENGER','DRIVER','ADMIN'])[1 + g % 3]::"Role",
+  CASE WHEN g % 2 = 0 THEN 'ADMIN'::"Role" END FROM generate_series(1, 300) g;
+"""
+
+
+@pytest.fixture
+def members(make_db, adapter_for):
+    s, sc = make_db("src")
+    t, tc = make_db("tgt")
+    sc.execute(ENUMS)
+    tc.execute(ENUMS)
+    return adapter_for(s), adapter_for(t), sc, tc
+
+
+def test_enum_columns_compare_as_their_labels(tmp_path, members):
+    src, tgt, _, tc = members
+    cols = {c.name: c for c in src.describe(src.list_tables(["public"])[0]).columns}
+    assert (cols["role"].native_type, cols["role"].canonical) == ("enum(Role)", T.TEXT)
+
+    result, findings = _run(tmp_path / "a", src, tgt, ignore=[])
+    m = _by_table(result)["public.members"]
+    assert m.status == "matched" and m.excluded_columns == [], [f.summary for f in findings]
+    assert verdict(findings) == "passed"
+
+    tc.execute("""UPDATE members SET role = 'ADMIN' WHERE id = 'm1'""")
+    result, findings = _run(tmp_path / "b", src, tgt, ignore=[])
+    m = _by_table(result)["public.members"]
+    assert m.status == "different" and m.changed_rows == 1
+    assert [f.column for f in findings if f.locator == "id = m1"] == ["role"]
+
+    # a target that keeps the labels as text, not an enum, compares the same
+    tc.execute("UPDATE members SET role = 'DRIVER' WHERE id = 'm1'")
+    tc.execute(
+        "ALTER TABLE members ALTER COLUMN role TYPE text, ALTER COLUMN tier TYPE varchar(20)"
+    )
+    result, findings = _run(tmp_path / "c", src, tgt, ignore=[])
+    assert _by_table(result)["public.members"].status == "matched", [f.summary for f in findings]
+
+
+def test_enum_column_of_a_baseline_before_revision_3(tmp_path, members):
+    src, tgt, _, _ = members
+    manifest = tmp_path / "old" / "manifest.json"
+    old = [IgnoreRule("members", "before canonical revision 3", c) for c in ("role", "tier")]
+    take_baseline(src, manifest, baseline_id="old", schemas=["public"], tables=None,
+                  business_keys={}, rows_per_bucket=1000, precision=6, ignore=old)  # fmt: skip
+    doc = json.loads(manifest.read_text())
+    entry = doc["tables"]["public.members"]
+    entry["canonical_revision"] = 2
+    for c in entry["columns"]:
+        if c[0] in ("role", "tier"):  # as an older build recorded an enum: its bare name
+            c[1], c[2] = "Role", "unsupported"
+    manifest.write_text(json.dumps(doc))
+
+    writer = FindingWriter(tmp_path / "f", "f")
+    result = Reconciler(tgt, writer, ReconcileOptions(), baseline=Baseline.load(manifest)).run()
+    writer.close()
+    findings = list(read_findings(tmp_path / "f"))
+    m = _by_table(result)["public.members"]
+    assert m.status == "matched" and m.excluded_columns == ["role", "tier"], [
+        f.summary for f in findings
+    ]
+    notes = [f for f in findings if f.column in ("role", "tier")]
+    assert {(f.kind, f.detail["issue"]) for f in notes} == {(Kind.NOT_CHECKED, "not_in_baseline")}
+    assert all("canonical revision 3" in f.summary for f in notes)
+    assert (notes[0].expected, notes[0].actual) == ("Role", "enum(Role)")
+    assert verdict(findings) == "passed_with_differences"
