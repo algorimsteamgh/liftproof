@@ -53,11 +53,11 @@ Parameters:
     AllowedPattern: "^[a-z0-9][a-z0-9-]{1,30}$"
     ConstraintDescription: 2 to 31 lower case letters, digits or hyphens.
   ImageId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Type: AWS::EC2::Image::Id
     Description: >-
-      The Liftproof AMI. Leave the default: AWS Marketplace publishes each version under
-      this public parameter in every Region.
-    Default: /aws/service/marketplace/prod-REPLACE-AT-LISTING/latest
+      The Liftproof AMI. AWS Marketplace fills this in with the AMI for the buyer's
+      Region and the version they chose. Outside AWS Marketplace, pass the AMI ID of
+      the version you were given.
   InstanceType:
     Type: String
     Description: 4 vCPU and 16 GiB is the starting point.

@@ -5,8 +5,8 @@ The listing offers two ways to launch: the CloudFormation template
 and the Terraform module `infra/modules/liftproof`. Both deploy the same thing, and
 `tests/test_cloudformation.py` fails when one changes without the other.
 
-Nothing in this file has been submitted to AWS Marketplace yet. The text below is a draft
-for the listing form.
+The listing draft is product `prod-lf77qe6dmorug` in AWS Partner Central, version
+`0.1.2`. The text below is the copy used on the listing form.
 
 ## Listing text (draft)
 
@@ -88,7 +88,4 @@ and 135).
 - The deployment guide is `docs/deployment-guide.md`. Instance replacement and launch
   times in section 9 were measured on 21 November 2026; the Availability Zone and Region
   rows are still design targets.
-- The AMI's Marketplace product ID. `ImageId` defaults to the SSM parameter
-  `/aws/service/marketplace/prod-REPLACE-AT-LISTING/latest`; the product ID replaces
-  `prod-REPLACE-AT-LISTING` once AWS Marketplace issues it.
 - Pricing and the EULA.
