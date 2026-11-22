@@ -3,7 +3,8 @@
 Everything here is Terraform (plus a Packer template for the AMI and a CloudFormation
 template for the AWS Marketplace listing). It passes
 `terraform validate` and a Checkov scan with no open findings; every Checkov skip is
-written next to the resource with its reason. Nothing has been applied to any account.
+written next to the resource with its reason. The CloudFormation template was deployed
+and torn down in a test account on 21 November 2026.
 
 ```
 infra/
@@ -181,6 +182,6 @@ recovery and upgrades are in the deployment guide (docs/deployment-guide.md).
 
 ## What is still to do
 
-- A test launch of `cloudformation/liftproof.yaml`; it has passed `cfn-lint` and Checkov
-  only. `tests/test_cloudformation.py` keeps it in step with `modules/liftproof`.
+- `ami_regions` in the Packer template, so the images customers launch in ap-south-1 and
+  ap-southeast-1 come from the gated release rather than from copies made by hand.
 - Remote state bucket for the Terraform roots (backend blocks are in place, commented).

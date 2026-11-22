@@ -10,3 +10,4 @@ build/
 .terraform.lock.hcl
 *.tfstate*
 packer-manifest.json
+*.tfplan
