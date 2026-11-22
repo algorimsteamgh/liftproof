@@ -85,10 +85,10 @@ and 135).
 
 - The architecture diagram is `docs/architecture.png` (source `docs/architecture.svg`).
   Redraw it with the official AWS architecture icons if the listing review asks for them.
-- The deployment guide is `docs/deployment-guide.md`. Fill in the support contact (section
-  11) and confirm the recovery times (section 9) at the first test launch.
+- The deployment guide is `docs/deployment-guide.md`. Instance replacement and launch
+  times in section 9 were measured on 21 November 2026; the Availability Zone and Region
+  rows are still design targets.
 - The AMI's Marketplace product ID. `ImageId` defaults to the SSM parameter
   `/aws/service/marketplace/prod-REPLACE-AT-LISTING/latest`; the product ID replaces
   `prod-REPLACE-AT-LISTING` once AWS Marketplace issues it.
-- Pricing, the EULA and the support contact.
-- A launch of the template in a test account. Only `cfn-lint` and Checkov have checked it.
+- Pricing and the EULA.

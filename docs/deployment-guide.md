@@ -269,8 +269,9 @@ the S3 bucket as they are written. The instance holds only working copies.
 
 A resumed reconciliation compares only the tables it had not finished. A replay is never
 resumed, because its journeys created data on the target: its finished journeys keep
-their findings and the rest are listed as not run, so run it again. These figures are
-targets to be confirmed by the first test launch.
+their findings and the rest are listed as not run, so run it again. Instance replacement
+was measured at about 85 seconds, and stack creation at 3 minutes 47 seconds, in a test
+deployment on 21 November 2026. The Availability Zone and Region rows remain targets.
 
 **Replacing the instance.** Raise the instance generation by one:
 `instance_generation = 2` in Terraform, or update the stack with **InstanceGeneration**
@@ -329,8 +330,18 @@ shows the running version; the login message shows when the image was built.
 3. `liftproof support-bundle --project acme.yaml --doctor` writes one file for a support
    ticket, with every data value removed.
 
-Support: SUPPORT-CONTACT-TO-BE-CONFIRMED (email, hours and response times as in the
-listing's support terms). Security issues: security@algorims.com (SECURITY.md).
+**Support.** Security issues: security@algorims.com (SECURITY.md). Everything else:
+
+| | |
+|---|---|
+| Email | support@algorims.com |
+| Hours | 06:30 to 18:30 IST (01:00 to 13:00 UTC), Monday to Friday |
+| First response | Within 1 hour during support hours |
+| Escalations | Treated as priority |
+
+Requests raised outside support hours are answered within the first hour of the next
+working day. Attach the output of `liftproof support-bundle --project NAME --doctor`: it
+carries the diagnostics with every data value removed.
 
 ## 12. Removing a deployment
 
