@@ -65,11 +65,11 @@ your data. Nothing is sent to Algorims.
    Secrets Manager, KMS, CloudWatch Logs and CloudWatch, and an S3 gateway endpoint.
 4. When the stack finishes, connect to the instance with Session Manager
    (`aws ssm start-session --target` and the **InstanceId** output), or call the
-   **RunDocument** output with mode `doctor`, to check network paths, credentials and
+   **RunDocumentName** output with mode `doctor`, to check network paths, credentials and
    permissions before the first comparison. The **ConnectUi** output opens the web
    interface (see `docs/ui.md`).
 5. For a first report before any of your own systems are set up, run the worked
-   example: the **RunDocument** output with project `example` and mode `files`. It
+   example: the **RunDocumentName** output with project `example` and mode `files`. It
    compares two folders shipped on the instance, finds one changed invoice amount, and
    writes the report to the deployment's bucket.
 6. To start a run from a pipeline, give the pipeline's role the **OperatorPolicyArn**

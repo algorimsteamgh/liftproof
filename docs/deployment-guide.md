@@ -214,7 +214,7 @@ uncomment). With your own KMS key, add the key policy statements in infra/README
 
 ## 8. Check it works, and monitor it
 
-**Health check.** Run doctor through the run document (the **RunDocument** /
+**Health check.** Run doctor through the run document (the **RunDocumentName** /
 `run_document_name` output) with mode `doctor`, or in a Session Manager shell:
 
 ```bash
