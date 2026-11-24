@@ -188,8 +188,12 @@ account's Session Manager preferences.
 
 1. Store the credentials (section 6).
 2. In AWS Marketplace, subscribe to Liftproof and choose **Launch CloudFormation**.
-3. Fill in the parameters. The required ones are the deployment name, VPC, private subnet,
-   the database slots (CIDR and port for each database) and the secret ARNs. AWS
+3. Fill in the parameters. The required ones are the deployment name, VPC, private
+   subnet, and the route tables of that subnet in **PrivateRouteTableIds** (the S3
+   gateway endpoint attaches to them; the stack is refused without them while
+   **CreateVpcEndpoints** is true). Add the database slots (CIDR and port for each
+   database) and the secret ARNs when you have them; leaving **SecretArns** empty
+   deploys without database access, which is enough to run the worked example. AWS
    Marketplace fills in **ImageId** with the AMI for your Region and the version you
    chose, so leave it as it arrives. Give an SNS topic in **AlarmTopicArn** to be
    notified of alarms.

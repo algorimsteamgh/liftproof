@@ -56,9 +56,11 @@ your data. Nothing is sent to Algorims.
 
 1. Store each database's credentials as a secret in AWS Secrets Manager in the same
    Region, as a key/value secret with the keys `username` and `password`.
-2. Choose **Launch CloudFormation**. Pick a private subnet that can reach your databases
-   and applications, and paste the secret ARNs into **Secrets the product may read**.
-   Fill a database slot (CIDR and port) for each database the instance must reach.
+2. Choose **Launch CloudFormation**. Pick a private subnet that can reach your
+   databases and applications, and give that subnet's route tables in
+   **PrivateRouteTableIds**. Paste the secret ARNs into **Secrets the product may
+   read** and fill a database slot (CIDR and port) for each database the instance
+   must reach; both can be left empty for a first deployment.
 3. Leave **Create VPC endpoints** on unless the VPC already has endpoints for SSM,
    Secrets Manager, KMS, CloudWatch Logs and CloudWatch, and an S3 gateway endpoint.
 4. When the stack finishes, connect to the instance with Session Manager

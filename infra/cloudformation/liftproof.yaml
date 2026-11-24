@@ -147,6 +147,9 @@ Parameters:
     Description: >-
       Secrets Manager secrets the product may read (database and replay credentials).
       Wildcards allowed, for example arn:aws:secretsmanager:REGION:ACCOUNT:secret:liftproof/*
+      Leave empty to deploy without database access, for example to run the worked
+      example first; add the secrets later by updating the stack.
+    Default: ""
   SecretKmsKeyArns:
     Type: CommaDelimitedList
     Description: KMS keys that encrypt those secrets, when not the product key. The usual cause of access denied on the first run.
@@ -203,7 +206,22 @@ Parameters:
     MinValue: 1
     MaxValue: 1000
 
+Rules:
+  RouteTablesNeededForEndpoints:
+    RuleCondition: { "Fn::Equals": [{ Ref: CreateVpcEndpoints }, "true"] }
+    Assertions:
+      - Assert:
+          "Fn::Not": [{ "Fn::Equals": [{ "Fn::Join": ["", { Ref: PrivateRouteTableIds }] }, ""] }]
+        AssertDescription: >-
+          PrivateRouteTableIds must name at least one route table when CreateVpcEndpoints
+          is true. The S3 gateway endpoint is attached to those route tables, and the
+          instance reaches S3 through it. Give the route tables of the private subnets
+          you are deploying into, or set CreateVpcEndpoints to false if the VPC already
+          has the endpoints.
+
 Conditions:
+  SecretsGiven:
+    "Fn::Not": [{ "Fn::Equals": [{ "Fn::Join": ["", { Ref: SecretArns }] }, ""] }]
   CreateKey: { "Fn::Equals": [{ Ref: KmsKeyArn }, ""] }
   DeriveBucketName: { "Fn::Equals": [{ Ref: BucketName }, ""] }
   CreateEndpoints: { "Fn::Equals": [{ Ref: CreateVpcEndpoints }, "true"] }
@@ -717,10 +735,13 @@ Resources:
                             - - { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
                               - { "Fn::Join": [",", { Ref: SecretKmsKeyArns }] }
                     - { "Fn::If": [CreateKey, { "Fn::GetAtt": [Key, Arn] }, { Ref: KmsKeyArn }] }
-              - Sid: ReadCredentials
-                Effect: Allow
-                Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
-                Resource: { Ref: SecretArns }
+              - "Fn::If":
+                  - SecretsGiven
+                  - Sid: ReadCredentials
+                    Effect: Allow
+                    Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                    Resource: { Ref: SecretArns }
+                  - { Ref: "AWS::NoValue" }
               - Sid: ShipLogs
                 Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
