@@ -11,3 +11,4 @@ build/
 *.tfstate*
 packer-manifest.json
 *.tfplan
+liftproof-results/

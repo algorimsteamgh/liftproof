@@ -93,8 +93,19 @@ def test_run_document_is_the_same(template):
             assert p["allowedPattern"] == json.loads(pattern.group(1)), name
 
 
+def _statements(statements):
+    """The real statements, looking inside Fn::If for the ones granted only under
+    a condition (ReadCredentials, when secrets were named)."""
+    for s in statements:
+        if "Fn::If" in s:
+            yield from (b for b in s["Fn::If"][1:]
+                        if isinstance(b, dict) and "Sid" in b)
+        else:
+            yield s
+
+
 def _sids(statements) -> set[str]:
-    return {s["Sid"] for s in statements}
+    return {s["Sid"] for s in _statements(statements)}
 
 
 def test_iam_statements_match(template):
@@ -111,7 +122,7 @@ def test_iam_statements_match(template):
     assert _sids(r["OperatorPolicy"]["Properties"]["PolicyDocument"]["Statement"]) == set(
         re.findall(r'sid\s*=\s*"(\w+)"', operator_tf)
     )
-    for statement in runtime["PolicyDocument"]["Statement"]:
+    for statement in _statements(runtime["PolicyDocument"]["Statement"]):
         actions = statement["Action"] if isinstance(statement["Action"], list) else [
             statement["Action"]]  # fmt: skip
         for action in actions:

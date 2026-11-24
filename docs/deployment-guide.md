@@ -188,10 +188,15 @@ account's Session Manager preferences.
 
 1. Store the credentials (section 6).
 2. In AWS Marketplace, subscribe to Liftproof and choose **Launch CloudFormation**.
-3. Fill in the parameters. The required ones are the deployment name, VPC, private subnet,
-   the database slots (CIDR and port for each database) and the secret ARNs. Leave
-   **ImageId** at its default. Give an SNS topic in **AlarmTopicArn** to be notified of
-   alarms.
+3. Fill in the parameters. The required ones are the deployment name, VPC, private
+   subnet, and the route tables of that subnet in **PrivateRouteTableIds** (the S3
+   gateway endpoint attaches to them; the stack is refused without them while
+   **CreateVpcEndpoints** is true). Add the database slots (CIDR and port for each
+   database) and the secret ARNs when you have them; leaving **SecretArns** empty
+   deploys without database access, which is enough to run the worked example. AWS
+   Marketplace fills in **ImageId** with the AMI for your Region and the version you
+   chose, so leave it as it arrives. Give an SNS topic in **AlarmTopicArn** to be
+   notified of alarms.
 4. Create the stack (about 10 minutes, most of it the VPC endpoints).
 
 ### With Terraform
@@ -209,7 +214,7 @@ uncomment). With your own KMS key, add the key policy statements in infra/README
 
 ## 8. Check it works, and monitor it
 
-**Health check.** Run doctor through the run document (the **RunDocument** /
+**Health check.** Run doctor through the run document (the **RunDocumentName** /
 `run_document_name` output) with mode `doctor`, or in a Session Manager shell:
 
 ```bash
@@ -301,9 +306,10 @@ the instance does not patch itself (SECURITY.md: at least monthly, and within 7 
 fix for a critical vulnerability). Check that no run is under way (`liftproof runs`),
 then:
 
-- CloudFormation: update the stack, keeping the parameters. **ImageId** resolves to the
-  latest version on every stack update, so the instance is replaced with it. Any stack
-  update moves to the latest version, so make updates outside run windows.
+- CloudFormation: subscribe to the new version in AWS Marketplace and choose **Launch
+  CloudFormation** again, or update the stack with the new version's **ImageId**. The
+  version is pinned to the one you launched, so a routine stack update does not move it
+  and an upgrade is always deliberate.
 - Terraform: set `ami_id` to the new version's AMI and raise `instance_generation` by
   one. Changing `ami_id` alone does nothing, so an upgrade is always deliberate.
 
